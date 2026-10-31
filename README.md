@@ -41,6 +41,9 @@ fail-closed，抛出 `pydantic.ValidationError`，由调用方兜底。
 LLM_MODEL_ID=your_model_id
 LLM_API_KEY=your_api_key_here
 LLM_BASE_URL=https://your-gateway/v1
+
+# 会话状态 Redis（Story 1.3，会话状态唯一写入者）
+WEILIAO_REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
 ## 开发

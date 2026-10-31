@@ -66,6 +66,25 @@ def test_bad_type_fails_closed() -> None:
         Envelope.model_validate(payload)
 
 
+def test_naive_timestamp_without_timezone_is_rejected() -> None:
+    """结算 deferred-work：naive datetime（无时区）fail-closed。"""
+    payload = _valid_payload()
+    payload["timestamp"] = datetime(2026, 10, 31, 10, 0, 0)  # 无时区
+
+    with pytest.raises(ValidationError):
+        Envelope.model_validate(payload)
+
+
+@pytest.mark.parametrize("blank_field", ["session_id", "house_id", "trace_id"])
+def test_blank_identifier_is_rejected(blank_field: str) -> None:
+    """结算 deferred-work：三项标识符非空（min_length=1）。"""
+    payload = _valid_payload()
+    payload[blank_field] = ""
+
+    with pytest.raises(ValidationError):
+        Envelope.model_validate(payload)
+
+
 def test_optional_turn_and_intent_accept_none() -> None:
     payload = _valid_payload()
     payload["turn"] = None

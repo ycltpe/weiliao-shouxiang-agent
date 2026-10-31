@@ -18,16 +18,16 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class Envelope(BaseModel):
     """管道内传递的标准化消息信封。"""
 
-    session_id: str
-    house_id: str
+    session_id: str = Field(min_length=1)
+    house_id: str = Field(min_length=1)
     timestamp: datetime
-    trace_id: str
+    trace_id: str = Field(min_length=1)
     turn: int | None = None
     intent: str | None = None
     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
@@ -36,3 +36,12 @@ class Envelope(BaseModel):
     resolved_message: str | None = None
     coref: list[Any] | None = None
     media_type: str | None = None
+
+    @field_validator("timestamp")
+    @classmethod
+    def _timestamp_must_be_tz_aware(cls, value: datetime) -> datetime:
+        """结算 deferred-work：时间戳必须带时区（naive datetime 拒绝）。"""
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            msg = "timestamp must be timezone-aware"
+            raise ValueError(msg)
+        return value
