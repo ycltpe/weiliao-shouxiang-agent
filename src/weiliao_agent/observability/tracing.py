@@ -1,0 +1,285 @@
+"""Langfuse 全链路追踪脚手架（Story 1.5）。
+
+职责（架构一致性约定「可观测」）：
+- trace_id 由编排器入口权威生成（``new_trace_id``，32 位小写十六进制，
+  与 Langfuse trace id 同口径，响应 id 可直接在 Langfuse 检索）；
+- 每消息记录三文本字段：买家原文 / 消解后消息 / 最终下发文本
+  （后两者当前恒等于原文，coref（Story 2）与 LLM 生成（Epic 4）
+  就位后渐进分化）；
+- 降级事件、过滤器 span 写入消息 trace；成本追踪经 generation 观测
+  记录 token 用量与费用（真实模型调用由 Epic 4 接入本封装）。
+
+Fail-safe 约定（spec Boundaries）：本模块所有公开入口对 Langfuse SDK
+的任何异常一律吞掉——追踪缺失绝不二次影响买家应答，也不得超出管道
+时间预算；SDK 自身 flush 走后台线程，不阻塞请求路径。未配置 Langfuse
+（无 ``LANGFUSE_PUBLIC_KEY`` 等环境变量）时 SDK 进入 disabled 态，全部
+记录 no-op，管道行为与 Story 1.4 逐字节一致（仅多一条禁用 warning）。
+
+记录一律在主线程编排器侧、以 ``TraceContext(trace_id=...)`` 显式挂到
+消息 trace：过滤器在 ThreadPoolExecutor 线程内执行，不做 OTel 跨线程
+context 传播（spec Never 约束）。
+"""
+
+import re
+import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
+from typing import Any
+
+from langfuse import Langfuse, get_client, propagate_attributes
+from langfuse.types import TraceContext
+
+# SDK 自定义 trace id 的合法口径（Langfuse._is_valid_trace_id 同规则）：
+# 非 32 位小写十六进制的 id 会让 SDK 告警并抛 ValueError，故本层提前
+# 收敛为跳过记录，避免异常驱动的控制流与日志噪音。
+_VALID_TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
+
+# 状态消息长度上限（降级归因等，防异常文本膨胀 trace）。
+_STATUS_MESSAGE_LIMIT = 500
+
+# 惰性单例缓存（get_client 内部按 public_key 单例）；测试可经
+# ``set_langfuse_client`` 注入替身或重置回 None 走惰性初始化。
+_client: Langfuse | None = None
+
+
+def get_langfuse() -> Langfuse:
+    """返回惰性单例 client；首次调用才初始化（未配置则 disabled 单例）。"""
+    global _client  # noqa: PLW0603
+    if _client is None:
+        _client = get_client()
+    return _client
+
+
+def set_langfuse_client(client: Langfuse | None) -> None:
+    """注入/替换 client（测试替身）；传 None 恢复惰性单例路径。"""
+    global _client  # noqa: PLW0603
+    _client = client
+
+
+def new_trace_id() -> str:
+    """生成服务端权威 trace_id：32 位小写十六进制（Langfuse trace id 口径）。"""
+    return uuid.uuid4().hex
+
+
+def _recordable(trace_id: str | None) -> bool:
+    """trace_id 是否可挂到 Langfuse trace（None 或非 32-hex 口径直接跳过）。"""
+    return trace_id is not None and _VALID_TRACE_ID.fullmatch(trace_id) is not None
+
+
+def _client_or_none() -> Langfuse | None:
+    """惰性取 client；初始化本身异常也收敛为 None（全链路 no-op）。"""
+    try:
+        return get_langfuse()
+    except Exception:
+        return None
+
+
+@contextmanager
+def trace_message(
+    *,
+    trace_id: str | None,
+    session_id: str,
+    house_id: str,
+    message: str | None,
+    turn: int | None = None,
+    intent: str | None = None,
+) -> Iterator[None]:
+    """消息级 trace 上下文：根 span 记买家原文与三文本字段，session_id 贯穿。
+
+    当前口径：消解后消息恒等于买家原文（coref 过滤器属 Story 2），最终
+    下发文本由编排器在管道完成后经 ``record_delivery`` 补记到 trace。
+    上下文体的异常原样上抛（编排器自身兜底语义不变），SDK 侧异常吞掉。
+    """
+    if not _recordable(trace_id):
+        yield
+        return
+    client = _client_or_none()
+    if client is None:
+        yield
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    # SDK 的同步/异步双模 CM 以 Any 承接：只依赖 __enter__/__exit__
+    # 协议，避免引入 SDK 私有类型。enter 分步进行：任一步失败须退出
+    # 已 enter 的前序 CM（评审补丁：防部分 enter 泄漏根 span）。
+    root: Any = None
+    attrs: Any = None
+    try:
+        root = client.start_as_current_observation(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="pipeline.message",
+            as_type="span",
+            input={"session_id": session_id, "house_id": house_id, "message": message},
+            metadata={
+                "session_id": session_id,
+                "house_id": house_id,
+                "turn": turn,
+                "intent": intent,
+                "message": message,
+                "resolved_message": message,
+                "delivered_text": None,
+            },
+        )
+        root.__enter__()
+    except Exception:
+        yield
+        return
+    try:
+        attrs = propagate_attributes(session_id=session_id)
+        attrs.__enter__()
+    except Exception:
+        with suppress(Exception):
+            root.__exit__(None, None, None)
+        yield
+        return
+    try:
+        yield
+    finally:
+        # 逆序退出；SDK __exit__ 异常吞掉，不得影响编排器。
+        with suppress(Exception):
+            if attrs is not None:
+                attrs.__exit__(None, None, None)
+        with suppress(Exception):
+            if root is not None:
+                root.__exit__(None, None, None)
+
+
+@contextmanager
+def filter_span(trace_id: str | None, name: str) -> Iterator[None]:
+    """过滤器执行 span（主线程侧记录；过滤器线程内不做 OTel 传播）。
+
+    体异常（过滤器抛错/超时）照常上抛——编排器据此降级，语义不变；
+    异常同时尽力以 ERROR 级标记到 span，便于 Langfuse 检索失败跳。
+    """
+    if not _recordable(trace_id):
+        yield
+        return
+    client = _client_or_none()
+    if client is None:
+        yield
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    manager: Any = None
+    span: Any = None
+    try:
+        manager = client.start_as_current_observation(
+            trace_context=TraceContext(trace_id=trace_id),
+            name=f"filter:{name}",
+            as_type="span",
+        )
+    except Exception:
+        yield
+        return
+    try:
+        span = manager.__enter__()
+    except Exception:
+        with suppress(Exception):
+            manager.__exit__(None, None, None)
+        yield
+        return
+    try:
+        yield
+    except Exception as exc:
+        with suppress(Exception):
+            span.update(level="ERROR", status_message=str(exc)[:_STATUS_MESSAGE_LIMIT])
+        raise
+    finally:
+        with suppress(Exception):
+            manager.__exit__(None, None, None)
+
+
+def record_degradation(
+    trace_id: str | None,
+    *,
+    failed_filter: str | None = None,
+    slow_filter: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """降级事件写入消息 trace（含归因过滤器名）。
+
+    降级事件记录本身再抛异常也吞掉（I/O 矩阵：绝不二次影响应答）。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="pipeline.degradation",
+            level="ERROR",
+            metadata={
+                "event": "pipeline_degradation",
+                "failed_filter": failed_filter,
+                "slow_filter": slow_filter,
+                "reason": reason,
+            },
+        )
+
+
+def record_delivery(
+    trace_id: str | None,
+    *,
+    reply: str,
+    degraded: bool,
+    failed_filter: str | None = None,
+) -> None:
+    """最终下发文本写入消息 trace（三文本字段之三，SM-5/SM-6 口径）。"""
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="pipeline.delivery",
+            output=reply,
+            metadata={
+                "event": "pipeline_delivery",
+                "degraded": degraded,
+                "failed_filter": failed_filter,
+                "delivered_text": reply,
+            },
+        )
+    # 评审补丁：根 span metadata 预置的 delivered_text=None 属过期占位，
+    # 同步最终文本到当前 span（调用方位于 trace_message 上下文内）。
+    with suppress(Exception):
+        client.update_current_span(metadata={"delivered_text": reply})
+
+
+def record_generation(
+    trace_id: str | None,
+    *,
+    model: str,
+    usage: Mapping[str, int],
+    cost: Mapping[str, float],
+    name: str = "model.generation",
+) -> None:
+    """成本追踪封装：token 用量与费用挂到当前消息 trace（Epic 4 消费）。
+
+    脚手架级 API：真实模型调用接入时由 LLM 过滤器在拿到 usage/cost 后
+    调用本封装；内部走 SDK generation 观测（usage_details/cost_details）。
+    局限（评审补丁）：空上下文体意味着时长恒 ~0 且不记录 input/output，
+    Epic 4 接入真实调用时须改 start/end 或 update 语义补全。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    try:
+        with client.start_as_current_observation(
+            trace_context=TraceContext(trace_id=trace_id),
+            name=name,
+            as_type="generation",
+            model=model,
+            usage_details=dict(usage),
+            cost_details=dict(cost),
+        ):
+            pass
+    except Exception:
+        pass

@@ -39,13 +39,23 @@ def test_happy_path_valid_dict_produces_envelope() -> None:
     assert envelope.media_type is None
 
 
-@pytest.mark.parametrize("missing_field", ["session_id", "house_id", "timestamp", "trace_id"])
+@pytest.mark.parametrize("missing_field", ["session_id", "house_id", "timestamp"])
 def test_missing_required_field_fails_closed(missing_field: str) -> None:
     payload = _valid_payload()
     del payload[missing_field]
 
     with pytest.raises(ValidationError):
         Envelope.model_validate(payload)
+
+
+def test_missing_trace_id_defaults_to_none() -> None:
+    """Story 1.5 契约变更：trace_id 由服务端权威生成，payload 可缺省。"""
+    payload = _valid_payload()
+    del payload["trace_id"]
+
+    envelope = Envelope.model_validate(payload)
+
+    assert envelope.trace_id is None
 
 
 def test_unknown_field_is_ignored_by_default() -> None:

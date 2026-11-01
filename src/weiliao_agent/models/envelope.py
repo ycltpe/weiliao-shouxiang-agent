@@ -6,7 +6,13 @@
 由调用方兜底。
 
 字段口径（架构一致性约定）：
-- ``session_id`` / ``house_id`` / ``timestamp`` / ``trace_id`` 必填；
+- ``session_id`` / ``house_id`` / ``timestamp`` 必填；
+- ``trace_id`` 缺省为 None：由服务在编排器入口生成并回填信封
+  （Story 1.5，32 位小写十六进制，即 Langfuse trace id 口径）。
+  回填语义为「缺失即生成、携带值透传」（既有测试锁定透传）：
+  payload 携带值原样流经管道与响应，但仅 32-hex 值可作为 Langfuse
+  trace id 被消费，非 32-hex 值跳过追踪（见 observability.tracing）；
+  空串仍拒绝；
 - ``turn``（会话内绝对消息序号，由会话管理在入管道前赋值）与
   ``intent``（由分类器填写）允许为 None，但非 None 时类型必须正确；
 - ``intent`` 本 Story 为 ``str | None``，9 类 Literal 枚举在 Story 2.1
@@ -27,7 +33,9 @@ class Envelope(BaseModel):
     session_id: str = Field(min_length=1)
     house_id: str = Field(min_length=1)
     timestamp: datetime
-    trace_id: str = Field(min_length=1)
+    # Story 1.5：trace_id 放宽为可选——服务端权威生成（编排器入口
+    # 回填），其余校验规则不动（空串仍 min_length=1 拒绝）。
+    trace_id: str | None = Field(default=None, min_length=1)
     turn: int | None = None
     intent: str | None = None
     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
