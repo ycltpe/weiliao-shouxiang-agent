@@ -1,7 +1,7 @@
 """应用入口：装配编排器、SessionManager 与 HTTP 端点，供 uvicorn 启动。
 
 启动方式：``uvicorn weiliao_agent.main:app --reload``。
-Story 1.4 的 ``/health`` 日后挂同一 app。
+``/health`` 由 create_app 装配（Story 1.4，NFR-7）。
 """
 
 import os

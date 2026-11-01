@@ -66,6 +66,11 @@ class PipelineOrchestrator:
         )
         self._budget_seconds = budget_seconds
 
+    @property
+    def filter_names(self) -> tuple[str, ...]:
+        """过滤器链名单（只读），供健康检查探针等链外只读消费。"""
+        return tuple(filter_.name for filter_ in self._filters)
+
     def run(self, envelope: Envelope) -> PipelineResult:
         """执行过滤器链；异常/超时一律降级模板兜底，不向上抛。"""
         deadline = time.monotonic() + self._budget_seconds
