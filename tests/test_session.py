@@ -7,6 +7,8 @@
 """
 
 import importlib
+import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -17,9 +19,18 @@ import redis
 from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
+from weiliao_agent.classifiers.llm_zero_shot import LlmZeroShotClassifier, _LlmIntentOutput
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
 from weiliao_agent.session import SessionManager, SessionSnapshot
 from weiliao_agent.session.manager import DEFAULT_TTL_SECONDS, KEY_PREFIX
+
+
+@pytest.fixture
+def _restore_main_module() -> Any:
+    """reload 类测试的清理：弹出 main 模块，防 FakeRedis 绑定的过期
+    状态（app/_classifier）被后续导入该模块的测试读到。"""
+    yield
+    sys.modules.pop("weiliao_agent.main", None)
 
 TS_1 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=UTC)
 TS_2 = datetime(2026, 10, 31, 10, 1, 0, tzinfo=UTC)
@@ -236,7 +247,9 @@ def test_endpoint_backfills_turn_before_pipeline(
     assert seen_turns == [1, 2]
 
 
-def test_main_composition_root_wires_session_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_composition_root_wires_session_manager(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
     # 组合根冒烟：main.py 是生产唯一注入 SessionManager 的位置。patch
     # Redis.from_url 为 fakeredis 后导入 main，端点须完成 turn 回填。
     fake = fakeredis.FakeRedis()
@@ -270,3 +283,128 @@ def test_in_flight_message_continues_with_snapshot_after_key_expiry(
 
     assert envelope.turn == 1  # 在途消息持有入管道时快照，不随 key 过期而失效
     assert result.degraded is False  # 处理不中断，正常出管道
+
+
+def test_write_intent_stores_per_turn_json_with_session_ttl(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    from weiliao_agent.models.intent import IntentClassification
+
+    manager.begin_turn(SESSION_ID, TS_1)
+
+    manager.write_intent(SESSION_ID, 1, IntentClassification(tag="PRICE_INQUIRY", confidence=0.9))
+
+    key = f"{KEY_PREFIX}{SESSION_ID}:intent:1"
+    raw = cast("bytes", client.get(key))
+    stored = json.loads(raw.decode())
+    assert stored == {"tag": "PRICE_INQUIRY", "confidence": 0.9}
+    # 序列化口径即 model_dump_json()，且 TTL 与会话一致。
+    assert client.ttl(key) == DEFAULT_TTL_SECONDS
+    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
+
+
+def test_write_intent_uses_distinct_key_per_turn(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    from weiliao_agent.models.intent import IntentClassification
+
+    manager.write_intent(SESSION_ID, 1, IntentClassification(tag="GREETING", confidence=0.9))
+    manager.write_intent(SESSION_ID, 2, IntentClassification(tag="LOCATION", confidence=0.7))
+
+    first = json.loads(cast("bytes", client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:1")).decode())
+    second = json.loads(cast("bytes", client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:2")).decode())
+    assert first["tag"] == "GREETING"
+    assert second["tag"] == "LOCATION"
+
+
+def test_write_intent_does_not_touch_session_hash(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # per-turn 键独立于会话 hash：意图写入不得残留/改写 turn 等权威字段。
+    from weiliao_agent.models.intent import IntentClassification
+
+    manager.write_intent(SESSION_ID, 3, IntentClassification(tag="UNKNOWN", confidence=0.5))
+
+    assert client.hgetall(f"{KEY_PREFIX}{SESSION_ID}") == {}
+    assert client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:3") is not None
+
+
+def test_main_composition_root_rejects_unknown_classifier(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 非法配置值 fail-fast：组合根导入期拒绝启动。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setenv("WEILIAO_INTENT_CLASSIFIER", "rules_engine")
+
+    with pytest.raises(ValueError, match="unknown intent classifier"):
+        importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+
+def test_main_composition_root_switch_to_none_classifier(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 配置切换路由链路零改动：none 装配占位过滤器，消息正常出管道
+    # （意图置 UNKNOWN），turn 仍由组合根 SessionManager 回填。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setenv("WEILIAO_INTENT_CLASSIFIER", "none")
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+    http = TestClient(main_module.app)
+    response = http.post("/v1/messages", json=_valid_payload())
+
+    assert response.status_code == 200
+    assert response.json()["degraded"] is False
+    stored_turn = fake.hget(f"{KEY_PREFIX}{SESSION_ID}", "turn")
+    assert int(cast("bytes", stored_turn)) == 1
+
+
+def test_main_composition_root_defaults_to_llm_classifier(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # env 未设（或空串）时组合根装配默认 LLM zero-shot 实现——锁定
+    # main.py 的默认接线不被误删/误改。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+    assert isinstance(main_module._classifier, LlmZeroShotClassifier)
+
+
+class _FakeStructuredModel:
+    """``with_structured_output`` 同接口替身：返回固定结构化输出。"""
+
+    def __init__(self, output: _LlmIntentOutput) -> None:
+        self._output = output
+
+    def invoke(self, messages: Any) -> _LlmIntentOutput:
+        return self._output
+
+
+def test_main_composition_root_writes_intent_to_redis(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 默认链路端到端：分类结果经组合根注入的 write_intent 落盘 per-turn
+    # 键，JSON 含 tag 与 confidence（fakeredis 无 LLM 网络）。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+    classifier = main_module._classifier
+    assert isinstance(classifier, LlmZeroShotClassifier)
+    classifier._structured_model = _FakeStructuredModel(
+        _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.91)
+    )
+    http = TestClient(main_module.app)
+    payload = {**_valid_payload(), "message": "你好，这套房多少钱？"}
+
+    response = http.post("/v1/messages", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["degraded"] is False
+    raw = fake.get(f"{KEY_PREFIX}{SESSION_ID}:intent:1")
+    assert raw is not None
+    stored = json.loads(cast("bytes", raw).decode())
+    assert stored == {"tag": "PRICE_INQUIRY", "confidence": 0.91}

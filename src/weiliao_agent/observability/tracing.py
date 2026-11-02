@@ -15,6 +15,11 @@ Fail-safe 约定（spec Boundaries）：本模块所有公开入口对 Langfuse 
 （无 ``LANGFUSE_PUBLIC_KEY`` 等环境变量）时 SDK 进入 disabled 态，全部
 记录 no-op，管道行为与 Story 1.4 逐字节一致（仅多一条禁用 warning）。
 
+意图分类事件（Story 2.2）：编排器入口 ``trace_message`` 的 intent 是
+preset 值（分类尚未发生），分类结果只能经 ``record_classification`` /
+``record_classification_failure`` 事件补挂同一 trace_id——含分类失败
+与写回失败两类失败事件（2.1 评审 defer 的分类失败观测挂点）。
+
 记录一律在主线程编排器侧、以 ``TraceContext(trace_id=...)`` 显式挂到
 消息 trace：过滤器在 ThreadPoolExecutor 线程内执行，不做 OTel 跨线程
 context 传播（spec Never 约束）。
@@ -248,6 +253,61 @@ def record_delivery(
     # 同步最终文本到当前 span（调用方位于 trace_message 上下文内）。
     with suppress(Exception):
         client.update_current_span(metadata={"delivered_text": reply})
+
+
+def record_classification(
+    trace_id: str | None,
+    *,
+    tag: str,
+    confidence: float,
+    source: str,
+    latency_ms: float,
+) -> None:
+    """意图分类成功事件：标签/置信度/实现来源/延迟补挂消息 trace。
+
+    fail-safe 口径同 ``record_degradation``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="intent.classification",
+            metadata={
+                "event": "intent_classification",
+                "tag": tag,
+                "confidence": confidence,
+                "source": source,
+                "latency_ms": round(latency_ms, 3),
+            },
+        )
+
+
+def record_classification_failure(trace_id: str | None, *, reason: str) -> None:
+    """意图分类/写回失败事件（reason=timeout / intent_write_failed 等）。
+
+    失败事件记录本身再抛异常也吞掉（绝不二次影响买家应答）。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="intent.classification_failure",
+            level="ERROR",
+            metadata={
+                "event": "intent_classification_failure",
+                "reason": reason[:_STATUS_MESSAGE_LIMIT],
+            },
+        )
 
 
 def record_generation(

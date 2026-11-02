@@ -13,9 +13,11 @@ roundtrip（读旧态/初始化/自增/刷新时间戳/EXPIRE 一次完成），
 过期竞态语义：调用方（入口适配器）在消息入管道前取快照，处理中途 key
 过期不中断在途消息；key 被 TTL 清除后重新发起即从零初始化（turn=1）。
 
-本 Story 不实现（接口边界已按 Epic 2/3/5 约定，届时补写方法）：
-``write_intent`` / ``write_coref`` / ``mark_handoff``，以及 per-turn
-工件键（如 ``:intent:{turn}``）的落盘。
+Story 2.2 已交付：``write_intent`` 将分类结果写入 per-turn 键
+``weiliao:session:{session_id}:intent:{turn}``（JSON：
+``IntentClassification.model_dump_json()``，TTL 与会话一致），单写者
+口径不变。仍待后续交付：``write_coref``（指代消解 Story）、
+``mark_handoff``（Epic 5）及 ``:coref:{turn}`` 键落盘。
 """
 
 from dataclasses import dataclass
@@ -23,6 +25,8 @@ from datetime import datetime
 from typing import cast
 
 import redis
+
+from weiliao_agent.models.intent import IntentClassification
 
 # 会话状态 key 前缀（架构一致性约定）。
 KEY_PREFIX = "weiliao:session:"
@@ -119,6 +123,22 @@ class SessionManager:
             args=[self._ttl_seconds],
         )
         return int(cast("int | str | bytes", count))
+
+    def write_intent(
+        self,
+        session_id: str,
+        turn: int,
+        classification: IntentClassification,
+    ) -> None:
+        """分类结果单写者落盘（Story 2.2，AD-4）：per-turn 键 + 会话 TTL。
+
+        ``SET weiliao:session:{session_id}:intent:{turn} {model_dump_json()} EX
+        ttl_seconds`` 单 roundtrip；键独立于会话 hash，TTL 与会话一致
+        （30 分钟默认）。写失败不吞异常：调用方（过滤器）经 try 包裹
+        fail-safe，应答不降级。
+        """
+        key = f"{self._key(session_id)}:intent:{turn}"
+        self._client.set(key, classification.model_dump_json(), ex=self._ttl_seconds)
 
     def read_snapshot(self, session_id: str) -> SessionSnapshot | None:
         """只读当前会话快照；key 不存在（已过期）或为缺 turn /
