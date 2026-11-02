@@ -21,11 +21,15 @@ from pydantic import ValidationError
 from weiliao_agent.filters.templates import render_placeholder
 from weiliao_agent.health import is_ready
 from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.models.intent import IntentTag
 from weiliao_agent.pipeline import PipelineOrchestrator, PipelineResult
 from weiliao_agent.session import SessionManager
 
 
-def _fallback_result(intent: str | None = None, trace_id: str | None = None) -> PipelineResult:
+def _fallback_result(
+    intent: IntentTag | None = None,
+    trace_id: str | None = None,
+) -> PipelineResult:
     """构造 fail-closed 兜底应答：兜底文案 + 新生成 trace_id。"""
     return PipelineResult(
         reply=render_placeholder(intent),

@@ -7,12 +7,14 @@
 Story 4.1 完整模板库替换时继承该约定。
 """
 
+from weiliao_agent.models.intent import IntentTag
+
 # 固定 AI 身份披露前缀（AD-10）：买家可见文本 100% 携带。
 AI_DISCLOSURE_PREFIX = "【AI 助手】"
 
 # 9 类意图各一条预审核安全文案；均为不承诺具体事实的安抚/记录口径，
 # 占位过滤器输出视为已审核，允许直接下发买家。
-_INTENT_PLACEHOLDERS: dict[str, str] = {
+_INTENT_PLACEHOLDERS: dict[IntentTag, str] = {
     "GREETING": "您好，已收到您的消息。请问您对这套房想了解哪方面的信息？",
     "PRICE_INQUIRY": "您咨询的价格问题已为您记录，确认后第一时间回复您。",
     "AVAILABILITY": "房源在售情况正在为您核实，稍后回复您确认结果。",
@@ -28,10 +30,12 @@ _INTENT_PLACEHOLDERS: dict[str, str] = {
 _GENERIC_PLACEHOLDER = "系统繁忙，已为您记录消息，经纪人稍后回复您。"
 
 
-def render_placeholder(intent: str | None) -> str:
+def render_placeholder(intent: IntentTag | None) -> str:
     """按意图标签渲染买家可见占位文案，统一携带 AI 身份披露前缀。
 
-    intent 为 None 或不在 9 类枚举内时回退通用兜底文案。
+    intent 为 None 时回退通用兜底文案；类型层已收窄为 9 类枚举
+    （Story 2.1），运行时经 dict.get 仍对枚举外字符串 fail-closed
+    到通用兜底（与信封未知枚举口径一致）。
     """
     body = _GENERIC_PLACEHOLDER
     if intent:
