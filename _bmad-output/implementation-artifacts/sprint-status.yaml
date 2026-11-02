@@ -1,5 +1,5 @@
 # generated: 2026-10-31
-# last_updated: 2026-11-01
+# last_updated: 2026-11-02
 # project: test
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-10-31
-last_updated: 2026-11-01
+last_updated: 2026-11-02
 project: test
 project_key: NOKEY
 tracking_system: file-system
@@ -56,7 +56,7 @@ development_status:
   1-5-Langfuse-全链路追踪脚手架: review
   epic-1-retrospective: optional
   epic-2: backlog
-  2-1-意图标签模型与分类器接口: backlog
+  2-1-意图标签模型与分类器接口: review
   2-2-意图分类默认实现: backlog
   2-3-重复追问识别: backlog
   epic-2-retrospective: optional
