@@ -8,6 +8,10 @@ Story 2.2 组合根：``WEILIAO_INTENT_CLASSIFIER`` 选分类器实现
 fail-fast——导入期抛 ``ValueError``，服务拒绝启动。意图写回经
 ``SessionManager.write_intent`` 方法引用注入（AD-4 单写者），路由
 链路代码零改动。
+
+Story 2.3 组合根：追问识别经 ``SessionManager.record_followup``
+方法引用注入（AD-4 单写者），过滤器不持有 Redis 客户端；路由链路
+其余装配不动。
 """
 
 import os
@@ -42,6 +46,7 @@ app = create_app(
             IntentRouterFilter(
                 classifier=_classifier,
                 intent_writer=_session_manager.write_intent,
+                followup_recorder=_session_manager.record_followup,
             ),
             CacheLookupFilter(),
             RiskReviewFilter(),

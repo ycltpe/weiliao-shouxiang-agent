@@ -16,7 +16,14 @@ roundtrip（读旧态/初始化/自增/刷新时间戳/EXPIRE 一次完成），
 Story 2.2 已交付：``write_intent`` 将分类结果写入 per-turn 键
 ``weiliao:session:{session_id}:intent:{turn}``（JSON：
 ``IntentClassification.model_dump_json()``，TTL 与会话一致），单写者
-口径不变。仍待后续交付：``write_coref``（指代消解 Story）、
+口径不变。
+
+Story 2.3 已交付：``record_followup`` 经 Lua 单 roundtrip 原子维护
+per-intent 追问计数（会话 hash 字段 ``followup:{TAG}``）与会话追问
+总数 ``followup_count``（仅追问命中——per-intent ≥2——时自增），并
+随脚本刷新 EXPIRE；返回 ``(per_intent_count, followup_count)`` 双计数。
+追问判定的权威值只存 Redis（AD-4），UNKNOWN 不参与计数（调用方
+口径）。仍待后续交付：``write_coref``（指代消解 Story）、
 ``mark_handoff``（Epic 5）及 ``:coref:{turn}`` 键落盘。
 """
 
@@ -26,7 +33,7 @@ from typing import cast
 
 import redis
 
-from weiliao_agent.models.intent import IntentClassification
+from weiliao_agent.models.intent import IntentClassification, IntentTag
 
 # 会话状态 key 前缀（架构一致性约定）。
 KEY_PREFIX = "weiliao:session:"
@@ -63,6 +70,26 @@ redis.call('EXPIRE', key, ttl_seconds)
 return count
 """
 
+_LUA_RECORD_FOLLOWUP = """
+local key = KEYS[1]
+local tag_field = ARGV[1]
+local ttl_seconds = tonumber(ARGV[2])
+local per_intent = redis.call('HINCRBY', key, tag_field, 1)
+local session_count = 0
+if per_intent >= 2 then
+  -- 追问命中（同意图第 2 次起）才自增会话追问总数；否则只读出现值，
+  -- 不得为首次出现创建 followup_count 字段（语义钉死：非 turn 序号）。
+  session_count = redis.call('HINCRBY', key, 'followup_count', 1)
+else
+  local existing = redis.call('HGET', key, 'followup_count')
+  if existing then
+    session_count = tonumber(existing)
+  end
+end
+redis.call('EXPIRE', key, ttl_seconds)
+return {per_intent, session_count}
+"""
+
 
 @dataclass(frozen=True)
 class SessionSnapshot:
@@ -91,6 +118,7 @@ class SessionManager:
         self._ttl_seconds = ttl_seconds
         self._begin_turn_script = client.register_script(_LUA_BEGIN_TURN)
         self._increment_followup_script = client.register_script(_LUA_INCREMENT_FOLLOWUP)
+        self._record_followup_script = client.register_script(_LUA_RECORD_FOLLOWUP)
 
     def begin_turn(self, session_id: str, timestamp: datetime) -> SessionSnapshot:
         """入管道前快照：初始化/自增 turn、刷新 TTL 与 ``last_message_at``。
@@ -117,12 +145,44 @@ class SessionManager:
         )
 
     def increment_followup(self, session_id: str) -> int:
-        """追问计数 Redis 原子自增并刷新 TTL；返回权威值（Epic 2 消费）。"""
+        """追问计数 Redis 原子自增并刷新 TTL；返回权威值（Epic 2 消费）。
+
+        警告（Story 2.3 语义钉死）：本原语无条件自增 ``followup_count``，
+        而 Epic 2 追问计数的权威语义为「仅追问命中（per-intent ≥2）时
+        自增」。追问识别必须只经 ``record_followup``——本方法不得用于
+        追问计数，否则会把普通消息混入权威计数、污染 ≥3 信号。
+        """
         count = self._increment_followup_script(
             keys=[self._key(session_id)],
             args=[self._ttl_seconds],
         )
         return int(cast("int | str | bytes", count))
+
+    def record_followup(self, session_id: str, tag: IntentTag) -> tuple[int, int]:
+        """追问识别原子记录（Story 2.3，AD-4）：per-intent 计数 + 会话总数。
+
+        Lua 单 roundtrip：``HINCRBY followup:{TAG}`` 维护 per-intent 计数；
+        仅当 per-intent ≥2（追问命中）时自增会话 ``followup_count``——
+        否则恒等于 turn 序号，「≥3」会在第 3 条普通消息误触发；EXPIRE
+        随脚本刷新，TTL 与会话一致。返回 ``(per_intent_count,
+        session_followup_count)`` 双计数，调用方据 per-intent ≥2 判定
+        ``is_followup``、据会话总数 ≥3 产出 hard trigger 信号。
+
+        调用方口径（intent_router）：仅分类成功、turn 非 None 且 tag 非
+        UNKNOWN 时调用；UNKNOWN 与本模块 1.3 的 ``increment_followup``
+        原语均不参与本计数。写失败不吞异常：调用方经 try 包裹 fail-safe。
+        """
+        raw = self._record_followup_script(
+            keys=[self._key(session_id)],
+            args=[f"followup:{tag}", self._ttl_seconds],
+        )
+        per_intent, session_count = cast(
+            "tuple[object, object]", tuple(cast("list[object]", raw))
+        )
+        return (
+            int(cast("int | str | bytes", per_intent)),
+            int(cast("int | str | bytes", session_count)),
+        )
 
     def write_intent(
         self,

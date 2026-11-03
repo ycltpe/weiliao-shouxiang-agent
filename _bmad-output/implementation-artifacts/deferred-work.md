@@ -35,3 +35,11 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-5-langfuse-tracing-scaffold.md`
   summary: trace_id 生成双格式并存：编排器/信封链路用 `uuid4().hex`（32-hex，Langfuse 可检索），HTTP 兜底 `_fallback_result` 用 `str(uuid.uuid4())`（带连字符，Langfuse 不可检索）
   evidence: `_fallback_result` 为 Story 1.2 预存代码，spec 明确要求 http.py 零改动、兜底行为与 1.4 逐字节一致；本 Story 未引入该分歧。settle：统一兜底口径时（如 Story 2.x 接入端点改造）一并定夺兜底 trace_id 是否也要 Langfuse 可检索。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-followup-query-detection.md`
+  summary: 追问计数/hard trigger 的 Langfuse 事件（intent.followup / intent.followup_hard_trigger）形状仅经 set_langfuse_client 替身接缝验证，真实 Langfuse SDK 契约（create_event 参数、事件可检索性）无任何常规验证
+  evidence: 仓内既定模式（Story 1.5/2.2 起所有 tracing 事件均走同一替身接缝，tracing.py:54 载明）；AC「Langfuse 可检索」实际依赖部署后真实 SDK 行为。settle：随部署/可观测 deferred 工作（如 Langfuse 自托管/masking 决策）一并补真实集成检验。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-followup-query-detection.md`
+  summary: record_followup 的 50 线程并发计数精确性仅在 fakeredis（server 级全局串行锁）下验证，真实 Redis 下 Lua 原子性无集成测试
+  evidence: 与 Story 1.3 已 deferred 条目同根因（fakeredis 使命令完全串行，非原子实现同样可通过）；当前依赖结构性单脚本（register_script 单 roundtrip）保证。settle：同 1.3 条目——部署形态落地后补容器化真实 Redis 并发集成测试。

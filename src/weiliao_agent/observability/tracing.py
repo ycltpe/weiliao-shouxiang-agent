@@ -23,6 +23,14 @@ preset 值（分类尚未发生），分类结果只能经 ``record_classificati
 记录一律在主线程编排器侧、以 ``TraceContext(trace_id=...)`` 显式挂到
 消息 trace：过滤器在 ThreadPoolExecutor 线程内执行，不做 OTel 跨线程
 context 传播（spec Never 约束）。
+
+追问识别事件（Story 2.3）：分类成功后 intent_router 经注入的会话单写者
+回调记录 (session, intent) 计数，``record_followup`` 补挂追问事件
+（tag / per_intent_count / session_followup_count / is_followup）；
+会话追问总数达 3 时 ``record_followup_hard_trigger`` 产出 hard trigger
+信号事件（命中条件=追问≥3，判定与转人工归 Epic 5 的 AD-12 模块）。
+记录失败经 ``record_classification_failure``（reason=
+``followup_record_failed``）观测，fail-safe 口径不变。
 """
 
 import re
@@ -306,6 +314,63 @@ def record_classification_failure(trace_id: str | None, *, reason: str) -> None:
             metadata={
                 "event": "intent_classification_failure",
                 "reason": reason[:_STATUS_MESSAGE_LIMIT],
+            },
+        )
+
+
+def record_followup(
+    trace_id: str | None,
+    *,
+    tag: str,
+    per_intent_count: int,
+    session_followup_count: int,
+    is_followup: bool,
+) -> None:
+    """追问记录事件（Story 2.3）：per-intent / 会话总数 / 标记补挂消息 trace。
+
+    fail-safe 口径同 ``record_classification``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="intent.followup",
+            metadata={
+                "event": "intent_followup",
+                "tag": tag,
+                "per_intent_count": per_intent_count,
+                "session_followup_count": session_followup_count,
+                "is_followup": is_followup,
+            },
+        )
+
+
+def record_followup_hard_trigger(trace_id: str | None, *, count: int) -> None:
+    """追问 ≥3 hard trigger 信号事件（Story 2.3）：判定归 Epic 5（AD-12）。
+
+    本事件仅为触发信号（Langfuse 可检索），不写信封 handoff 字段；
+    判定方读 Redis 权威值而非任何快照。fail-safe 口径同上。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="intent.followup_hard_trigger",
+            level="WARNING",
+            metadata={
+                "event": "followup_hard_trigger",
+                "hit_condition": "followup>=3",
+                "count": count,
             },
         )
 

@@ -18,6 +18,10 @@
 - ``intent`` 已收窄为 ``IntentTag | None``（Story 2.1，9 类 Literal 枚举，
   权威定义在 models.intent，由分类器填写）：未知值经 ``model_validate``
   拒绝即 fail-closed 到模板兜底；
+- ``is_followup``（Story 2.3，重复追问标记）：同一 session 内同一意图第
+  2 次起为 True，由 intent_router 经注入的会话单写者回调判定后写回；
+  默认 False（含分类 fail-closed / 记录失败 fail-safe 路径）。Epic 3 的
+  cache_lookup 据此禁走 L0 缓存；
 - ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
   预留字段，本 Story 仅定义、不消费，默认 None。
 """
@@ -41,6 +45,10 @@ class Envelope(BaseModel):
     trace_id: str | None = Field(default=None, min_length=1)
     turn: int | None = None
     intent: IntentTag | None = None
+    # Story 2.3：Follow-up Query 标记（同意图第 2 次起为 True，Epic 3
+    # cache_lookup 消费）；默认 False——分类 fail-closed 与追问记录失败
+    # fail-safe 路径均不置位。
+    is_followup: bool = False
     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
     # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
     message: str | None = None

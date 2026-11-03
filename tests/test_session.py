@@ -329,6 +329,130 @@ def test_write_intent_does_not_touch_session_hash(
     assert client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:3") is not None
 
 
+def test_record_followup_first_occurrence_does_not_increment_session_count(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    manager.begin_turn(SESSION_ID, TS_1)
+
+    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+
+    assert (per_intent, session_count) == (1, 0)  # 首次出现非追问，总数不自增
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY") == b"1"
+    assert client.hget(key, "followup_count") == b"0"
+    assert client.ttl(key) == DEFAULT_TTL_SECONDS  # EXPIRE 随脚本刷新
+
+
+def test_record_followup_second_occurrence_marks_followup(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+
+    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+
+    assert (per_intent, session_count) == (2, 1)  # 追问 #1：per-intent ≥2 命中
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert client.hget(key, "followup_count") == b"1"
+
+
+def test_record_followup_same_tag_reaches_threshold_at_fourth_message(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 语义钉死：追问 #3 = 同意图第 4 次消息（≥3 信号触发时刻）。
+    manager.begin_turn(SESSION_ID, TS_1)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (1, 0)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (2, 1)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (3, 2)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (4, 3)
+    assert client.hget(f"{KEY_PREFIX}{SESSION_ID}", "followup_count") == b"3"
+
+
+def test_record_followup_counts_across_intents(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 「≥3 无论意图类型」：跨意图累计第 3 次追问命中（各意图第 2 次）。
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "AVAILABILITY")
+    manager.record_followup(SESSION_ID, "LOCATION")
+
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (2, 1)
+    assert manager.record_followup(SESSION_ID, "AVAILABILITY") == (2, 2)
+    assert manager.record_followup(SESSION_ID, "LOCATION") == (2, 3)
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert client.hget(key, "followup:AVAILABILITY") == b"2"
+    assert client.hget(key, "followup:LOCATION") == b"2"
+    assert client.hget(key, "followup_count") == b"3"
+
+
+def test_record_followup_isolates_per_intent_counters(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+
+    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING")
+
+    # GREETING 首次出现：per-intent 独立计数，会话总数只计 PRICE_INQUIRY 的命中。
+    assert (per_intent, session_count) == (1, 1)
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:GREETING") == b"1"
+    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+
+
+def test_record_followup_refreshes_ttl(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    manager.begin_turn(SESSION_ID, TS_1)
+    client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 模拟中途 TTL 被压短
+
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+
+    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
+
+
+def test_record_followup_before_begin_turn_preserves_counts(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # record_followup 先执行（hash 已存在但无 turn 字段）：begin_turn
+    # 不得误判为新会话而把 per-intent / followup_count 清零。
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+
+    snapshot = manager.begin_turn(SESSION_ID, TS_1)
+
+    assert snapshot.turn == 1
+    assert snapshot.followup_count == 1
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+
+
+def test_concurrent_record_followup_counts_exactly(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 并发同 session 同 intent：per-intent 与会话总数均精确不丢不重。
+    manager.begin_turn(SESSION_ID, TS_1)
+    threads = 50
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        results = list(
+            pool.map(
+                lambda _i: manager.record_followup(SESSION_ID, "PRICE_INQUIRY"),
+                range(threads),
+            )
+        )
+
+    per_intents = sorted(r[0] for r in results)
+    assert per_intents == list(range(1, threads + 1))
+    assert all(r[1] == r[0] - 1 for r in results)  # 会话总数 = per-intent - 1
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY") == str(threads).encode()
+    assert client.hget(key, "followup_count") == str(threads - 1).encode()
+
+
 def test_main_composition_root_rejects_unknown_classifier(
     monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
 ) -> None:
@@ -408,3 +532,34 @@ def test_main_composition_root_writes_intent_to_redis(
     assert raw is not None
     stored = json.loads(cast("bytes", raw).decode())
     assert stored == {"tag": "PRICE_INQUIRY", "confidence": 0.91}
+
+
+def test_main_composition_root_records_followup_to_redis(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 默认链路端到端（Story 2.3 验收）：同一 session 同一意图第 2 条消息
+    # 经组合根注入的 record_followup 落盘——followup:TAG=2、followup_count=1。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+    classifier = main_module._classifier
+    assert isinstance(classifier, LlmZeroShotClassifier)
+    classifier._structured_model = _FakeStructuredModel(
+        _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.91)
+    )
+    http = TestClient(main_module.app)
+    payload = {**_valid_payload(), "message": "你好，这套房多少钱？"}
+
+    first = http.post("/v1/messages", json=payload)
+    second = http.post(
+        "/v1/messages",
+        json={**payload, "timestamp": TS_2.isoformat()},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert fake.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert fake.hget(key, "followup_count") == b"1"
+    assert fake.ttl(key) == DEFAULT_TTL_SECONDS
