@@ -334,6 +334,42 @@ def test_followup_threshold_emits_hard_trigger_event(
     assert event["metadata"]["count"] == 3
 
 
+def test_followup_past_threshold_does_not_reemit_hard_trigger(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # 负边界（锁评审 E1）：计数已过 3 的追问命中不重发信号——
+    # 若实现退化为 >= 3，本条即红。
+    recorder = _StubFollowupRecorder((3, 4))
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        followup_recorder=recorder,
+    )
+    envelope = Envelope.model_validate(_followup_payload())
+
+    result = filter_.process(envelope)
+
+    assert result.is_followup is True
+    assert "intent.followup_hard_trigger" not in _event_names(fake_langfuse)
+
+
+def test_followup_first_occurrence_after_threshold_emits_nothing(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # 负边界（锁评审 E2）：会话计数已达标时，新意图首次出现（非追问）
+    # 不发信号——若丢失 is_followup 守卫，本条即红。
+    recorder = _StubFollowupRecorder((1, 3))
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
+        followup_recorder=recorder,
+    )
+    envelope = Envelope.model_validate(_followup_payload())
+
+    result = filter_.process(envelope)
+
+    assert result.is_followup is False
+    assert "intent.followup_hard_trigger" not in _event_names(fake_langfuse)
+
+
 def test_followup_recorder_failure_fails_safe(fake_langfuse: _FakeLangfuse) -> None:
     # recorder 抛 redis.RedisError：不应答降级、信封保留分类结果、
     # is_followup 保持默认 False、trace 记失败事件、过滤器不向上抛。

@@ -76,6 +76,15 @@ context:
 - Given 多线程并发对同 session 同意图记录追问，when 全部完成，then 各次计数精确不丢不重。
 - Given `uv run pytest tests -q`，when 全量执行，then 既有用例 + 新增用例全部通过，零回归；`ruff check src tests` 与 `mypy src`（strict）无告警。
 
+### Review Findings
+
+（2026-11-03 bmad-code-review 独立二次评审：blind-hunter 14 / edge-case-hunter 3 / verification-gap 3 / acceptance-auditor 4，共 24 项原始发现，合并为 18 项——decision-needed 1 / patch 2 / defer 1 / dismiss 14）
+
+- [x] [Review][Decision] `followup_count` 双写原语硬化选择（low；盲审+边界+验证缺口+验收审计四层同指）— 1.3 `increment_followup`（无条件自增）与 2.3 `record_followup`（仅追问命中自增）共享同名字段，当前唯一屏障是 G4 docstring 警告；若未来调用方误用 increment_followup 把计数推过 3，`== 3` 穿越信号将静默永不触发。选项：A 维持 docstring 警告（现状零改动）/ B 弃用 increment_followup（需修订本 spec「既有原语不动」约束并改 1.3 锁定测试）/ C 字段改名隔离（需数据语义迁移、同样动 1.3 测试）。**裁决（2026-11-03）：选 A 维持 docstring 警告，风险接受。**
+- [x] [Review][Patch] G1 修复缺负边界回归测试（medium；验证缺口层经变异测试实证：`== 3` 改回 `>= 3` 全套件仍绿） [`src/weiliao_agent/filters/intent_router.py:172`] — 补两条 stub 用例：recorder 返 `(3, 4)`（计数已过 3 的追问不重发信号，锁 E1）与 `(1, 3)`（会话已达标时新意图首次出现非追问、不发信号，锁 E2）。**已修复（2026-11-03）：`test_followup_past_threshold_does_not_reemit_hard_trigger` 与 `test_followup_first_occurrence_after_threshold_emits_nothing`，全套件 114 例绿。**
+- [x] [Review][Patch] `record_followup` docstring 阈值措辞矛盾（low；验收审计层发现，已读码证实） [`src/weiliao_agent/session/manager.py:161`] — docstring 写「据会话总数 ≥3 产出 hard trigger 信号」，与实现的恰为 3 穿越语义（`== 3`）矛盾，会误导 Epic 5 消费方；改为「恰为 3（第 3 次追问穿越）」。**已修复（2026-11-03）。**
+- [x] [Review][Defer] 并发计数精确性仅 fakeredis 验证 [`tests/test_session.py:452`] — deferred, pre-existing（fakeredis server 级全局串行，与首次评审 deferred 条目及 Story 1.3 条目同根因；已记录 deferred-work.md，settle：部署形态落地后补真实 Redis 集成测试）。
+
 ## Implementation Notes
 
 - Lua 脚本内做条件自增：`per_intent >= 2` 才 `HINCRBY followup_count`，

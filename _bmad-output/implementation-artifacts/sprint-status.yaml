@@ -58,7 +58,7 @@ development_status:
   epic-2: in-progress
   2-1-意图标签模型与分类器接口: review
   2-2-意图分类默认实现: review
-  2-3-重复追问识别: review
+  2-3-重复追问识别: done
   epic-2-retrospective: optional
   epic-3: backlog
   3-1-事实卡片-Schema-与-L0-缓存客户端: backlog

@@ -43,3 +43,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-3-followup-query-detection.md`
   summary: record_followup 的 50 线程并发计数精确性仅在 fakeredis（server 级全局串行锁）下验证，真实 Redis 下 Lua 原子性无集成测试
   evidence: 与 Story 1.3 已 deferred 条目同根因（fakeredis 使命令完全串行，非原子实现同样可通过）；当前依赖结构性单脚本（register_script 单 roundtrip）保证。settle：同 1.3 条目——部署形态落地后补容器化真实 Redis 并发集成测试。
+
+## Deferred from: code review of spec-2-3-followup-query-detection (2026-11-03)
+
+- `record_followup` 并发计数精确性与「恰一条消息得 count==3」属性仅在 fakeredis（server 级全局串行锁）下验证，真实 Redis 原子性与并发穿越唯一性无集成测试。与 Story 1.3/首次评审 deferred 条目同根因同 settle 路径：部署形态落地后补容器化真实 Redis 并发集成测试。
