@@ -10,6 +10,7 @@ from weiliao_agent.observability.tracing import (
     filter_span,
     get_langfuse,
     new_trace_id,
+    record_cache_event,
     record_degradation,
     record_delivery,
     record_generation,
@@ -18,6 +19,7 @@ from weiliao_agent.observability.tracing import (
 )
 
 __all__ = [
+    "record_cache_event",
     "filter_span",
     "get_langfuse",
     "new_trace_id",

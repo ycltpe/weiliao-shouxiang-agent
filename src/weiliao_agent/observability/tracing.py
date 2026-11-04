@@ -37,7 +37,7 @@ import re
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from typing import Any
+from typing import Any, Literal
 
 from langfuse import Langfuse, get_client, propagate_attributes
 from langfuse.types import TraceContext
@@ -408,3 +408,46 @@ def record_generation(
             pass
     except Exception:
         pass
+
+
+def record_cache_event(
+    trace_id: str | None,
+    *,
+    operation: str,
+    stage: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """缓存事件写入消息 trace（Story 3.1，L0 客户端复用）。
+
+    事件 taxonomy（operation）：``hit``（读命中）/ ``write``（写入成功）/
+    ``invalidated``（逻辑作废，含读路径按墓碑拦截——同一 operation 兼
+    作废动作与读拦截两语义）/ ``corrupted``（损坏数据，视为 miss）/
+    ``failure``（Redis 故障）。仅 ``corrupted`` / ``failure`` 为 ERROR 级；
+    其余 DEFAULT 级。stage 词表：``set`` / ``get`` / ``invalidate``。
+
+    保留键（``event`` / ``operation`` / ``stage``）由本函数权威写入，
+    调用方 ``metadata`` 一律挂于独立 ``metadata`` 子键，不得覆盖保留键
+    （嵌套或过滤，评审循环 3）。fail-safe 口径同 ``record_degradation``：
+    记录本身再抛异常也吞掉，绝不二次影响买家应答。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    level: Literal["DEFAULT", "ERROR"] = (
+        "ERROR" if operation in ("corrupted", "failure") else "DEFAULT"
+    )
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="cache.event",
+            level=level,
+            metadata={
+                "event": "cache_event",
+                "operation": operation,
+                "stage": stage,
+                "metadata": dict(metadata) if metadata else {},
+            },
+        )
