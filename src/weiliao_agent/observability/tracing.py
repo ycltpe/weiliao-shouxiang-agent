@@ -50,6 +50,10 @@ _VALID_TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 # 状态消息长度上限（降级归因等，防异常文本膨胀 trace）。
 _STATUS_MESSAGE_LIMIT = 500
 
+# ``house.sync.trigger`` 消费事件 operation 词表（Story 3.2 评审补丁）：
+# 四值 Literal 权威定义，拼错即静态报错，防 ERROR 词被静默降级 DEFAULT。
+HouseSyncOperation = Literal["consumed", "stale_alert", "corrupted", "failure"]
+
 # 惰性单例缓存（get_client 内部按 public_key 单例）；测试可经
 # ``set_langfuse_client`` 注入替身或重置回 None 走惰性初始化。
 _client: Langfuse | None = None
@@ -448,6 +452,49 @@ def record_cache_event(
                 "event": "cache_event",
                 "operation": operation,
                 "stage": stage,
+                "metadata": dict(metadata) if metadata else {},
+            },
+        )
+
+
+def record_house_sync_event(
+    trace_id: str | None,
+    *,
+    operation: HouseSyncOperation,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """``house.sync.trigger`` 消费事件写入独立 trace（Story 3.2）。
+
+    事件 taxonomy（operation）：``consumed``（消息处理完成：upsert 写入、
+    invalidate 生效或超期转失效——含延迟 metadata）/ ``stale_alert``
+    （超期 >500ms 事件按失效处理 + 告警）/ ``corrupted``（JSON 损坏 /
+    schema 校验失败，毒消息跳过并提交 offset）/ ``failure``（L0 写失败
+    未提交 offset 可重放、Kafka 断连重连）。仅 ``stale_alert`` /
+    ``corrupted`` / ``failure`` 为 ERROR 级；``consumed`` 为 DEFAULT 级。
+
+    与 ``record_cache_event`` 同口径：保留键（``event`` / ``operation``）
+    由本函数权威写入，调用方 ``metadata`` 一律挂于独立 ``metadata`` 子键；
+    每事件独立 trace_id（消费者侧经 ``new_trace_id`` 生成，与消息 trace
+    解耦——消费链路无买家消息 trace 可挂）。fail-safe：记录本身再抛异常
+    也吞掉，绝不令消费者崩溃或影响 API 路径。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    level: Literal["DEFAULT", "ERROR"] = (
+        "ERROR" if operation in ("stale_alert", "corrupted", "failure") else "DEFAULT"
+    )
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="house_sync.event",
+            level=level,
+            metadata={
+                "event": "house_sync_event",
+                "operation": operation,
                 "metadata": dict(metadata) if metadata else {},
             },
         )

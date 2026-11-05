@@ -47,3 +47,9 @@
 ## Deferred from: code review of spec-2-3-followup-query-detection (2026-11-03)
 
 - `record_followup` 并发计数精确性与「恰一条消息得 count==3」属性仅在 fakeredis（server 级全局串行锁）下验证，真实 Redis 原子性与并发穿越唯一性无集成测试。与 Story 1.3/首次评审 deferred 条目同根因同 settle 路径：部署形态落地后补容器化真实 Redis 并发集成测试。
+
+## Deferred from: code review of spec-3-2-kafka-house-event-sync-consumer (2026-11-05)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-kafka-house-event-sync-consumer.md`
+  summary: docker-compose redpanda/redpanda-init 服务无任何自动化校验（仅 spec Verification 手工步骤），compose 配置回归无法被测试发现
+  evidence: 本 story 新增的 dev broker 只靠 spec 手工检查守护；仓库无 CI，pytest/mypy/ruff 均不触碰 compose 文件，redpanda-init 命令或 healthcheck 的笔误可全绿入库。settle：属流程决策——引入 compose 解析校验（如 CI 里 docker compose config -q 或 pytest + pyyaml 断言 topic 创建服务），需先定 CI 形态。

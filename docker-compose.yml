@@ -182,6 +182,51 @@ services:
       start_period: 40s
     restart: unless-stopped
 
+  # ========== 消息队列（本地开发 broker，Story 3.2） ==========
+  # 单节点 redpanda 仅供开发联调（spec 约束：不做集群/分区生产拓扑设计）。
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: local-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      # 双监听：9092 供宿主机（广告 localhost），29092 供容器网络
+      # （广告 redpanda:29092）——init 容器经内部地址引导才不会拿到
+      # localhost 广告而连接失败。
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092,INTERNAL://redpanda:29092
+    ports:
+      - "9092:9092"    # Kafka API（WEILIAO_KAFKA_BROKERS=localhost:9092）
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # topic 创建：仅在「创建成功」或「经列表确认已存在」时收敛为成功，
+  # 其余失败（broker 不可达等）必须非零退出，不再被 || true 吞掉。
+  redpanda-init:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: local-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "if rpk topic create house.sync.trigger --brokers redpanda:29092; then
+      echo 'topic created';
+      elif rpk topic list --brokers redpanda:29092 | grep -q '^house\.sync\.trigger'; then
+      echo 'topic already exists';
+      else
+      echo 'topic creation failed' >&2; exit 1; fi"
+
 volumes:
   redis-data:
   postgres-data:
@@ -193,3 +238,4 @@ volumes:
   milvus-data:
   milvus-etcd-data:
   milvus-minio-data:
+  redpanda-data:

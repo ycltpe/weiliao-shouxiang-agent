@@ -46,6 +46,22 @@ LLM_BASE_URL=https://your-gateway/v1
 WEILIAO_REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
+房源事件同步消费者（Story 3.2，Kafka `house.sync.trigger`）为可选启停：
+
+```bash
+# 非空才启动消费者（缺省不启动：本地开发与测试零 broker 零噪音）
+WEILIAO_KAFKA_BROKERS=localhost:9092
+# 以下为缺省值，显式设置可覆盖：house.sync.trigger / weiliao-house-sync
+WEILIAO_KAFKA_TOPIC=house.sync.trigger
+WEILIAO_KAFKA_GROUP_ID=weiliao-house-sync
+```
+
+本地联调 broker：`docker compose up -d redpanda redpanda-init`（单节点
+redpanda，Kafka API 暴露于 9092，init 容器自动创建
+`house.sync.trigger` topic），随后以前述
+`WEILIAO_KAFKA_BROKERS=localhost:9092` 启动服务，即可经 rpk 发送事件
+观察消费日志与 Langfuse 事件。
+
 ## 开发
 
 ```bash
