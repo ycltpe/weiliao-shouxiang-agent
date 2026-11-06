@@ -59,3 +59,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-4-1-template-fallback-response-library.md`
   summary: PHOTO_REQUEST 的图片/相册素材分支已提供同步接口，但当前生产调用点均不传素材，图片素材来源尚未接入
   evidence: Story 4.1 冻结块明确不实现图片素材查询；接口为后续响应组装/素材服务接入预留。settle：在实现图片素材查询的后续 Story 接入真实调用方，并验证有图、有相册、无图三条生产路径。
+
+## Deferred from: code review of spec-4-3-fact-card-grounding-controlled-generation (2026-11-06)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-4-3-fact-card-grounding-controlled-generation.md`
+  summary: 编排器逐跳超时丢弃的执行线程无取消机制，llm_generate 慢调用被丢弃后 OpenAI 请求仍在后台跑完，产生纯浪费的 token 花费（无任何归因/记账）
+  evidence: 1.2 deferred 条目已记「超时丢弃的执行线程无取消/复用机制……Epic 4 接入带副作用的真实过滤器后做超时风暴压测，重审执行器生命周期」；本 Story 影子接入真实生成过滤器后该场景首次可达。settle：与该挂账项同批——超时风暴压测时重审执行器生命周期（共享池/cancel/草稿丢弃通知），并评估是否需要为被丢弃的生成调用记 token 归因。
+- source_spec: `_bmad-output/implementation-artifacts/spec-4-3-fact-card-grounding-controlled-generation.md`
+  summary: grounding 违禁清单的裸「最」「第一」子串匹配会误伤良性表述（如「最近」「最后」「最好」），可能丢弃合规草稿
+  evidence: 该清单沿用 Story AC 既定违禁词与 4.1 `_FORBIDDEN_MATERIAL_FRAGMENTS`，fail-closed 方向安全（影子模式下代价仅为 token 浪费）；改用分词/豁免表等更精确匹配属业务违禁词口径定夺。settle：随 4.4 的审核通过率与 grounding_failed 监控数据观察误报率后定，若误报高再细化匹配语义。

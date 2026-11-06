@@ -27,7 +27,7 @@ def test_health_ready_returns_200() -> None:
     # Story 3.4（A 方案）：就绪响应附 metrics snapshot（压测 curl 即读）；
     # 快照读取自身 fail-safe，就绪判定不受影响。
     metrics_module.reset_cache_metrics()
-    client = TestClient(create_app())  # 默认四过滤器链完整
+    client = TestClient(create_app())  # 默认五过滤器链完整
     response = client.get("/health")
     assert response.status_code == 200
     body = response.json()

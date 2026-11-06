@@ -26,6 +26,11 @@
   查找的下游通道——cache_lookup 命中把卡片挂到信封，miss 保持 None
   留给 Epic 4 的 LLM 层；查找顺序 L1 → L0 → LLM 对管道真实可观测，
   Story 3.4 的命中率口径亦基于本字段统计；
+- ``generated_reply``（Story 4.3，受控生成草稿挂点，影子接入决策 A）：
+  llm_generate 过滤器把通过确定性 grounding 校验的 LLM 草稿挂到本
+  可选字段；红线意图/非文本/空消息跳过、生成异常、校验未过一律保持
+  None。买家可见应答仍由 response_assembler 模板兜底产出——4.4 审核
+  就位前 LLM 内容不得触达买家；
 - ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
   预留字段，本 Story 仅定义、不消费，默认 None。
 """
@@ -58,6 +63,10 @@ class Envelope(BaseModel):
     # 卡片，miss 保持 None 留给 Epic 4 LLM 层；买家可见应答仍由
     # response_assembler 的占位模板产出，本字段仅携带结构化事实。
     fact_card: FactCard | None = None
+    # Story 4.3：受控生成草稿挂点（影子接入，决策 A 方案）——仅
+    # llm_generate 写入（model_copy 追加可选字段，既有 model_validate
+    # 兼容）；任何故障路径保持 None，买家可见语义不变。
+    generated_reply: str | None = None
     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
     # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
     message: str | None = None

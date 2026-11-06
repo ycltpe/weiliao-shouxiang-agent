@@ -1,8 +1,8 @@
 """管道编排器（Story 1.2 核心交付）。
 
 手写纯 Python 编排（AD-2，无 LangGraph Runtime 依赖）：顺序调用
-intent_router → cache_lookup → risk_review → response_assembler，
-过滤器间仅经信封传递。
+intent_router → cache_lookup → llm_generate → risk_review →
+response_assembler，过滤器间仅经信封传递。
 
 Story 1.5 追踪挂点：``run()`` 入口为 trace_id 单一权威生成点（信封
 缺失即回填；携带值透传——既有测试锁定该语义，非 32-hex 值仅跳过
@@ -29,14 +29,23 @@ from dataclasses import asdict, dataclass
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.filters.cache_lookup import CacheLookupFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
+from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.risk_review import RiskReviewFilter
 from weiliao_agent.filters.templates import render_fallback
+from weiliao_agent.llm.client import OpenAiGenerationClient
+from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.observability import tracing
 
 # 端到端内部预算：NFR-1 P99 < 3s 的出口余量口径，可配置。
 DEFAULT_BUDGET_SECONDS = 2.5
+# LLM 生成子图预算（Story 4.3）：必须显著小于编排器内部预算——客户端
+# 默认 1.8s 的慢调用会拖过剩余跳预算，使编排器以 slow_filter=llm_generate
+# 降级（degraded=True），违反影子模式「生成链路故障对买家零感知」；
+# 0.9s 使慢调用在过滤器内超时归一为生成失败（仅丢草稿 + trace 事件，
+# 买家应答与 degraded 语义逐字节保持 4.2 前口径）。装配期不触达凭据。
+LLM_GENERATE_BUDGET_SECONDS = 0.9
 
 
 @dataclass(frozen=True)
@@ -54,7 +63,7 @@ class PipelineResult:
 
 
 class PipelineOrchestrator:
-    """顺序编排四过滤器链，统一异常捕获与逐跳 deadline 预算。"""
+    """顺序编排五过滤器链，统一异常捕获与逐跳 deadline 预算。"""
 
     def __init__(
         self,
@@ -67,6 +76,13 @@ class PipelineOrchestrator:
             else [
                 IntentRouterFilter(),
                 CacheLookupFilter(),
+                LlmGenerateFilter(
+                    subgraph=LlmGenerationSubgraph(
+                        OpenAiGenerationClient(
+                            budget_seconds=LLM_GENERATE_BUDGET_SECONDS
+                        )
+                    )
+                ),
                 RiskReviewFilter(),
                 ResponseAssemblerFilter(),
             ]

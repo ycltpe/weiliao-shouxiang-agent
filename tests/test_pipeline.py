@@ -190,6 +190,15 @@ def test_default_chain_intent_router_defaults_missing_intent_to_unknown() -> Non
 
     result = orchestrator.run(envelope)
 
+    # Story 4.3：默认链五过滤器口径，顺序固定（llm_generate 影子接入，
+    # cache_lookup 与 risk_review 之间）。
+    assert orchestrator.filter_names == (
+        "intent_router",
+        "cache_lookup",
+        "llm_generate",
+        "risk_review",
+        "response_assembler",
+    )
     assert result.degraded is False
     assert result.reply == render_fallback("UNKNOWN")
 

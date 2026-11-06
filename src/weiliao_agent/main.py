@@ -28,6 +28,12 @@ SessionManager，L1 仅为读优化快照）；模块级另建 ``L0CacheClient``
 实例注入 cache_lookup（与 lifespan 内消费者实例相互独立，共享同一
 redis-py 客户端）。
 
+Story 4.3 组合根：``LlmGenerateFilter`` 插入 cache_lookup 与
+risk_review 之间（影子接入决策 A）；注入预算 0.9s 的子图
+（``LLM_GENERATE_BUDGET_SECONDS``，慢调用在过滤器内超时归一，防
+拖过编排器剩余跳预算导致误降级）——装配期不触达 OpenAI 凭据，
+生成草稿只挂信封 ``generated_reply``，买家可见应答仍 100% 模板兜底。
+
 Story 3.4 组合根（A 方案）：cache_lookup 的追问禁走与命中率计数经
 ``observability.metrics`` 模块级单例归集；``/health`` 就绪响应附
 metrics snapshot（压测 curl 即读）；lifespan 托管定时结构化 stderr
@@ -49,10 +55,13 @@ from weiliao_agent.cache.l1_cache import L1CacheClient
 from weiliao_agent.classifiers import create_classifier
 from weiliao_agent.filters.cache_lookup import CacheLookupFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
+from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.risk_review import RiskReviewFilter
+from weiliao_agent.llm.client import OpenAiGenerationClient
+from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.observability import metrics
-from weiliao_agent.pipeline import PipelineOrchestrator
+from weiliao_agent.pipeline import LLM_GENERATE_BUDGET_SECONDS, PipelineOrchestrator
 from weiliao_agent.session import SessionManager
 from weiliao_agent.workers import HouseSyncConsumer, KafkaMessageSource
 
@@ -152,6 +161,11 @@ app = create_app(
                 followup_snapshot_writer=_l1_cache.set_followup_count,
             ),
             CacheLookupFilter(l0_client=_l0_cache),
+            LlmGenerateFilter(
+                subgraph=LlmGenerationSubgraph(
+                    OpenAiGenerationClient(budget_seconds=LLM_GENERATE_BUDGET_SECONDS)
+                )
+            ),
             RiskReviewFilter(),
             ResponseAssemblerFilter(),
         ]

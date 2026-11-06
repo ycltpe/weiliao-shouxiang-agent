@@ -99,4 +99,8 @@ def test_generation_constraints_carry_compliance_rules() -> None:
 
     assert "不得虚构价格" in text
     assert "学区名额" in text
+    # Story 4.3 强化：违禁词与自称经纪人禁令须明示在生成约束段。
+    assert "价格可谈" in text
+    assert "「最」「第一」" in text
+    assert "我是这套房的经纪人" in text
     assert "AI 助手" in text

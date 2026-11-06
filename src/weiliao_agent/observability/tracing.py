@@ -460,6 +460,40 @@ def record_cache_event(
         )
 
 
+def record_llm_generate_event(
+    trace_id: str | None,
+    *,
+    outcome: Literal["grounding_failed", "generation_error"],
+    reason: str,
+) -> None:
+    """LLM 受控生成失败事件（Story 4.3）：仅可观测，不影响买家应答。
+
+    事件 taxonomy（outcome）：``grounding_failed``（确定性校验未过，
+    草稿被丢弃）/ ``generation_error``（模型调用异常/凭据缺失，无草稿）。
+    两值均为 ERROR 级。影子接入口径：本事件只记录生成链路故障，
+    ``degraded`` 语义不动（买家可见应答始终是模板兜底，AC 第 4 条
+    「行为与 4.2 前逐字节一致」经此与编排器降级事件区分开）。
+    fail-safe 口径同 ``record_degradation``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="llm.generate_event",
+            level="ERROR",
+            metadata={
+                "event": "llm_generate_event",
+                "outcome": outcome,
+                "reason": reason[:_STATUS_MESSAGE_LIMIT],
+            },
+        )
+
+
 def record_house_sync_event(
     trace_id: str | None,
     *,
