@@ -619,3 +619,17 @@ def test_main_l1_ttl_above_30_fails_fast_at_import(
     monkeypatch.setenv("WEILIAO_L1_TTL_SECONDS", "31")
     with pytest.raises(ValueError, match="hard limit"):
         importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "abc"])
+def test_main_metrics_log_seconds_invalid_fails_fast_at_import(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any, raw: str
+) -> None:
+    # 配置错误拒绝启动：WEILIAO_METRICS_LOG_SECONDS 非正整数（含非
+    # 整数），reload 组合根即抛 ValueError，消息带变量名（A 方案定时
+    # 日志间隔，缺省 60）。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setenv("WEILIAO_METRICS_LOG_SECONDS", raw)
+    with pytest.raises(ValueError, match="WEILIAO_METRICS_LOG_SECONDS"):
+        importlib.reload(importlib.import_module("weiliao_agent.main"))

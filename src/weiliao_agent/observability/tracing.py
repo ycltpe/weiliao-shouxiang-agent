@@ -425,6 +425,7 @@ def record_cache_event(
 
     事件 taxonomy（operation）：``hit``（读命中）/ ``miss``（L0 未命中，
     Story 3.3 起 cache_lookup 成对记录 hit/miss，3.4 命中率口径前置）/
+    ``bypass``（追问禁走 L0，Story 3.4——不查不挂卡，DEFAULT 级）/
     ``write``（写入成功）/ ``invalidated``（逻辑作废，含读路径按墓碑
     拦截——同一 operation 兼作废动作与读拦截两语义）/ ``corrupted``
     （损坏数据，视为 miss）/ ``failure``（Redis 故障）。仅 ``corrupted``

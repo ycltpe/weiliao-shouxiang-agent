@@ -63,6 +63,25 @@ WEILIAO_KAFKA_TOPIC=house.sync.trigger
 WEILIAO_KAFKA_GROUP_ID=weiliao-house-sync
 ```
 
+缓存命中率指标（Story 3.4，A 方案读数入口）：追问（`is_followup`）
+禁走 L0 缓存、强制进入 LLM 链路，并计入 `bypassed` 而完全不计入
+命中率分子/分母。命中率口径：分子 = L0 命中（`l1_hit` 为 L1 预留
+并入位，当前无 L1 读消费者、恒 0）；分母 = 非追问且 intent 非 None
+的实际 L0 查询数（hit + miss，Redis 故障归并 miss）；分母为 0 时
+`hit_rate` 为 `null`。计数器是进程内单例：多实例部署时每个进程独立
+计数，`/health` 读到的是被采样实例自身的数；计数窗口等于进程生命
+周期，进程重启即清零。读数方式：
+
+```bash
+# 压测期间定时打 stderr（结构化 JSON 单行；缺省 60s，非正整数 fail-fast）
+WEILIAO_METRICS_LOG_SECONDS=60
+
+# 或随时读就绪实例的快照
+curl -s localhost:8000/health
+# → {"status": "ready", "cache_metrics": {"l0_hit": …, "l0_miss": …,
+#    "l1_hit": 0, "bypassed": …, "lookups": …, "hits": …, "hit_rate": …}}
+```
+
 本地联调 broker：`docker compose up -d redpanda redpanda-init`（单节点
 redpanda，Kafka API 暴露于 9092，init 容器自动创建
 `house.sync.trigger` topic），随后以前述

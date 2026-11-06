@@ -27,6 +27,12 @@ Story 3.3 组合根：``L1CacheClient``（``WEILIAO_L1_TTL_SECONDS`` 缺省
 SessionManager，L1 仅为读优化快照）；模块级另建 ``L0CacheClient``
 实例注入 cache_lookup（与 lifespan 内消费者实例相互独立，共享同一
 redis-py 客户端）。
+
+Story 3.4 组合根（A 方案）：cache_lookup 的追问禁走与命中率计数经
+``observability.metrics`` 模块级单例归集；``/health`` 就绪响应附
+metrics snapshot（压测 curl 即读）；lifespan 托管定时结构化 stderr
+日志任务（间隔 ``WEILIAO_METRICS_LOG_SECONDS`` 缺省 60，非正整数
+fail-fast 带变量名）。
 """
 
 import asyncio
@@ -45,6 +51,7 @@ from weiliao_agent.filters.cache_lookup import CacheLookupFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.risk_review import RiskReviewFilter
+from weiliao_agent.observability import metrics
 from weiliao_agent.pipeline import PipelineOrchestrator
 from weiliao_agent.session import SessionManager
 from weiliao_agent.workers import HouseSyncConsumer, KafkaMessageSource
@@ -78,12 +85,32 @@ _l1_cache = L1CacheClient(ttl_seconds=_L1_TTL_SECONDS)
 # 同一 redis-py 客户端——线程安全，零进程内状态共享）。
 _l0_cache = L0CacheClient(_redis_client)
 
+# 命中率定时日志间隔（Story 3.4，A 方案）：非正整数配置错误拒绝启动
+# （与 WEILIAO_L1_TTL_SECONDS 同口径，错误消息带变量名）。
+_METRICS_LOG_RAW = os.environ.get("WEILIAO_METRICS_LOG_SECONDS", "60")
+try:
+    _METRICS_LOG_SECONDS = int(_METRICS_LOG_RAW)
+except ValueError as exc:
+    msg = f"WEILIAO_METRICS_LOG_SECONDS must be an integer, got {_METRICS_LOG_RAW!r}"
+    raise ValueError(msg) from exc
+if _METRICS_LOG_SECONDS <= 0:
+    msg = f"WEILIAO_METRICS_LOG_SECONDS must be a positive integer, got {_METRICS_LOG_SECONDS}"
+    raise ValueError(msg)
+
+
+async def _metrics_log_loop() -> None:
+    """定时发射缓存命中率结构化日志（first 发射在首个间隔之后）。"""
+    while True:
+        await asyncio.sleep(_METRICS_LOG_SECONDS)
+        metrics.emit_cache_metrics_log()
+
 
 @asynccontextmanager
 async def _lifespan(app: object) -> AsyncIterator[None]:
     """托管 Story 3.2 消费者任务；broker 未配置时消费者不创建。"""
     consumer: HouseSyncConsumer | None = None
     consumer_task: asyncio.Task[None] | None = None
+    metrics_task: asyncio.Task[None] | None = None
     brokers = os.environ.get("WEILIAO_KAFKA_BROKERS")
     if brokers:
         consumer = HouseSyncConsumer(
@@ -95,7 +122,11 @@ async def _lifespan(app: object) -> AsyncIterator[None]:
             ),
         )
         consumer_task = asyncio.create_task(consumer.run())
+    metrics_task = asyncio.create_task(_metrics_log_loop())
     yield
+    metrics_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await metrics_task
     if consumer is not None and consumer_task is not None:
         await consumer.stop()
         try:

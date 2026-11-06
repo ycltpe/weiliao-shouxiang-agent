@@ -375,7 +375,8 @@ def test_langfuse_unconfigured_pipeline_behaves_normally(
     assert body["reply"] == render_placeholder("PRICE_INQUIRY")
     # 矩阵行 2 子句：健康检查同样不受 SDK disabled 影响（200 ready）。
     assert health.status_code == 200
-    assert health.json() == {"status": "ready"}
+    # Story 3.4（A 方案）起就绪响应附 metrics snapshot，仅锁定 status。
+    assert health.json()["status"] == "ready"
     # 禁用 warning 仅一次（SDK 单例收敛）。
     disabled_warnings = [r for r in caplog.records if "disabled" in r.getMessage().lower()]
     assert len(disabled_warnings) == 1

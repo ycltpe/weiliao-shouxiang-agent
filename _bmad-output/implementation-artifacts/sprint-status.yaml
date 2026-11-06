@@ -64,7 +64,7 @@ development_status:
   3-1-事实卡片-Schema-与-L0-缓存客户端: review
   3-2-Kafka-房源事件同步消费者: review
   3-3-L1-进程内缓存与分层查找顺序: review
-  3-4-重复追问禁走缓存与命中率指标: backlog
+  3-4-重复追问禁走缓存与命中率指标: review
   epic-3-retrospective: optional
   epic-4: backlog
   4-1-模板兜底应答库: backlog

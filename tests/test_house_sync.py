@@ -10,6 +10,7 @@ L0 为 fakeredis 直注，观测为 FakeLangfuse 替身——AC 可验证。
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ import weiliao_agent.main as main_module
 import weiliao_agent.workers.house_sync as house_sync_module
 from weiliao_agent.cache import L0CacheClient
 from weiliao_agent.models import FactCard
+from weiliao_agent.observability import metrics as metrics_module
 from weiliao_agent.observability import tracing
 from weiliao_agent.workers import HouseSyncConsumer, KafkaMessageSource
 from weiliao_agent.workers.house_sync import ALL_INTENTS, Message
@@ -635,6 +637,45 @@ def test_lifespan_forces_cancel_on_blocking_consumer(
     assert spy.stopped is True
     assert spy.cancelled is True  # 任务被取消回收，无异常逸出
     assert any("forcing cancel" in record.message for record in caplog.records)
+
+
+def test_lifespan_runs_and_cancels_metrics_log_loop(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Story 3.4（A 方案）接线守护：metrics 定时日志任务随 lifespan 启动、
+    # 退出后被 cancel 回收——删掉 create_task 一行本测试即红，防 stderr
+    # 读数入口静默脱落。间隔改小（循环体每轮读模块全局，patch 即生效）。
+    monkeypatch.delenv("WEILIAO_KAFKA_BROKERS", raising=False)
+    monkeypatch.setattr(main_module, "_METRICS_LOG_SECONDS", 0.05)
+    metrics_module.reset_cache_metrics()
+    created_tasks: list[asyncio.Task[Any]] = []
+    real_create_task = asyncio.create_task
+
+    def _spy_create_task(coro: Any, **kwargs: Any) -> asyncio.Task[Any]:
+        task = real_create_task(coro, **kwargs)
+        if getattr(coro, "__name__", "") == "_metrics_log_loop":
+            created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(main_module.asyncio, "create_task", _spy_create_task)
+    with (
+        caplog.at_level(logging.INFO, logger="weiliao_agent.observability.metrics"),
+        TestClient(main_module.app) as client,
+    ):
+        assert client.get("/health").status_code == 200
+        deadline = time.monotonic() + 5  # 等首个间隔后的发射（~0.05s）
+        while time.monotonic() < deadline and not any(
+            r.name == "weiliao_agent.observability.metrics" for r in caplog.records
+        ):
+            time.sleep(0.01)
+    payload = json.loads(
+        next(r for r in caplog.records if r.name == "weiliao_agent.observability.metrics").message
+    )
+    assert payload["event"] == "cache_metrics"  # 定时结构化 JSON 单行（纯 JSON 体）
+    assert payload["lookups"] == 0
+    assert payload["hit_rate"] is None
+    assert len(created_tasks) == 1  # 循环任务随 lifespan 创建
+    assert created_tasks[0].cancelled()  # 退出上下文后 cancel 回收，无悬挂
 
 
 # ---- Kafka tombstone 记录（record.value=None）与消息源构造/提交映射 ----

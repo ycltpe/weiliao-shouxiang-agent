@@ -1,4 +1,4 @@
-"""健康检查端点单测（Story 1.4）。
+"""健康检查端点单测（Story 1.4；Story 3.4 追加 metrics snapshot 读数）。
 
 覆盖 spec I/O 口径两场景：管道编排完成（含 response_assembler）→ 200；
 链不完整 → 503（非 200 即满足 AC，负载均衡据此刻摘除实例）。
@@ -10,6 +10,7 @@ from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.main import app as production_app
 from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.observability import metrics as metrics_module
 from weiliao_agent.pipeline import PipelineOrchestrator
 
 
@@ -23,10 +24,18 @@ class _PassThroughFilter(Filter):
 
 
 def test_health_ready_returns_200() -> None:
+    # Story 3.4（A 方案）：就绪响应附 metrics snapshot（压测 curl 即读）；
+    # 快照读取自身 fail-safe，就绪判定不受影响。
+    metrics_module.reset_cache_metrics()
     client = TestClient(create_app())  # 默认四过滤器链完整
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ready"}
+    body = response.json()
+    assert body["status"] == "ready"
+    cache_metrics = body["cache_metrics"]
+    assert cache_metrics["lookups"] == 0
+    assert cache_metrics["hits"] == 0
+    assert cache_metrics["hit_rate"] is None
 
 
 def test_health_incomplete_chain_returns_503() -> None:

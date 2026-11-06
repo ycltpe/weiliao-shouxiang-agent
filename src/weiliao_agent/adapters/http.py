@@ -9,6 +9,7 @@ HTTP 非 5xx。未注入 SessionManager（如测试）则跳过会话步骤。�
 横切能力与 Kafka 接入不在本 Story 范围。
 """
 
+import logging
 import uuid
 from typing import Any
 
@@ -19,11 +20,13 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from weiliao_agent.filters.templates import render_placeholder
-from weiliao_agent.health import is_ready
+from weiliao_agent.health import cache_metrics_payload, is_ready
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.models.intent import IntentTag
 from weiliao_agent.pipeline import PipelineOrchestrator, PipelineResult
 from weiliao_agent.session import SessionManager
+
+logger = logging.getLogger(__name__)
 
 
 def _fallback_result(
@@ -59,7 +62,18 @@ def create_app(
             # 不同，500 属 paging 级事件）：按未就绪收敛，摘除实例待介入。
             ready = False
         if ready:
-            return JSONResponse(status_code=200, content={"status": "ready"})
+            # Story 3.4（A 方案）：就绪响应附缓存命中率快照，压测
+            # curl /health 即读；metrics 取数自身 fail-safe，不阻端点。
+            try:
+                payload = cache_metrics_payload()
+            except Exception:
+                # 快照取数失败不得静默：观测功能无声脱落无迹可查。
+                logger.warning(
+                    "cache metrics snapshot unavailable; omitting from /health",
+                    exc_info=True,
+                )
+                payload = {}
+            return JSONResponse(status_code=200, content={"status": "ready", **payload})
         return JSONResponse(status_code=503, content={"status": "not_ready"})
 
     @app.exception_handler(RequestValidationError)
