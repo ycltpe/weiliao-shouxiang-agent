@@ -68,7 +68,7 @@ development_status:
   epic-3-retrospective: optional
   epic-4: in-progress
   4-1-模板兜底应答库: review
-  4-2-LLM-子图与-OpenAI-客户端: backlog
+  4-2-LLM-子图与-OpenAI-客户端: review
   4-3-事实卡片-Grounding-受控生成: backlog
   4-4-后置风控双审核: backlog
   4-5-OpenAI-故障降级与步进恢复: backlog
