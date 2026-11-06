@@ -16,7 +16,7 @@ src/weiliao_agent/
   filters/         # 热路径过滤器：coreference、intent_router、cache_lookup、risk_review、response_assembler
   llm/             # LangGraph 子图、OpenAI client、prompt 管理
   session/         # 会话状态管理（单写者，含 handoff 状态）
-  cache/           # L0 Redis 客户端、L1 cachetools 封装
+  cache/           # L0 Redis 客户端（事实卡片）、L1 cachetools 封装（会话热点快照，TTL ≤30s）
   models/          # Pydantic 模型：信封、事实卡片、意图标签（Literal）
   workers/         # Kafka 消费者：房源事件同步、转人工指令
   observability/   # Langfuse trace、监控指标、成本追踪
@@ -44,6 +44,13 @@ LLM_BASE_URL=https://your-gateway/v1
 
 # 会话状态 Redis（Story 1.3，会话状态唯一写入者）
 WEILIAO_REDIS_URL=redis://127.0.0.1:6379/0
+```
+
+L1 进程内缓存（Story 3.3，会话级热点读优化层）TTL 可调，缺省 30 秒：
+
+```bash
+# L1 快照 TTL（AD-5 硬上限 30s，传入 >30 启动即 fail-fast）
+WEILIAO_L1_TTL_SECONDS=30
 ```
 
 房源事件同步消费者（Story 3.2，Kafka `house.sync.trigger`）为可选启停：

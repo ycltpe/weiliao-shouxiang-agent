@@ -12,6 +12,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from unittest import mock
 
 import fakeredis
 import pytest
@@ -21,6 +22,7 @@ from fastapi.testclient import TestClient
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.classifiers.llm_zero_shot import LlmZeroShotClassifier, _LlmIntentOutput
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
+from weiliao_agent.models.fact_card import FactCard
 from weiliao_agent.session import SessionManager, SessionSnapshot
 from weiliao_agent.session.manager import DEFAULT_TTL_SECONDS, KEY_PREFIX
 
@@ -563,3 +565,57 @@ def test_main_composition_root_records_followup_to_redis(
     assert fake.hget(key, "followup:PRICE_INQUIRY") == b"2"
     assert fake.hget(key, "followup_count") == b"1"
     assert fake.ttl(key) == DEFAULT_TTL_SECONDS
+
+
+def test_main_composition_root_wires_l1_writers_and_l0_lookup(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # Story 3.3 组合根冒烟：一次 POST 同时验证 (a) intent_router 经注入的
+    # L1 writer 落最近意图快照、(b) cache_lookup 持有的 L0 客户端即组合根
+    # 模块级实例（spy 其 get——撤销接线时本断言即红，防 Story 行为静默
+    # 不在生产运行）。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+    classifier = main_module._classifier
+    assert isinstance(classifier, LlmZeroShotClassifier)
+    classifier._structured_model = _FakeStructuredModel(
+        _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.91)
+    )
+    card = FactCard.model_validate(
+        {
+            "house_id": "house-001",
+            "status": "active",
+            "price_bucket": 12,
+            "fact_version": 1,
+            "as_of": TS_1,
+        }
+    )
+    assert main_module._l0_cache.set("PRICE_INQUIRY", card) is True
+    http = TestClient(main_module.app)
+    payload = {**_valid_payload(), "message": "你好，这套房多少钱？"}
+
+    with mock.patch.object(
+        main_module._l0_cache, "get", wraps=main_module._l0_cache.get
+    ) as get_spy:
+        response = http.post("/v1/messages", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["degraded"] is False
+    # (a) L1 最近意图快照：分类成功后组合根注入的 writer 已写入。
+    assert main_module._l1_cache.get_recent_intent(SESSION_ID) == "PRICE_INQUIRY"
+    # (b) cache_lookup 热路径真实经过模块级 _l0_cache（预置卡片命中）。
+    assert get_spy.call_count == 1
+
+
+def test_main_l1_ttl_above_30_fails_fast_at_import(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 配置错误拒绝启动：WEILIAO_L1_TTL_SECONDS=31 越 AD-5 硬上限，
+    # reload 组合根即抛 ValueError（import-time fail-fast）。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setenv("WEILIAO_L1_TTL_SECONDS", "31")
+    with pytest.raises(ValueError, match="hard limit"):
+        importlib.reload(importlib.import_module("weiliao_agent.main"))

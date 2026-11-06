@@ -22,6 +22,10 @@
   2 次起为 True，由 intent_router 经注入的会话单写者回调判定后写回；
   默认 False（含分类 fail-closed / 记录失败 fail-safe 路径）。Epic 3 的
   cache_lookup 据此禁走 L0 缓存；
+- ``fact_card``（Story 3.3，缓存查找结果挂点，决策 A 方案）：L0 事实卡片
+  查找的下游通道——cache_lookup 命中把卡片挂到信封，miss 保持 None
+  留给 Epic 4 的 LLM 层；查找顺序 L1 → L0 → LLM 对管道真实可观测，
+  Story 3.4 的命中率口径亦基于本字段统计；
 - ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
   预留字段，本 Story 仅定义、不消费，默认 None。
 """
@@ -31,6 +35,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from weiliao_agent.models.fact_card import FactCard
 from weiliao_agent.models.intent import IntentTag
 
 
@@ -49,6 +54,10 @@ class Envelope(BaseModel):
     # cache_lookup 消费）；默认 False——分类 fail-closed 与追问记录失败
     # fail-safe 路径均不置位。
     is_followup: bool = False
+    # Story 3.3：L0 查找结果挂点（决策 A 方案）——cache_lookup 命中挂
+    # 卡片，miss 保持 None 留给 Epic 4 LLM 层；买家可见应答仍由
+    # response_assembler 的占位模板产出，本字段仅携带结构化事实。
+    fact_card: FactCard | None = None
     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
     # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
     message: str | None = None

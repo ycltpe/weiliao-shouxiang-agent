@@ -423,11 +423,13 @@ def record_cache_event(
 ) -> None:
     """缓存事件写入消息 trace（Story 3.1，L0 客户端复用）。
 
-    事件 taxonomy（operation）：``hit``（读命中）/ ``write``（写入成功）/
-    ``invalidated``（逻辑作废，含读路径按墓碑拦截——同一 operation 兼
-    作废动作与读拦截两语义）/ ``corrupted``（损坏数据，视为 miss）/
-    ``failure``（Redis 故障）。仅 ``corrupted`` / ``failure`` 为 ERROR 级；
-    其余 DEFAULT 级。stage 词表：``set`` / ``get`` / ``invalidate``。
+    事件 taxonomy（operation）：``hit``（读命中）/ ``miss``（L0 未命中，
+    Story 3.3 起 cache_lookup 成对记录 hit/miss，3.4 命中率口径前置）/
+    ``write``（写入成功）/ ``invalidated``（逻辑作废，含读路径按墓碑
+    拦截——同一 operation 兼作废动作与读拦截两语义）/ ``corrupted``
+    （损坏数据，视为 miss）/ ``failure``（Redis 故障）。仅 ``corrupted``
+    / ``failure`` 为 ERROR 级；其余 DEFAULT 级。stage 词表：
+    ``set`` / ``get`` / ``invalidate``。
 
     保留键（``event`` / ``operation`` / ``stage``）由本函数权威写入，
     调用方 ``metadata`` 一律挂于独立 ``metadata`` 子键，不得覆盖保留键

@@ -29,10 +29,19 @@ UNKNOWN 不参与追问判定（计数与标记均跳过，降级路径零副作
 recorder 异常 try 包裹 fail-safe：应答不降级、信封保留分类结果、
 ``is_followup`` 保持默认 False、trace 记 reason=followup_record_failed
 失败事件，过滤器自身不向上抛。
+
+Story 3.3：可选注入 ``recent_intent_writer`` / ``followup_snapshot_writer``
+（AD-5 组合根注入 ``L1CacheClient.set_recent_intent`` /
+``set_followup_count`` 方法引用，过滤器不持有 L1 客户端）：分类成功
+且 ``turn`` 非 None 时写最近意图快照；``record_followup`` 成功返回后
+写会话追问计数快照（会话总数）。两者均 try 包裹静默 fail-safe——
+与 intent_writer 的非对称设计：L1 是进程内优化层，写失败只可能是
+程序错误，不记 trace（避免热路径噪音）、不应答降级，信封结果不变。
 """
 
 import time
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from typing import Any, Protocol
 
 from weiliao_agent.filters.base import Filter
@@ -65,10 +74,14 @@ class IntentRouterFilter(Filter):
         classifier: IntentClassifier | None = None,
         intent_writer: Callable[[str, int, IntentClassification], None] | None = None,
         followup_recorder: Callable[[str, IntentTag], tuple[int, int]] | None = None,
+        recent_intent_writer: Callable[[str, IntentTag], None] | None = None,
+        followup_snapshot_writer: Callable[[str, int], None] | None = None,
     ) -> None:
         self._classifier = classifier
         self._intent_writer = intent_writer
         self._followup_recorder = followup_recorder
+        self._recent_intent_writer = recent_intent_writer
+        self._followup_snapshot_writer = followup_snapshot_writer
 
     def process(self, envelope: Envelope) -> Envelope:
         if self._classifier is None:
@@ -131,6 +144,11 @@ class IntentRouterFilter(Filter):
                 tracing.record_classification_failure(
                     envelope.trace_id, reason="intent_write_failed"
                 )
+        if envelope.turn is not None and self._recent_intent_writer is not None:
+            # L1 写失败静默 fail-safe（Story 3.3 设计笔记）：优化层
+            # 不记 trace、不应答降级，信封保留分类结果。
+            with suppress(Exception):
+                self._recent_intent_writer(envelope.session_id, classification.tag)
         is_followup = self._record_followup(envelope, classification.tag)
         if not is_followup:
             return classified
@@ -162,6 +180,12 @@ class IntentRouterFilter(Filter):
             )
             return False
         is_followup = per_intent_count >= 2
+        if self._followup_snapshot_writer is not None:
+            # 同 recent_intent_writer：L1 快照写失败静默吞，不记 trace。
+            with suppress(Exception):
+                self._followup_snapshot_writer(
+                    envelope.session_id, session_followup_count
+                )
         tracing.record_followup(
             envelope.trace_id,
             tag=tag,

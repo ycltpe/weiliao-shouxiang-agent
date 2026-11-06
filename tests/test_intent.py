@@ -452,3 +452,94 @@ def test_followup_not_recorded_when_classification_fails(
     assert result.intent == "UNKNOWN"
     assert result.is_followup is False
     assert recorder.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Story 3.3 L1 写挂点：recent_intent_writer / followup_snapshot_writer 注入、
+# 触发时机与静默 fail-safe（L1 优化层写失败不记 trace、不应答降级）。
+# ---------------------------------------------------------------------------
+
+
+class _RecordingL1Writer:
+    """L1 writer 替身：记录收到的 (session_id, value)。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def __call__(self, session_id: str, value: Any) -> None:
+        self.calls.append((session_id, value))
+
+
+class _RaisingL1Writer:
+    def __call__(self, session_id: str, value: Any) -> None:
+        msg = "l1 cache boom"
+        raise RuntimeError(msg)
+
+
+def test_recent_intent_writer_called_once_on_classification_success(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    writer = _RecordingL1Writer()
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        recent_intent_writer=writer,
+    )
+    envelope = Envelope.model_validate(_followup_payload())
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "PRICE_INQUIRY"
+    assert writer.calls == [("sess-001", "PRICE_INQUIRY")]
+
+
+def test_recent_intent_writer_skipped_when_turn_is_none(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    writer = _RecordingL1Writer()
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        recent_intent_writer=writer,
+    )
+    envelope = Envelope.model_validate(_followup_payload(turn=None))
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "PRICE_INQUIRY"
+    assert writer.calls == []
+
+
+def test_followup_snapshot_writer_called_with_session_total_on_success(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    writer = _RecordingL1Writer()
+    recorder = _StubFollowupRecorder((1, 3))
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        followup_recorder=recorder,
+        followup_snapshot_writer=writer,
+    )
+    envelope = Envelope.model_validate(_followup_payload())
+
+    filter_.process(envelope)
+
+    assert writer.calls == [("sess-001", 3)]  # 会话追问总数快照
+
+
+def test_l1_writer_failure_fails_silently_without_trace_failure(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # L1 写失败静默 fail-safe：应答与信封结果不变、无失败 trace 事件
+    # （与 intent_writer 的非对称设计——优化层不记 trace）。
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        followup_recorder=_StubFollowupRecorder((1, 0)),
+        recent_intent_writer=_RaisingL1Writer(),
+        followup_snapshot_writer=_RaisingL1Writer(),
+    )
+    envelope = Envelope.model_validate(_followup_payload())
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "PRICE_INQUIRY"
+    assert result.is_followup is False
+    assert "intent.classification_failure" not in _event_names(fake_langfuse)

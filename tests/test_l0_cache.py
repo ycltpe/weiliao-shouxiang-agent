@@ -10,13 +10,13 @@
 """
 
 import json
-from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import fakeredis
 import pytest
 import redis
+from conftest import _FakeLangfuse
 
 from weiliao_agent.cache import (
     DEFAULT_TTL_SECONDS,
@@ -45,28 +45,6 @@ def redis_client() -> fakeredis.FakeRedis:
 @pytest.fixture
 def l0(redis_client: fakeredis.FakeRedis) -> L0CacheClient:
     return L0CacheClient(redis_client)
-
-
-class _FakeLangfuse:
-    """Langfuse client 替身：记录全部事件调用，可按需抛错。"""
-
-    def __init__(self, *, raise_on_event: bool = False) -> None:
-        self.raise_on_event = raise_on_event
-        self.events: list[dict[str, Any]] = []
-
-    def create_event(self, **kwargs: Any) -> None:
-        if self.raise_on_event:
-            msg = "sdk create_event boom"
-            raise RuntimeError(msg)
-        self.events.append(kwargs)
-
-
-@pytest.fixture
-def fake_langfuse() -> Iterator[_FakeLangfuse]:
-    client = _FakeLangfuse()
-    tracing.set_langfuse_client(client)
-    yield client
-    tracing.set_langfuse_client(None)
 
 
 def _card(house_id: str, version: int, **overrides: Any) -> FactCard:

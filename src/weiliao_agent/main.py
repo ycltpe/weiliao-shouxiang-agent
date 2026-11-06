@@ -20,6 +20,13 @@ Story 3.2 组合根：``house.sync.trigger`` 消费者任务由 lifespan 托管�
 线程安全，零进程内状态共享）。关停时先停拉取、等待在途消息处理，
 超时强退不悬挂进程；消费者健康不挂 /health（fail-closed 逐消息降级
 先例，Story 3.1 口径不变）。
+
+Story 3.3 组合根：``L1CacheClient``（``WEILIAO_L1_TTL_SECONDS`` 缺省
+30，AD-5 硬上限 30 超限 fail-fast）方法引用注入 intent_router
+（``set_recent_intent`` / ``set_followup_count``——AD-4 权威写仍在
+SessionManager，L1 仅为读优化快照）；模块级另建 ``L0CacheClient``
+实例注入 cache_lookup（与 lifespan 内消费者实例相互独立，共享同一
+redis-py 客户端）。
 """
 
 import asyncio
@@ -32,6 +39,7 @@ import redis
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.cache.l0_client import L0CacheClient
+from weiliao_agent.cache.l1_cache import L1CacheClient
 from weiliao_agent.classifiers import create_classifier
 from weiliao_agent.filters.cache_lookup import CacheLookupFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
@@ -57,6 +65,18 @@ _redis_client = redis.Redis.from_url(
 _session_manager = SessionManager(_redis_client)
 # 空串等空值回落默认实现（文档承诺），仅显式非法值 fail-fast。
 _classifier = create_classifier(os.environ.get("WEILIAO_INTENT_CLASSIFIER") or "llm_zero_shot")
+# L1 进程内缓存（AD-5）：TTL 缺省 30s、硬上限 30s（超限 fail-fast，
+# 配置错误拒绝启动）；仅存会话热点快照，事实卡片严禁入 L1。
+_L1_TTL_RAW = os.environ.get("WEILIAO_L1_TTL_SECONDS", "30")
+try:
+    _L1_TTL_SECONDS = int(_L1_TTL_RAW)
+except ValueError as exc:
+    msg = f"WEILIAO_L1_TTL_SECONDS must be an integer, got {_L1_TTL_RAW!r}"
+    raise ValueError(msg) from exc
+_l1_cache = L1CacheClient(ttl_seconds=_L1_TTL_SECONDS)
+# 模块级 L0 实例注入 cache_lookup（与 lifespan 消费者实例独立，共享
+# 同一 redis-py 客户端——线程安全，零进程内状态共享）。
+_l0_cache = L0CacheClient(_redis_client)
 
 
 @asynccontextmanager
@@ -97,8 +117,10 @@ app = create_app(
                 classifier=_classifier,
                 intent_writer=_session_manager.write_intent,
                 followup_recorder=_session_manager.record_followup,
+                recent_intent_writer=_l1_cache.set_recent_intent,
+                followup_snapshot_writer=_l1_cache.set_followup_count,
             ),
-            CacheLookupFilter(),
+            CacheLookupFilter(l0_client=_l0_cache),
             RiskReviewFilter(),
             ResponseAssemblerFilter(),
         ]
