@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
-from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_placeholder
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.observability import tracing
 from weiliao_agent.pipeline import PipelineOrchestrator
@@ -229,7 +229,7 @@ def test_filter_exception_records_degradation_with_attribution(
     # 降级路径仍补记最终下发文本（兜底文案）。
     deliveries = [e for e in fake_langfuse.events if e["name"] == "pipeline.delivery"]
     assert len(deliveries) == 1
-    assert deliveries[0]["output"] == render_placeholder("PRICE_INQUIRY")
+    assert deliveries[0]["output"] == render_fallback("PRICE_INQUIRY")
 
 
 def test_raising_sdk_client_does_not_affect_pipeline_result() -> None:
@@ -372,7 +372,7 @@ def test_langfuse_unconfigured_pipeline_behaves_normally(
     body = response.json()
     assert body["degraded"] is False
     assert body["trace_id"] == "ab" * 16
-    assert body["reply"] == render_placeholder("PRICE_INQUIRY")
+    assert body["reply"] == render_fallback("PRICE_INQUIRY")
     # 矩阵行 2 子句：健康检查同样不受 SDK disabled 影响（200 ready）。
     assert health.status_code == 200
     # Story 3.4（A 方案）起就绪响应附 metrics snapshot，仅锁定 status。

@@ -53,3 +53,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-2-kafka-house-event-sync-consumer.md`
   summary: docker-compose redpanda/redpanda-init 服务无任何自动化校验（仅 spec Verification 手工步骤），compose 配置回归无法被测试发现
   evidence: 本 story 新增的 dev broker 只靠 spec 手工检查守护；仓库无 CI，pytest/mypy/ruff 均不触碰 compose 文件，redpanda-init 命令或 healthcheck 的笔误可全绿入库。settle：属流程决策——引入 compose 解析校验（如 CI 里 docker compose config -q 或 pytest + pyyaml 断言 topic 创建服务），需先定 CI 形态。
+
+## Deferred from: code review of spec-4-1-template-fallback-response-library (2026-11-06)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-4-1-template-fallback-response-library.md`
+  summary: PHOTO_REQUEST 的图片/相册素材分支已提供同步接口，但当前生产调用点均不传素材，图片素材来源尚未接入
+  evidence: Story 4.1 冻结块明确不实现图片素材查询；接口为后续响应组装/素材服务接入预留。settle：在实现图片素材查询的后续 Story 接入真实调用方，并验证有图、有相册、无图三条生产路径。

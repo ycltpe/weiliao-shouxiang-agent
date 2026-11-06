@@ -2,7 +2,7 @@
 
 覆盖 spec I/O & Edge-Case Matrix 四场景：
 HAPPY_PATH / FILTER_RAISES / DEADLINE_EXCEEDED / INVALID_INPUT，
-外加占位模板集选择键（9 类意图 / 缺失 / 未知值）与 AI 身份披露前缀。
+外加模板集选择键（9 类意图 / 缺失 / 未知值）与 AI 身份披露前缀。
 """
 
 import time
@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
-from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_placeholder
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.pipeline import PipelineOrchestrator
 
@@ -59,7 +59,7 @@ class _SlowFilter(Filter):
         return envelope
 
 
-def test_happy_path_runs_full_chain_and_returns_placeholder_reply() -> None:
+def test_happy_path_runs_full_chain_and_returns_fallback_reply() -> None:
     log: list[str] = []
     orchestrator = PipelineOrchestrator(
         filters=[
@@ -78,7 +78,7 @@ def test_happy_path_runs_full_chain_and_returns_placeholder_reply() -> None:
     assert result.failed_filter is None
     assert result.trace_id == "trace-001"
     assert result.reply.startswith(AI_DISCLOSURE_PREFIX)
-    assert result.reply != render_placeholder(None)  # 命中意图文案而非通用兜底
+    assert result.reply != render_fallback(None)  # 命中意图文案而非通用兜底
 
 
 def test_filter_exception_degrades_and_skips_remaining_filters() -> None:
@@ -181,7 +181,7 @@ def test_valid_input_via_endpoint_executes_pipeline() -> None:
     assert body["degraded"] is False
     assert body["failed_filter"] is None
     assert body["trace_id"] == "trace-001"
-    assert body["reply"] == render_placeholder("GREETING")
+    assert body["reply"] == render_fallback("GREETING")
 
 
 def test_default_chain_intent_router_defaults_missing_intent_to_unknown() -> None:
@@ -191,10 +191,10 @@ def test_default_chain_intent_router_defaults_missing_intent_to_unknown() -> Non
     result = orchestrator.run(envelope)
 
     assert result.degraded is False
-    assert result.reply == render_placeholder("UNKNOWN")
+    assert result.reply == render_fallback("UNKNOWN")
 
 
-def test_placeholder_template_selection_keys() -> None:
+def test_fallback_template_selection_keys() -> None:
     # 9 类意图各一条文案，全部携带 AI 身份披露前缀。
     bodies: set[str] = set()
     for intent in (
@@ -208,13 +208,13 @@ def test_placeholder_template_selection_keys() -> None:
         "COMPLAINT",
         "UNKNOWN",
     ):
-        text = render_placeholder(intent)
+        text = render_fallback(intent)
         assert text.startswith(AI_DISCLOSURE_PREFIX)
-        assert text != render_placeholder(None)
+        assert text != render_fallback(None)
         # 正文非空，且各意图文案互不重复（防空文案/静默复制）。
         assert len(text) > len(AI_DISCLOSURE_PREFIX)
         bodies.add(text)
     assert len(bodies) == 9
 
     # intent 缺失或不在 9 类枚举内：一律通用兜底。
-    assert render_placeholder(None) == render_placeholder("NOT_AN_INTENT")
+    assert render_fallback(None) == render_fallback("NOT_AN_INTENT")

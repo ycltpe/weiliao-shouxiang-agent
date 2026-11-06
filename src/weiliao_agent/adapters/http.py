@@ -19,7 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from weiliao_agent.filters.templates import render_placeholder
+from weiliao_agent.filters.templates import render_fallback
 from weiliao_agent.health import cache_metrics_payload, is_ready
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.models.intent import IntentTag
@@ -35,7 +35,7 @@ def _fallback_result(
 ) -> PipelineResult:
     """构造 fail-closed 兜底应答：兜底文案 + 新生成 trace_id。"""
     return PipelineResult(
-        reply=render_placeholder(intent),
+        reply=render_fallback(intent),
         trace_id=trace_id if trace_id is not None else str(uuid.uuid4()),
         degraded=True,
         failed_filter=None,

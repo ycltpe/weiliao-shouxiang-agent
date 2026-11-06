@@ -66,8 +66,8 @@ development_status:
   3-3-L1-进程内缓存与分层查找顺序: review
   3-4-重复追问禁走缓存与命中率指标: review
   epic-3-retrospective: optional
-  epic-4: backlog
-  4-1-模板兜底应答库: backlog
+  epic-4: in-progress
+  4-1-模板兜底应答库: review
   4-2-LLM-子图与-OpenAI-客户端: backlog
   4-3-事实卡片-Grounding-受控生成: backlog
   4-4-后置风控双审核: backlog

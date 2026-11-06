@@ -31,7 +31,7 @@ from weiliao_agent.filters.cache_lookup import CacheLookupFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.risk_review import RiskReviewFilter
-from weiliao_agent.filters.templates import render_placeholder
+from weiliao_agent.filters.templates import render_fallback
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.observability import tracing
 
@@ -140,7 +140,7 @@ class PipelineOrchestrator:
             # 超时跳的执行线程结果已丢弃，等待其完成无意义（不傻等）。
             executor.shutdown(wait=False)
         return PipelineResult(
-            reply=render_placeholder(envelope.intent),
+            reply=render_fallback(envelope.intent),
             trace_id=trace_id,
             degraded=False,
             failed_filter=None,
@@ -164,7 +164,7 @@ class PipelineOrchestrator:
         )
         culprit = failed_filter if failed_filter is not None else slow_filter
         return PipelineResult(
-            reply=render_placeholder(envelope.intent),
+            reply=render_fallback(envelope.intent),
             trace_id=trace_id,
             degraded=True,
             failed_filter=culprit,

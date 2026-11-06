@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.intent_router import IntentRouterFilter
-from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_placeholder
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.models.intent import IntentClassification, IntentTag
 from weiliao_agent.observability import tracing
@@ -58,7 +58,7 @@ def test_endpoint_unknown_intent_fails_closed_with_generic_fallback() -> None:
     body = response.json()
     assert body["degraded"] is True
     assert body["failed_filter"] is None
-    assert body["reply"] == render_placeholder(None)  # 通用兜底文案
+    assert body["reply"] == render_fallback(None)  # 通用兜底文案
     assert body["reply"].startswith(AI_DISCLOSURE_PREFIX)
     assert body["trace_id"]  # 新生成 trace_id
     assert body["trace_id"] != "trace-001"
