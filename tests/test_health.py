@@ -27,6 +27,7 @@ def test_health_ready_returns_200() -> None:
     # Story 3.4（A 方案）：就绪响应附 metrics snapshot（压测 curl 即读）；
     # 快照读取自身 fail-safe，就绪判定不受影响。
     metrics_module.reset_cache_metrics()
+    metrics_module.reset_risk_review_metrics()
     client = TestClient(create_app())  # 默认五过滤器链完整
     response = client.get("/health")
     assert response.status_code == 200
@@ -36,6 +37,11 @@ def test_health_ready_returns_200() -> None:
     assert cache_metrics["lookups"] == 0
     assert cache_metrics["hits"] == 0
     assert cache_metrics["hit_rate"] is None
+    # Story 4.4：就绪响应附审核通过率快照。
+    risk_metrics = body["risk_review_metrics"]
+    assert risk_metrics["total"] == 0
+    assert risk_metrics["passed"] == 0
+    assert risk_metrics["pass_rate"] is None
 
 
 def test_health_incomplete_chain_returns_503() -> None:

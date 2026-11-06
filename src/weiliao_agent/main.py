@@ -34,6 +34,15 @@ risk_review 之间（影子接入决策 A）；注入预算 0.9s 的子图
 拖过编排器剩余跳预算导致误降级）——装配期不触达 OpenAI 凭据，
 生成草稿只挂信封 ``generated_reply``，买家可见应答仍 100% 模板兜底。
 
+Story 4.4 组合根：``RiskReviewFilter`` 注入真实审核客户端（双审核
+第二道，AD-8）；``WEILIAO_RISK_REVIEW_TIMEOUT_MS`` 缺省 500、越界
+300–800 fail-fast 带变量名，``WEILIAO_RISK_REVIEW_ENDPOINT`` 未配置
+则运行期 fail-closed（任何草稿视为不通过，绝不默认放行）；
+``WEILIAO_RISK_REVIEW_PASS_RATE_THRESHOLD`` 缺省 0.95、非 0–1
+fail-fast 带变量名。``/health`` 就绪响应附审核通过率快照，lifespan
+定时日志增发 ``risk_review_metrics``（跌破阈值时 ``risk_review_alert``
+ERROR 告警）。
+
 Story 3.4 组合根（A 方案）：cache_lookup 的追问禁走与命中率计数经
 ``observability.metrics`` 模块级单例归集；``/health`` 就绪响应附
 metrics snapshot（压测 curl 即读）；lifespan 托管定时结构化 stderr
@@ -57,7 +66,12 @@ from weiliao_agent.filters.cache_lookup import CacheLookupFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
-from weiliao_agent.filters.risk_review import RiskReviewFilter
+from weiliao_agent.filters.risk_review import (
+    MAX_TIMEOUT_MS,
+    MIN_TIMEOUT_MS,
+    RiskReviewClient,
+    RiskReviewFilter,
+)
 from weiliao_agent.llm.client import OpenAiGenerationClient
 from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.observability import metrics
@@ -106,12 +120,50 @@ if _METRICS_LOG_SECONDS <= 0:
     msg = f"WEILIAO_METRICS_LOG_SECONDS must be a positive integer, got {_METRICS_LOG_SECONDS}"
     raise ValueError(msg)
 
+# 审核超时（Story 4.4）：缺省 500ms，可调 300–800；解析错误与越界均
+# fail-fast 拒绝启动（错误消息带变量名）。endpoint 未配置不 fail-fast：
+# 运行期 fail-closed（任何草稿视为不通过，本地开发/测试零中台可跑）。
+_RISK_TIMEOUT_RAW = os.environ.get("WEILIAO_RISK_REVIEW_TIMEOUT_MS", "500")
+try:
+    _RISK_REVIEW_TIMEOUT_MS = int(_RISK_TIMEOUT_RAW)
+except ValueError as exc:
+    msg = f"WEILIAO_RISK_REVIEW_TIMEOUT_MS must be an integer, got {_RISK_TIMEOUT_RAW!r}"
+    raise ValueError(msg) from exc
+if not MIN_TIMEOUT_MS <= _RISK_REVIEW_TIMEOUT_MS <= MAX_TIMEOUT_MS:
+    msg = (
+        f"WEILIAO_RISK_REVIEW_TIMEOUT_MS must be within "
+        f"{MIN_TIMEOUT_MS}-{MAX_TIMEOUT_MS}, got {_RISK_REVIEW_TIMEOUT_MS}"
+    )
+    raise ValueError(msg)
+
+# 通过率告警阈值：缺省 0.95，须为 0–1 闭区间（越界 fail-fast 带变量名）；
+# 跌破判定在 lifespan 定时日志（样本 ≥20 防抖动）。
+_RISK_THRESHOLD_RAW = os.environ.get("WEILIAO_RISK_REVIEW_PASS_RATE_THRESHOLD", "0.95")
+try:
+    _RISK_REVIEW_PASS_RATE_THRESHOLD = float(_RISK_THRESHOLD_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_RISK_REVIEW_PASS_RATE_THRESHOLD must be a number, "
+        f"got {_RISK_THRESHOLD_RAW!r}"
+    )
+    raise ValueError(msg) from exc
+if not 0.0 <= _RISK_REVIEW_PASS_RATE_THRESHOLD <= 1.0:
+    msg = (
+        f"WEILIAO_RISK_REVIEW_PASS_RATE_THRESHOLD must be within 0-1, "
+        f"got {_RISK_REVIEW_PASS_RATE_THRESHOLD}"
+    )
+    raise ValueError(msg)
+metrics.get_risk_review_metrics().set_pass_rate_threshold(_RISK_REVIEW_PASS_RATE_THRESHOLD)
+_risk_review_client = RiskReviewClient(timeout_ms=_RISK_REVIEW_TIMEOUT_MS)
+
 
 async def _metrics_log_loop() -> None:
-    """定时发射缓存命中率结构化日志（first 发射在首个间隔之后）。"""
+    """定时发射缓存命中率与审核通过率结构化日志（first 发射在首个
+    间隔之后）；跌破审核阈值时同循环追加 ERROR 级告警日志。"""
     while True:
         await asyncio.sleep(_METRICS_LOG_SECONDS)
         metrics.emit_cache_metrics_log()
+        metrics.emit_risk_review_metrics_log()
 
 
 @asynccontextmanager
@@ -166,7 +218,7 @@ app = create_app(
                     OpenAiGenerationClient(budget_seconds=LLM_GENERATE_BUDGET_SECONDS)
                 )
             ),
-            RiskReviewFilter(),
+            RiskReviewFilter(client=_risk_review_client),
             ResponseAssemblerFilter(),
         ]
     ),

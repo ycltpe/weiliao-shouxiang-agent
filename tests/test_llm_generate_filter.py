@@ -18,7 +18,8 @@ import pytest
 import weiliao_agent.filters.llm_generate as filter_module
 from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
-from weiliao_agent.filters.templates import render_fallback
+from weiliao_agent.filters.risk_review import RiskReviewFilter, RiskReviewVerdict
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.llm import (
     LlmGenerationError,
     LlmGenerationSubgraph,
@@ -32,6 +33,15 @@ from weiliao_agent.pipeline import LLM_GENERATE_BUDGET_SECONDS, PipelineOrchestr
 
 TRACE_ID = "ab" * 16
 DRAFT = "您好，这套房源目前在售，价格以页面展示为准。"
+
+
+class _AlwaysPassClient:
+    """审核客户端替身：恒放行（4.4 过审路径走查）。"""
+
+    def review(
+        self, *, text: str, intent: str | None, trace_id: str | None, house_id: str
+    ) -> RiskReviewVerdict:
+        return RiskReviewVerdict(passed=True, outcome="passed", latency_ms=1.0)
 
 
 class _StubChat:
@@ -272,8 +282,12 @@ def test_module_entry_failure_is_fail_safe(
     assert len(_generate_events(fake_langfuse)) == 1
 
 
-def test_full_pipeline_buyer_reply_still_template_fallback() -> None:
-    """AC 第 1 条：草稿挂信封，买家可见 reply 仍为模板兜底（degraded=False）。"""
+def test_full_pipeline_approved_draft_reaches_buyer_with_ai_prefix() -> None:
+    """4.4 AC 第 1 条：草稿过审后买家可见 reply = AI 前缀+草稿（degraded=False）。
+
+    4.3 影子口径（买家应答 100% 模板兜底）随 4.4 最终组装点落地而作废：
+    编排器最终返回点消费已过审草稿。
+    """
     seen: list[Envelope] = []
 
     class _Recorder:
@@ -286,6 +300,7 @@ def test_full_pipeline_buyer_reply_still_template_fallback() -> None:
     orchestrator = PipelineOrchestrator(
         filters=[
             LlmGenerateFilter(subgraph=_subgraph(_StubChat())),
+            RiskReviewFilter(client=_AlwaysPassClient()),
             cast(Any, _Recorder()),
             ResponseAssemblerFilter(),
         ]
@@ -296,9 +311,8 @@ def test_full_pipeline_buyer_reply_still_template_fallback() -> None:
 
     assert result.degraded is False
     assert result.failed_filter is None
-    assert result.reply == render_fallback("PRICE_INQUIRY")
-    assert result.reply.startswith("【AI 助手】")
-    assert seen[0].generated_reply == DRAFT  # 草稿只到信封
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{DRAFT}"
+    assert seen[0].generated_reply == DRAFT  # 过审草稿经信封到达最终组装点
 
 
 class _SlowChat:

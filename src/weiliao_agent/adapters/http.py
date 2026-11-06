@@ -20,7 +20,11 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from weiliao_agent.filters.templates import render_fallback
-from weiliao_agent.health import cache_metrics_payload, is_ready
+from weiliao_agent.health import (
+    cache_metrics_payload,
+    is_ready,
+    risk_review_metrics_payload,
+)
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.models.intent import IntentTag
 from weiliao_agent.pipeline import PipelineOrchestrator, PipelineResult
@@ -62,17 +66,25 @@ def create_app(
             # 不同，500 属 paging 级事件）：按未就绪收敛，摘除实例待介入。
             ready = False
         if ready:
-            # Story 3.4（A 方案）：就绪响应附缓存命中率快照，压测
-            # curl /health 即读；metrics 取数自身 fail-safe，不阻端点。
+            # Story 3.4/4.4：就绪响应附缓存命中率与审核通过率快照，
+            # 压测 curl /health 即读；两快照各包各的 fail-safe——
+            # 任一取数失败只丢自己那份，不连坐另一个健康数据源。
+            payload: dict[str, Any] = {}
             try:
-                payload = cache_metrics_payload()
+                payload.update(cache_metrics_payload())
             except Exception:
                 # 快照取数失败不得静默：观测功能无声脱落无迹可查。
                 logger.warning(
                     "cache metrics snapshot unavailable; omitting from /health",
                     exc_info=True,
                 )
-                payload = {}
+            try:
+                payload.update(risk_review_metrics_payload())
+            except Exception:
+                logger.warning(
+                    "risk review metrics snapshot unavailable; omitting from /health",
+                    exc_info=True,
+                )
             return JSONResponse(status_code=200, content={"status": "ready", **payload})
         return JSONResponse(status_code=503, content={"status": "not_ready"})
 

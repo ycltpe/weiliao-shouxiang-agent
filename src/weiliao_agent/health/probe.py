@@ -13,7 +13,10 @@ Story 3.4（A 方案）：``cache_metrics_payload`` 提供缓存命中率快照�
 from typing import Any
 
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
-from weiliao_agent.observability.metrics import get_cache_metrics
+from weiliao_agent.observability.metrics import (
+    get_cache_metrics,
+    get_risk_review_metrics,
+)
 from weiliao_agent.pipeline import PipelineOrchestrator
 
 # 就绪所依赖的末位过滤器（架构：端点挂在响应组装过滤器）；
@@ -29,3 +32,8 @@ def is_ready(orchestrator: PipelineOrchestrator) -> bool:
 def cache_metrics_payload() -> dict[str, Any]:
     """命中率快照响应载荷（A 方案读数入口）合并进 /health 就绪响应。"""
     return {"cache_metrics": get_cache_metrics().snapshot()}
+
+
+def risk_review_metrics_payload() -> dict[str, Any]:
+    """审核通过率快照响应载荷（Story 4.4）合并进 /health 就绪响应。"""
+    return {"risk_review_metrics": get_risk_review_metrics().snapshot()}

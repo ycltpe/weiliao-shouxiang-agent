@@ -32,7 +32,7 @@ from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.risk_review import RiskReviewFilter
-from weiliao_agent.filters.templates import render_fallback
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.llm.client import OpenAiGenerationClient
 from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.models.envelope import Envelope
@@ -155,8 +155,17 @@ class PipelineOrchestrator:
         finally:
             # 超时跳的执行线程结果已丢弃，等待其完成无意义（不傻等）。
             executor.shutdown(wait=False)
+        # 最终组装点（Story 4.4）：已过审草稿（risk_review 放行，信封
+        # generated_reply 非 None）携带 AI 身份披露前缀下发；无草稿
+        # （未生成/审核未过/红线意图）回模板兜底（render_fallback 自带
+        # 前缀）。通过审核的内容到达本点后不得再被改写；response_assembler
+        # 占位不动，完整组装器归后续 Epic。
         return PipelineResult(
-            reply=render_fallback(envelope.intent),
+            reply=(
+                f"{AI_DISCLOSURE_PREFIX}{envelope.generated_reply}"
+                if envelope.generated_reply is not None
+                else render_fallback(envelope.intent)
+            ),
             trace_id=trace_id,
             degraded=False,
             failed_filter=None,

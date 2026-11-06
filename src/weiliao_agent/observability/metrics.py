@@ -23,6 +23,10 @@ import threading
 from contextlib import suppress
 from typing import Any, TypedDict
 
+# 审核结果归因词表：权威定义在 filters.risk_review.client（本模块只读
+# 引用，防两处 Literal 漂移；client 无内部依赖，不构成导入环）。
+from weiliao_agent.filters.risk_review.client import RiskReviewOutcome
+
 _logger = logging.getLogger(__name__)
 
 
@@ -117,3 +121,140 @@ def emit_cache_metrics_log() -> None:
             **get_cache_metrics().snapshot(),
         }
         _logger.info("%s", json.dumps(payload, sort_keys=True))
+
+
+# 通过率告警阈值默认值（WEILIAO_RISK_REVIEW_PASS_RATE_THRESHOLD 缺省）。
+DEFAULT_RISK_REVIEW_PASS_RATE_THRESHOLD = 0.95
+
+# 告警最小样本量：累计审核 <20 不告警，防小样本抖动误报。
+MIN_RISK_REVIEW_ALERT_SAMPLES = 20
+
+
+class RiskReviewMetricsSnapshot(TypedDict):
+    """``snapshot()`` 返回结构（/health 响应与定时日志共用）。"""
+
+    total: int  # 分母：实际审核调用数（含超时/错误）
+    passed: int  # 分子：passed
+    rejected: int
+    timeout: int
+    error: int
+    pass_rate: float | None  # passed / total；分母 0 时为 None
+
+
+class RiskReviewMetricsCollector:
+    """后置审核通过率指标计数器（线程安全，仿 CacheMetricsCollector）。
+
+    口径（spec Boundaries，冻结区）：分母 = 实际审核调用数（含超时/
+    错误），分子 = passed；超时与错误计入失败。草稿为 None 的信封不调
+    中台、不计分母（risk_review 过滤器保证）。分母 0 时 ``pass_rate``
+    为 None（无实际审核，通过率无定义）。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._passed = 0
+        self._rejected = 0
+        self._timeout = 0
+        self._error = 0
+        self._pass_rate_threshold = DEFAULT_RISK_REVIEW_PASS_RATE_THRESHOLD
+
+    def record(self, outcome: RiskReviewOutcome) -> None:
+        """记录一次实际审核调用的结果（passed/rejected/timeout/error）。"""
+        with self._lock:
+            if outcome == "passed":
+                self._passed += 1
+            elif outcome == "rejected":
+                self._rejected += 1
+            elif outcome == "timeout":
+                self._timeout += 1
+            else:
+                self._error += 1
+
+    def reset(self) -> None:
+        """清零计数器并还原默认阈值（测试隔离注入点）。"""
+        with self._lock:
+            self._passed = 0
+            self._rejected = 0
+            self._timeout = 0
+            self._error = 0
+            self._pass_rate_threshold = DEFAULT_RISK_REVIEW_PASS_RATE_THRESHOLD
+
+    def snapshot(self) -> RiskReviewMetricsSnapshot:
+        """返回分子/分母/通过率读数（分母 0 时 pass_rate 为 None）。"""
+        with self._lock:
+            passed = self._passed
+            rejected = self._rejected
+            timeout = self._timeout
+            error = self._error
+        total = passed + rejected + timeout + error
+        return RiskReviewMetricsSnapshot(
+            total=total,
+            passed=passed,
+            rejected=rejected,
+            timeout=timeout,
+            error=error,
+            pass_rate=passed / total if total else None,
+        )
+
+    @property
+    def pass_rate_threshold(self) -> float:
+        """跌破告警阈值（0–1，组合根经 env 配置并 fail-fast 校验）。"""
+        with self._lock:
+            return self._pass_rate_threshold
+
+    def set_pass_rate_threshold(self, value: float) -> None:
+        """更新告警阈值；越界（非 0–1）fail-fast（防御性二次校验）。"""
+        if not 0.0 <= value <= 1.0:
+            msg = f"pass_rate_threshold must be within 0-1, got {value!r}"
+            raise ValueError(msg)
+        with self._lock:
+            self._pass_rate_threshold = value
+
+
+# 模块级单例：risk_review 热路径与组合根（/health 响应、定时日志）共用。
+_risk_review_collector = RiskReviewMetricsCollector()
+
+
+def get_risk_review_metrics() -> RiskReviewMetricsCollector:
+    """返回进程内模块级单例审核指标计数器。"""
+    return _risk_review_collector
+
+
+def reset_risk_review_metrics() -> RiskReviewMetricsCollector:
+    """清零模块级单例并返回（测试隔离的注入重置点）。"""
+    _risk_review_collector.reset()
+    return _risk_review_collector
+
+
+def emit_risk_review_metrics_log() -> None:
+    """定时发射审核通过率结构化日志；跌破阈值追加 ERROR 级告警。
+
+    告警口径（spec Boundaries）：累计审核样本 ≥ ``MIN_RISK_REVIEW_ALERT_SAMPLES``
+    且 ``pass_rate < threshold`` 时发射 ERROR 级告警日志
+    （``event=risk_review_alert``）；样本不足不告警防抖动。日志发射自身
+    fail-safe：任何异常吞掉，指标记录绝不二次影响买家应答。消息体即
+    纯 JSON（``record.message`` 可直接 ``json.loads``），同 cache 口径。
+    """
+    with suppress(Exception):
+        collector = get_risk_review_metrics()
+        snapshot = collector.snapshot()
+        threshold = collector.pass_rate_threshold
+        payload: dict[str, Any] = {
+            "event": "risk_review_metrics",
+            "pass_rate_threshold": threshold,
+            **snapshot,
+        }
+        _logger.info("%s", json.dumps(payload, sort_keys=True))
+        total = snapshot["total"]
+        rate = snapshot["pass_rate"]
+        if total >= MIN_RISK_REVIEW_ALERT_SAMPLES and rate is not None and rate < threshold:
+            alert: dict[str, Any] = {
+                "event": "risk_review_alert",
+                "pass_rate": rate,
+                "pass_rate_threshold": threshold,
+                "total": total,
+                "rejected": snapshot["rejected"],
+                "timeout": snapshot["timeout"],
+                "error": snapshot["error"],
+            }
+            _logger.error("%s", json.dumps(alert, sort_keys=True))

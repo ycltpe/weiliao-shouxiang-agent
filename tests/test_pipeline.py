@@ -203,6 +203,46 @@ def test_default_chain_intent_router_defaults_missing_intent_to_unknown() -> Non
     assert result.reply == render_fallback("UNKNOWN")
 
 
+def test_final_assembly_consumes_approved_draft_with_ai_prefix() -> None:
+    # Story 4.4 最终组装点：已过审草稿（generated_reply 非 None 经
+    # risk_review 放行）买家可见 reply = AI 前缀+草稿；无草稿回模板兜底。
+    log: list[str] = []
+    orchestrator = PipelineOrchestrator(
+        filters=[
+            _RecordingFilter("intent_router", log),
+            _RecordingFilter("risk_review", log),
+            _RecordingFilter("response_assembler", log),
+        ]
+    )
+    envelope = Envelope.model_validate(
+        {**_valid_payload(), "generated_reply": "这套房源目前在售。"}
+    )
+
+    result = orchestrator.run(envelope)
+
+    assert result.degraded is False
+    assert result.failed_filter is None
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}这套房源目前在售。"
+
+
+def test_final_assembly_falls_back_when_no_approved_draft() -> None:
+    log: list[str] = []
+    orchestrator = PipelineOrchestrator(
+        filters=[
+            _RecordingFilter("intent_router", log),
+            _RecordingFilter("risk_review", log),
+            _RecordingFilter("response_assembler", log),
+        ]
+    )
+    envelope = Envelope.model_validate(_valid_payload())
+
+    result = orchestrator.run(envelope)
+
+    assert result.degraded is False
+    assert result.failed_filter is None
+    assert result.reply == render_fallback("PRICE_INQUIRY")
+
+
 def test_fallback_template_selection_keys() -> None:
     # 9 类意图各一条文案，全部携带 AI 身份披露前缀。
     bodies: set[str] = set()

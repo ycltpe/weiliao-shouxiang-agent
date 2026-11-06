@@ -664,16 +664,26 @@ def test_lifespan_runs_and_cancels_metrics_log_loop(
     ):
         assert client.get("/health").status_code == 200
         deadline = time.monotonic() + 5  # 等首个间隔后的发射（~0.05s）
-        while time.monotonic() < deadline and not any(
-            r.name == "weiliao_agent.observability.metrics" for r in caplog.records
-        ):
+        while time.monotonic() < deadline and not {
+            json.loads(r.message)["event"]
+            for r in caplog.records
+            if r.name == "weiliao_agent.observability.metrics"
+        } >= {"cache_metrics", "risk_review_metrics"}:
             time.sleep(0.01)
-    payload = json.loads(
-        next(r for r in caplog.records if r.name == "weiliao_agent.observability.metrics").message
-    )
-    assert payload["event"] == "cache_metrics"  # 定时结构化 JSON 单行（纯 JSON 体）
-    assert payload["lookups"] == 0
-    assert payload["hit_rate"] is None
+    records = [
+        json.loads(r.message)
+        for r in caplog.records
+        if r.name == "weiliao_agent.observability.metrics"
+    ]
+    cache_payload = next(p for p in records if p["event"] == "cache_metrics")
+    assert cache_payload["lookups"] == 0
+    assert cache_payload["hit_rate"] is None
+    # Story 4.4：循环内新增的审核通过率发射须被观察——删掉 main.py 中
+    # emit_risk_review_metrics_log() 一行，本断言即红（定时日志与跌破
+    # 阈值告警入口防静默脱落）。
+    risk_payload = next(p for p in records if p["event"] == "risk_review_metrics")
+    assert risk_payload["total"] == 0
+    assert risk_payload["pass_rate"] is None
     assert len(created_tasks) == 1  # 循环任务随 lifespan 创建
     assert created_tasks[0].cancelled()  # 退出上下文后 cancel 回收，无悬挂
 

@@ -494,6 +494,43 @@ def record_llm_generate_event(
         )
 
 
+def record_risk_review_event(
+    trace_id: str | None,
+    *,
+    outcome: Literal["passed", "rejected", "timeout", "error"],
+    latency_ms: float,
+    reason: str | None = None,
+) -> None:
+    """后置审核结果事件（Story 4.4）：仅可观测，不影响买家应答。
+
+    事件 taxonomy（outcome）：``passed``（中台放行，DEFAULT 级）/
+    ``rejected``（中台显式拒绝）/ ``timeout``（超时视为不通过）/
+    ``error``（网络错/非 200/坏响应/endpoint 未配置）。后三者为 ERROR
+    级并携带 reason 归因。审核拒绝/超时属设计内行为：``degraded`` 语义
+    不动，质量信号经本事件与通过率指标表达。fail-safe 口径同
+    ``record_llm_generate_event``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    level: Literal["DEFAULT", "ERROR"] = "ERROR" if outcome != "passed" else "DEFAULT"
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="risk_review.event",
+            level=level,
+            metadata={
+                "event": "risk_review_event",
+                "outcome": outcome,
+                "latency_ms": round(latency_ms, 3),
+                "reason": reason[:_STATUS_MESSAGE_LIMIT] if reason else None,
+            },
+        )
+
+
 def record_house_sync_event(
     trace_id: str | None,
     *,
