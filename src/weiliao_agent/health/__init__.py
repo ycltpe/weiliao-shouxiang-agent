@@ -3,7 +3,13 @@
 from weiliao_agent.health.probe import (
     cache_metrics_payload,
     is_ready,
+    llm_breaker_payload,
     risk_review_metrics_payload,
 )
 
-__all__ = ["cache_metrics_payload", "is_ready", "risk_review_metrics_payload"]
+__all__ = [
+    "cache_metrics_payload",
+    "is_ready",
+    "llm_breaker_payload",
+    "risk_review_metrics_payload",
+]

@@ -531,6 +531,42 @@ def record_risk_review_event(
         )
 
 
+def record_llm_breaker_event(
+    trace_id: str | None,
+    *,
+    outcome: Literal["tripped", "skip", "recovered"],
+    reason: str | None = None,
+) -> None:
+    """LLM 熔断器事件（Story 4.5）：降级/恢复全程可检索锚点。
+
+    事件 taxonomy（outcome）：``tripped``（OpenAI 侧故障致熔断器跳闸
+    open，ERROR 级，携带 reason 归因）/ ``skip``（open/half-open 期间
+    请求被跳过、零子图调用回模板兜底，DEFAULT 级——open 期每次跳过都
+    记 ERROR 会造成噪音洪流，ERROR 只留给跳闸与告警日志）/
+    ``recovered``（步进试探成功、放行比例达 100% 闭合 closed，DEFAULT
+    级）。买家可见语义逐字节不动（degraded=False），本事件仅质量信号。
+    fail-safe 口径同 ``record_risk_review_event``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    level: Literal["DEFAULT", "ERROR"] = "ERROR" if outcome == "tripped" else "DEFAULT"
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="llm.breaker_event",
+            level=level,
+            metadata={
+                "event": "llm_breaker_event",
+                "outcome": outcome,
+                "reason": reason[:_STATUS_MESSAGE_LIMIT] if reason else None,
+            },
+        )
+
+
 def record_house_sync_event(
     trace_id: str | None,
     *,

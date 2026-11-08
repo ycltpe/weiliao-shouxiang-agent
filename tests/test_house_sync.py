@@ -642,12 +642,13 @@ def test_lifespan_forces_cancel_on_blocking_consumer(
 def test_lifespan_runs_and_cancels_metrics_log_loop(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Story 3.4（A 方案）接线守护：metrics 定时日志任务随 lifespan 启动、
-    # 退出后被 cancel 回收——删掉 create_task 一行本测试即红，防 stderr
-    # 读数入口静默脱落。间隔改小（循环体每轮读模块全局，patch 即生效）。
+    # Story 3.4（A 方案）/4.5 接线守护：metrics 定时日志任务随 lifespan
+    # 启动、退出后被 cancel 回收——删掉 create_task 一行本测试即红，防
+    # stderr 读数入口静默脱落。间隔改小（循环体每轮读模块全局，patch 即生效）。
     monkeypatch.delenv("WEILIAO_KAFKA_BROKERS", raising=False)
     monkeypatch.setattr(main_module, "_METRICS_LOG_SECONDS", 0.05)
     metrics_module.reset_cache_metrics()
+    metrics_module.reset_llm_breaker_metrics()
     created_tasks: list[asyncio.Task[Any]] = []
     real_create_task = asyncio.create_task
 
@@ -668,7 +669,7 @@ def test_lifespan_runs_and_cancels_metrics_log_loop(
             json.loads(r.message)["event"]
             for r in caplog.records
             if r.name == "weiliao_agent.observability.metrics"
-        } >= {"cache_metrics", "risk_review_metrics"}:
+        } >= {"cache_metrics", "risk_review_metrics", "llm_breaker_metrics"}:
             time.sleep(0.01)
     records = [
         json.loads(r.message)
@@ -684,6 +685,12 @@ def test_lifespan_runs_and_cancels_metrics_log_loop(
     risk_payload = next(p for p in records if p["event"] == "risk_review_metrics")
     assert risk_payload["total"] == 0
     assert risk_payload["pass_rate"] is None
+    # Story 4.5：循环内新增的熔断器发射须被观察——删掉 main.py 中
+    # emit_llm_breaker_metrics_log() 一行，本断言即红（定时日志与
+    # 非 closed 态告警入口防静默脱落）。
+    breaker_payload = next(p for p in records if p["event"] == "llm_breaker_metrics")
+    assert breaker_payload["state"] == "closed"
+    assert breaker_payload["requests"] == 0
     assert len(created_tasks) == 1  # 循环任务随 lifespan 创建
     assert created_tasks[0].cancelled()  # 退出上下文后 cancel 回收，无悬挂
 

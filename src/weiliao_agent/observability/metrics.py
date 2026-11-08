@@ -258,3 +258,114 @@ def emit_risk_review_metrics_log() -> None:
                 "error": snapshot["error"],
             }
             _logger.error("%s", json.dumps(alert, sort_keys=True))
+
+
+# ---- LLM 熔断器指标（Story 4.5，仿 RiskReviewMetricsCollector）----
+
+
+class LlmBreakerMetricsSnapshot(TypedDict):
+    """``snapshot()`` 返回结构（/health 响应与定时日志共用）。"""
+
+    state: str  # 熔断器当前三态：closed / open / half_open
+    requests: int  # 熔断放行（实际触达子图）的请求数
+    skipped: int  # open/half-open 拒绝（零子图调用，立即模板兜底）数
+    trips: int  # 跳闸次数（closed→open 与 half-open→open 迁移）
+    recoveries: int  # 恢复闭合次数（half-open→closed 迁移）
+
+
+class LlmBreakerMetricsCollector:
+    """LLM 熔断器指标计数器（线程安全）。
+
+    口径：计数由熔断器本体（``llm.circuit_breaker``）在状态迁移与放行
+    决策点回写——requests/skipped 为决策计数，trips/recoveries 为状态
+    迁移计数；state 由熔断器迁移时同步（快照含当前状态，/health 即读）。
+    全部入口自身不抛异常（调用方仍按 fail-safe 口径兜底吞错，对齐
+    tracing 约定）。模块级单例供热路径与组合根共用；测试经
+    ``reset_llm_breaker_metrics`` 注入重置实现隔离。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = "closed"
+        self._requests = 0
+        self._skipped = 0
+        self._trips = 0
+        self._recoveries = 0
+
+    def record_request(self) -> None:
+        """记录一次放行（请求将实际触达子图）。"""
+        with self._lock:
+            self._requests += 1
+
+    def record_skipped(self) -> None:
+        """记录一次拒绝（open/half-open 未放量，零子图调用）。"""
+        with self._lock:
+            self._skipped += 1
+
+    def record_trip(self) -> None:
+        """记录一次跳闸（进入 open）。"""
+        with self._lock:
+            self._trips += 1
+
+    def record_recovery(self) -> None:
+        """记录一次恢复闭合（回到 closed）。"""
+        with self._lock:
+            self._recoveries += 1
+
+    def set_state(self, state: str) -> None:
+        """同步熔断器当前三态（迁移点权威写入，快照/告警消费）。"""
+        with self._lock:
+            self._state = state
+
+    def reset(self) -> None:
+        """清零全部计数器并还原 closed 态（测试隔离注入点）。"""
+        with self._lock:
+            self._state = "closed"
+            self._requests = 0
+            self._skipped = 0
+            self._trips = 0
+            self._recoveries = 0
+
+    def snapshot(self) -> LlmBreakerMetricsSnapshot:
+        """返回状态 + 计数读数（/health 响应与定时日志共用）。"""
+        with self._lock:
+            return LlmBreakerMetricsSnapshot(
+                state=self._state,
+                requests=self._requests,
+                skipped=self._skipped,
+                trips=self._trips,
+                recoveries=self._recoveries,
+            )
+
+
+# 模块级单例：熔断器与组合根（/health 响应、定时日志）共用。
+_llm_breaker_collector = LlmBreakerMetricsCollector()
+
+
+def get_llm_breaker_metrics() -> LlmBreakerMetricsCollector:
+    """返回进程内模块级单例熔断器指标计数器。"""
+    return _llm_breaker_collector
+
+
+def reset_llm_breaker_metrics() -> LlmBreakerMetricsCollector:
+    """清零模块级单例并返回（测试隔离的注入重置点）。"""
+    _llm_breaker_collector.reset()
+    return _llm_breaker_collector
+
+
+def emit_llm_breaker_metrics_log() -> None:
+    """定时发射熔断器结构化日志；非 closed 态追加 ERROR 级告警。
+
+    告警口径（spec Boundaries）：熔断器非 closed 态（open/half_open，
+    即降级持续中）时发射 ERROR 级 ``llm_breaker_alert`` 告警日志——
+    与 risk_review 跌破阈值告警同通道，无需累计样本（状态本身即信号）。
+    日志发射自身 fail-safe：任何异常吞掉，指标记录绝不二次影响买家应答。
+    消息体即纯 JSON（``record.message`` 可直接 ``json.loads``），同 cache 口径。
+    """
+    with suppress(Exception):
+        snapshot = get_llm_breaker_metrics().snapshot()
+        payload: dict[str, Any] = {"event": "llm_breaker_metrics", **snapshot}
+        _logger.info("%s", json.dumps(payload, sort_keys=True))
+        if snapshot["state"] != "closed":
+            alert: dict[str, Any] = {"event": "llm_breaker_alert", **snapshot}
+            _logger.error("%s", json.dumps(alert, sort_keys=True))

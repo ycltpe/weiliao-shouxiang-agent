@@ -1,4 +1,5 @@
-"""健康检查端点单测（Story 1.4；Story 3.4 追加 metrics snapshot 读数）。
+"""健康检查端点单测（Story 1.4；Story 3.4/4.4 追加 metrics snapshot 读数；
+Story 4.5 追加熔断器快照与快照非零回读）。
 
 覆盖 spec I/O 口径两场景：管道编排完成（含 response_assembler）→ 200；
 链不完整 → 503（非 200 即满足 AC，负载均衡据此刻摘除实例）。
@@ -28,6 +29,7 @@ def test_health_ready_returns_200() -> None:
     # 快照读取自身 fail-safe，就绪判定不受影响。
     metrics_module.reset_cache_metrics()
     metrics_module.reset_risk_review_metrics()
+    metrics_module.reset_llm_breaker_metrics()
     client = TestClient(create_app())  # 默认五过滤器链完整
     response = client.get("/health")
     assert response.status_code == 200
@@ -42,6 +44,37 @@ def test_health_ready_returns_200() -> None:
     assert risk_metrics["total"] == 0
     assert risk_metrics["passed"] == 0
     assert risk_metrics["pass_rate"] is None
+    # Story 4.5：就绪响应附熔断器快照（状态 + 计数）。
+    llm_breaker = body["llm_breaker"]
+    assert llm_breaker["state"] == "closed"
+    assert llm_breaker["requests"] == 0
+    assert llm_breaker["skipped"] == 0
+    assert llm_breaker["trips"] == 0
+    assert llm_breaker["recoveries"] == 0
+
+
+def test_health_llm_breaker_snapshot_nonzero_readback() -> None:
+    # Story 4.5 AC 第 5 条：熔断器活动后 /health 快照非零可读（非仅零值占位）。
+    collector = metrics_module.reset_llm_breaker_metrics()
+    try:
+        collector.record_request()
+        collector.record_skipped()
+        collector.record_trip()
+        collector.set_state("open")
+        client = TestClient(create_app())
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        llm_breaker = response.json()["llm_breaker"]
+        assert llm_breaker["state"] == "open"
+        assert llm_breaker["requests"] == 1
+        assert llm_breaker["skipped"] == 1
+        assert llm_breaker["trips"] == 1
+        assert llm_breaker["recoveries"] == 0
+    finally:
+        # 共享单例：中途断言失败也不得把 open 态/计数泄漏给后续用例。
+        metrics_module.reset_llm_breaker_metrics()
 
 
 def test_health_incomplete_chain_returns_503() -> None:

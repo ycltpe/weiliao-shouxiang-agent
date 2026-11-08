@@ -43,6 +43,14 @@ fail-fast 带变量名。``/health`` 就绪响应附审核通过率快照，life
 定时日志增发 ``risk_review_metrics``（跌破阈值时 ``risk_review_alert``
 ERROR 告警）。
 
+Story 4.5 组合根：LLM 熔断器（``llm.circuit_breaker.LlmCircuitBreaker``，
+三态 + 确定性步进恢复）注入 LlmGenerateFilter——open 期间请求不调子图、
+立即回模板兜底；``WEILIAO_LLM_BREAKER_COOLDOWN_SECONDS`` 缺省 10、
+非正 fail-fast 带变量名；``WEILIAO_LLM_BREAKER_RECOVERY_STEP`` 缺省
+0.1、须 0<x<=1 越界 fail-fast 带变量名；指标经模块级单例归集，
+``/health`` 附熔断器快照，lifespan 定时日志增发 ``llm_breaker_metrics``
+（非 closed 态追加 ERROR 级 ``llm_breaker_alert`` 告警）。
+
 Story 3.4 组合根（A 方案）：cache_lookup 的追问禁走与命中率计数经
 ``observability.metrics`` 模块级单例归集；``/health`` 就绪响应附
 metrics snapshot（压测 curl 即读）；lifespan 托管定时结构化 stderr
@@ -52,6 +60,7 @@ fail-fast 带变量名）。
 
 import asyncio
 import logging
+import math
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -72,6 +81,7 @@ from weiliao_agent.filters.risk_review import (
     RiskReviewClient,
     RiskReviewFilter,
 )
+from weiliao_agent.llm.circuit_breaker import LlmCircuitBreaker
 from weiliao_agent.llm.client import OpenAiGenerationClient
 from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.observability import metrics
@@ -156,6 +166,53 @@ if not 0.0 <= _RISK_REVIEW_PASS_RATE_THRESHOLD <= 1.0:
 metrics.get_risk_review_metrics().set_pass_rate_threshold(_RISK_REVIEW_PASS_RATE_THRESHOLD)
 _risk_review_client = RiskReviewClient(timeout_ms=_RISK_REVIEW_TIMEOUT_MS)
 
+# LLM 熔断器冷却期（Story 4.5）：缺省 10s；解析错误、非正与非有限
+# （nan/inf：nan 令 open 立即抖回 half-open、inf 令熔断永不恢复）均
+# fail-fast 拒绝启动（错误消息带变量名，同 WEILIAO_L1_TTL_SECONDS 口径）。
+_LLM_BREAKER_COOLDOWN_RAW = os.environ.get("WEILIAO_LLM_BREAKER_COOLDOWN_SECONDS", "10")
+try:
+    _LLM_BREAKER_COOLDOWN_SECONDS = float(_LLM_BREAKER_COOLDOWN_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_LLM_BREAKER_COOLDOWN_SECONDS must be a number, "
+        f"got {_LLM_BREAKER_COOLDOWN_RAW!r}"
+    )
+    raise ValueError(msg) from exc
+if (
+    not math.isfinite(_LLM_BREAKER_COOLDOWN_SECONDS)
+    or _LLM_BREAKER_COOLDOWN_SECONDS <= 0
+):
+    msg = (
+        f"WEILIAO_LLM_BREAKER_COOLDOWN_SECONDS must be a positive finite number, "
+        f"got {_LLM_BREAKER_COOLDOWN_SECONDS}"
+    )
+    raise ValueError(msg)
+
+# 恢复步进：缺省 0.1（half-open 按 10% 起步、试探成功 +10%、达 100%
+# 闭合）；须 0<x<=1，越界 fail-fast 拒绝启动（错误消息带变量名）。
+_LLM_BREAKER_STEP_RAW = os.environ.get("WEILIAO_LLM_BREAKER_RECOVERY_STEP", "0.1")
+try:
+    _LLM_BREAKER_RECOVERY_STEP = float(_LLM_BREAKER_STEP_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_LLM_BREAKER_RECOVERY_STEP must be a number, "
+        f"got {_LLM_BREAKER_STEP_RAW!r}"
+    )
+    raise ValueError(msg) from exc
+if not 0.0 < _LLM_BREAKER_RECOVERY_STEP <= 1.0:
+    msg = (
+        f"WEILIAO_LLM_BREAKER_RECOVERY_STEP must be within (0, 1], "
+        f"got {_LLM_BREAKER_RECOVERY_STEP}"
+    )
+    raise ValueError(msg)
+# 组合根构造：指标单例注入（状态/计数归集与 /health、定时日志共用）；
+# 纯进程内状态，装配期不触达 OpenAI 凭据。
+_llm_breaker = LlmCircuitBreaker(
+    cooldown_seconds=_LLM_BREAKER_COOLDOWN_SECONDS,
+    recovery_step=_LLM_BREAKER_RECOVERY_STEP,
+    metrics=metrics.get_llm_breaker_metrics(),
+)
+
 
 async def _metrics_log_loop() -> None:
     """定时发射缓存命中率与审核通过率结构化日志（first 发射在首个
@@ -164,6 +221,7 @@ async def _metrics_log_loop() -> None:
         await asyncio.sleep(_METRICS_LOG_SECONDS)
         metrics.emit_cache_metrics_log()
         metrics.emit_risk_review_metrics_log()
+        metrics.emit_llm_breaker_metrics_log()
 
 
 @asynccontextmanager
@@ -216,7 +274,8 @@ app = create_app(
             LlmGenerateFilter(
                 subgraph=LlmGenerationSubgraph(
                     OpenAiGenerationClient(budget_seconds=LLM_GENERATE_BUDGET_SECONDS)
-                )
+                ),
+                breaker=_llm_breaker,
             ),
             RiskReviewFilter(client=_risk_review_client),
             ResponseAssemblerFilter(),

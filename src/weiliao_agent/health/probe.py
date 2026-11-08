@@ -8,6 +8,10 @@
 Story 3.4（A 方案）：``cache_metrics_payload`` 提供缓存命中率快照的
 /health 响应挂点——压测 ``curl /health`` 即读，分子/分母/``hit_rate``
 口径权威定义在 ``observability.metrics``。
+
+Story 4.5：``llm_breaker_payload`` 提供 LLM 熔断器快照（状态 + 计数）
+挂点——降级持续期（非 closed 态）curl /health 即读，口径权威定义在
+``observability.metrics``（仿 risk_review 快照先例，各自 fail-safe）。
 """
 
 from typing import Any
@@ -15,6 +19,7 @@ from typing import Any
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.observability.metrics import (
     get_cache_metrics,
+    get_llm_breaker_metrics,
     get_risk_review_metrics,
 )
 from weiliao_agent.pipeline import PipelineOrchestrator
@@ -37,3 +42,8 @@ def cache_metrics_payload() -> dict[str, Any]:
 def risk_review_metrics_payload() -> dict[str, Any]:
     """审核通过率快照响应载荷（Story 4.4）合并进 /health 就绪响应。"""
     return {"risk_review_metrics": get_risk_review_metrics().snapshot()}
+
+
+def llm_breaker_payload() -> dict[str, Any]:
+    """熔断器状态/计数快照响应载荷（Story 4.5）合并进 /health 就绪响应。"""
+    return {"llm_breaker": get_llm_breaker_metrics().snapshot()}

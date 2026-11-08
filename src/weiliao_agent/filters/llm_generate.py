@@ -17,11 +17,22 @@ COMPLAINT，红线优先于 LLM 链路）与 ``media_type`` 非 text、空消息
   买家可见应答、``degraded`` 语义一律不动——4.4 审核就位前 LLM
   内容在任何路径都不得未经审核触达买家，本过滤器不消费也不产出
   买家可见文本。
+
+Story 4.5：可选注入熔断器（``llm.circuit_breaker.LlmCircuitBreaker``，
+None=不熔断，保持既有测试与惰性默认路径语义）。请求前 ``before_request()``
+咨询：False 即跳过生成——不调子图、零 I/O、信封原样透传（切换 <100ms
+的前提是 open 期间零子图调用），并记 DEFAULT 级 skip 事件；生成成功
+``on_success()``（grounding 未过属内容问题、中性不信号，成功口径=
+子图未抛 OpenAI 故障）；生成异常按 ``_failure_reason`` 归一后
+``on_failure(reason)``，仅 OpenAI 侧故障词表跳闸（tripped 事件 ERROR 级），
+确定性失败不跳闸。熔断咨询/信号自身全部 fail-safe（异常吞掉、按放行
+处理），绝不让请求路径因熔断逻辑抛错。
 """
 
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.llm import LlmGenerationError
 from weiliao_agent.llm import generate as _module_generate
+from weiliao_agent.llm.circuit_breaker import LlmCircuitBreaker
 from weiliao_agent.llm.grounding import verify_grounding
 from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.models.envelope import Envelope
@@ -39,10 +50,16 @@ class LlmGenerateFilter(Filter):
 
     name = "llm_generate"
 
-    def __init__(self, subgraph: LlmGenerationSubgraph | None = None) -> None:
+    def __init__(
+        self,
+        subgraph: LlmGenerationSubgraph | None = None,
+        breaker: LlmCircuitBreaker | None = None,
+    ) -> None:
         # 组合根注入定制子图；缺省 None 走 llm 模块级惰性入口（装配期
         # 不触达 OpenAI 凭据，同 3.3 cache_lookup 注入模式）。
+        # breaker 可选注入（Story 4.5）：None=不熔断，装配期不构造亦可。
         self._subgraph = subgraph
+        self._breaker = breaker
 
     def process(self, envelope: Envelope) -> Envelope:
         if envelope.intent in _REDLINE_INTENTS:
@@ -59,17 +76,28 @@ class LlmGenerateFilter(Filter):
         if message is None or not message.strip():
             # 空/空白消息：跳过生成，信封原样透传，不触达模型。
             return envelope
+        breaker = self._breaker
+        if breaker is not None and not self._consult_breaker(breaker, envelope):
+            # 熔断拒绝：open/half-open 未放量，不调子图、零 I/O、透传。
+            return envelope
         try:
             text = self._generate(message, envelope)
         except Exception as exc:
             # 全路径 fail-safe：凭据缺失/超时/网络错误一律吞掉，草稿
             # 为 None；仅记可观测事件，买家应答与 degraded 语义不动。
+            reason = _failure_reason(exc)
             tracing.record_llm_generate_event(
                 envelope.trace_id,
                 outcome="generation_error",
-                reason=_failure_reason(exc),
+                reason=reason,
             )
+            if breaker is not None:
+                self._signal_breaker_failure(breaker, envelope, reason)
             return envelope
+        if breaker is not None:
+            # 成功信号口径：子图未抛 OpenAI 故障即算成功（grounding
+            # 校验属内容问题，中性，不阻断恢复推进）。
+            self._signal_breaker_success(breaker, envelope)
         problem = verify_grounding(text)
         if problem is not None:
             # fail-closed：违禁表述/标注泄漏/链接命中即丢弃草稿。
@@ -95,6 +123,46 @@ class LlmGenerateFilter(Filter):
             intent=envelope.intent,
             trace_id=envelope.trace_id,
         )
+
+    def _consult_breaker(self, breaker: LlmCircuitBreaker, envelope: Envelope) -> bool:
+        """熔断咨询：False 即跳过生成（不调子图、信封原样透传）。
+
+        咨询自身 fail-safe：breaker 异常吞掉并按放行处理（熔断器是
+        优化层，故障时退化回既有傻等预算路径，绝不反过来阻断请求）；
+        拒绝路径记 DEFAULT 级 skip 事件（open 期跳过记 ERROR 会成噪音）。
+        """
+        try:
+            admitted = breaker.before_request()
+        except Exception:
+            return True
+        if admitted:
+            return True
+        tracing.record_llm_breaker_event(envelope.trace_id, outcome="skip")
+        return False
+
+    def _signal_breaker_failure(
+        self, breaker: LlmCircuitBreaker, envelope: Envelope, reason: str
+    ) -> None:
+        """故障信号 fail-safe：仅故障词表跳闸时记 ERROR 级 tripped 事件。"""
+        try:
+            tripped = breaker.on_failure(reason)
+        except Exception:
+            return
+        if tripped:
+            tracing.record_llm_breaker_event(
+                envelope.trace_id, outcome="tripped", reason=reason
+            )
+
+    def _signal_breaker_success(
+        self, breaker: LlmCircuitBreaker, envelope: Envelope
+    ) -> None:
+        """成功信号 fail-safe：推进恢复至 100% 闭合时记 recovered 事件。"""
+        try:
+            recovered = breaker.on_success()
+        except Exception:
+            return
+        if recovered:
+            tracing.record_llm_breaker_event(envelope.trace_id, outcome="recovered")
 
 
 def _failure_reason(exc: Exception) -> str:
