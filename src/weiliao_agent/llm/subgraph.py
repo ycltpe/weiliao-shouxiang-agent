@@ -9,14 +9,27 @@ LLM 编排仅允许位于本进程内子图：编译后仅经 ``.invoke()`` 在�
 对外只暴露同步 ``LlmGenerationSubgraph.generate()``；输入仅消费
 ``resolved_message`` + ``fact_card`` + ``intent``（+追踪用 ``trace_id``），
 空消息 fail-fast（reason=``invalid_input``），不触达模型。
+
+Story 4.6：可选注入模型路由（``llm.model_router.ModelRouter``，None=
+单模型既有路径逐字节不变）——generate 节点经 router 按意图复杂度与
+滑窗预算护栏选定 client 生成，路由事件（primary/mini/forced_mini/
+recovered）记 trace、成功 usage 由 router 记账（失败不计）；路由判定/
+记账自身全部 fail-safe：护栏异常回退主模型放行处理，绝不阻断生成。
 """
 
+from contextlib import suppress
 from typing import Any, TypedDict
 
+from langchain_core.messages import BaseMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from weiliao_agent.llm.client import LlmGenerationError, OpenAiGenerationClient
+from weiliao_agent.llm.client import (
+    GenerationResult,
+    LlmGenerationError,
+    OpenAiGenerationClient,
+)
+from weiliao_agent.llm.model_router import ModelRouter
 from weiliao_agent.llm.prompts import build_generation_prompt
 from weiliao_agent.models.fact_card import FactCard
 from weiliao_agent.models.intent import IntentTag
@@ -40,6 +53,7 @@ class LlmSubgraphState(TypedDict):
 
 def build_generation_graph(
     client: OpenAiGenerationClient,
+    router: ModelRouter | None = None,
 ) -> CompiledStateGraph[LlmSubgraphState, None, LlmSubgraphState, LlmSubgraphState]:
     """编译生成子图：START → generate → END（节点内组合 client 与埋点）。"""
 
@@ -49,7 +63,10 @@ def build_generation_graph(
             fact_card=state["fact_card"],
             intent=state["intent"],
         )
-        result = client.generate(messages)
+        if router is not None:
+            result = _generate_via_router(router, client, messages, state)
+        else:
+            result = client.generate(messages)
         # fail-safe 追踪：record_generation 内部吞异常，不阻断应答链路；
         # cost 不在本 Story 计算（由 Langfuse 按模型自算，Story 4.6 细化）。
         tracing.record_generation(
@@ -64,12 +81,53 @@ def build_generation_graph(
     return graph.compile()
 
 
+def _generate_via_router(
+    router: ModelRouter,
+    fallback: OpenAiGenerationClient,
+    messages: list[BaseMessage],
+    state: LlmSubgraphState,
+) -> GenerationResult:
+    """路由路径生成：护栏判定/记账 fail-safe，异常回退主模型放行。
+
+    判定自身异常吞掉并按常规路由（主模型）放行——预算护栏是优化层，
+    故障时退化回既有路径，绝不反过来阻断生成；生成失败（LlmGenerationError）
+    不在此吞掉，照常上抛由过滤器既有语义归一（失败不计入预算）。
+    """
+    try:
+        decision = router.select(state["intent"])
+    except Exception:
+        decision = None
+    if decision is None:
+        return fallback.generate(messages)
+    result = decision.client.generate(messages)
+    # fail-safe 追踪（tracing 内部吞异常）：单条消息可复盘路由 outcome；
+    # 收紧→恢复迁移的判定瞬间补记 recovered 事件。
+    tracing.record_model_routing_event(
+        state["trace_id"], outcome=decision.outcome, intent=state["intent"]
+    )
+    if decision.transition is not None:
+        tracing.record_model_routing_event(
+            state["trace_id"], outcome=decision.transition, intent=state["intent"]
+        )
+    # 记账 fail-safe：预算护栏不得阻断已成功生成。
+    with suppress(Exception):
+        router.account(decision, result.usage)
+    return result
+
+
 class LlmGenerationSubgraph:
     """编译后的生成子图 + 同步入口（进程内 ``.invoke()``，AD-2）。"""
 
-    def __init__(self, client: OpenAiGenerationClient | None = None) -> None:
+    def __init__(
+        self,
+        client: OpenAiGenerationClient | None = None,
+        router: ModelRouter | None = None,
+    ) -> None:
+        # router 可选注入（Story 4.6）：None=单模型既有路径逐字节不变；
+        # 组合根注入时 client 须为路由主模型 client（护栏 fail-safe 回退用）。
         self._client = client or OpenAiGenerationClient()
-        self._graph = build_generation_graph(self._client)
+        self._router = router
+        self._graph = build_generation_graph(self._client, router=router)
 
     def generate(
         self,

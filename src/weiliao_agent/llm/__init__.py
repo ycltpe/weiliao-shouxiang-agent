@@ -16,6 +16,21 @@ from weiliao_agent.llm.client import (
     LlmGenerationError,
     OpenAiGenerationClient,
 )
+from weiliao_agent.llm.model_router import (
+    DEFAULT_BUDGET_TOKENS as ROUTING_DEFAULT_BUDGET_TOKENS,
+)
+from weiliao_agent.llm.model_router import (
+    DEFAULT_MINI_MODEL_ALIAS,
+    KNOWN_INTENTS,
+    ModelRouter,
+    RoutingDecision,
+)
+from weiliao_agent.llm.model_router import (
+    DEFAULT_SIMPLE_INTENTS as ROUTING_DEFAULT_SIMPLE_INTENTS,
+)
+from weiliao_agent.llm.model_router import (
+    DEFAULT_WINDOW_SECONDS as ROUTING_DEFAULT_WINDOW_SECONDS,
+)
 from weiliao_agent.llm.prompts import build_generation_prompt
 from weiliao_agent.llm.subgraph import (
     GENERATE_NODE,
@@ -30,12 +45,19 @@ __all__ = [
     "DEFAULT_BUDGET_SECONDS",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_MODEL_ALIAS",
+    "DEFAULT_MINI_MODEL_ALIAS",
     "GENERATE_NODE",
     "GenerationResult",
+    "KNOWN_INTENTS",
     "LlmGenerationError",
     "LlmGenerationSubgraph",
     "LlmSubgraphState",
+    "ModelRouter",
     "OpenAiGenerationClient",
+    "ROUTING_DEFAULT_BUDGET_TOKENS",
+    "ROUTING_DEFAULT_SIMPLE_INTENTS",
+    "ROUTING_DEFAULT_WINDOW_SECONDS",
+    "RoutingDecision",
     "build_generation_graph",
     "build_generation_prompt",
     "generate",

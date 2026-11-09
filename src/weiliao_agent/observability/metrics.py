@@ -369,3 +369,128 @@ def emit_llm_breaker_metrics_log() -> None:
         if snapshot["state"] != "closed":
             alert: dict[str, Any] = {"event": "llm_breaker_alert", **snapshot}
             _logger.error("%s", json.dumps(alert, sort_keys=True))
+
+
+# ---- 模型路由与预算护栏指标（Story 4.6，仿 LlmBreakerMetricsCollector）----
+
+
+class ModelRoutingMetricsSnapshot(TypedDict):
+    """``snapshot()`` 返回结构（/health 响应与定时日志共用）。"""
+
+    primary_calls: int  # 主模型调用数（名单外意图/intent=None 常规路由）
+    primary_tokens: int  # 主模型 token 累计（成功回传 usage 的 total_tokens）
+    mini_calls: int  # mini 调用数（含收紧期 forced_mini）
+    mini_tokens: int  # mini token 累计（含收紧期 forced_mini）
+    tightened: bool  # 预算护栏当前是否处于收紧态（全部强制 mini）
+    over_limits: int  # 收紧进入次数（滑窗累计 ≥ 阈值的迁移计数）
+    recoveries: int  # 收紧恢复次数（回落 < 阈值的迁移计数）
+
+
+class ModelRoutingMetricsCollector:
+    """模型路由指标计数器（线程安全）。
+
+    口径：计数由路由本体（``llm.model_router.ModelRouter``）在判定与
+    记账点回写——calls/tokens 为成功生成计数（forced_mini 计入 mini
+    口径，模型维度归并）；tightened 由迁移时同步（快照含当前状态，
+    /health 即读）；over_limits/recoveries 为收紧/恢复迁移计数。全部
+    入口自身不抛异常（调用方仍按 fail-safe 口径兜底吞错，对齐 tracing
+    约定）。模块级单例供热路径与组合根共用；测试经
+    ``reset_model_routing_metrics`` 注入重置实现隔离。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._primary_calls = 0
+        self._primary_tokens = 0
+        self._mini_calls = 0
+        self._mini_tokens = 0
+        self._tightened = False
+        self._over_limits = 0
+        self._recoveries = 0
+
+    def record_call(self, outcome: str, tokens: int) -> None:
+        """记录一次成功生成调用：按 outcome 归并模型维度（primary/mini）。
+
+        forced_mini 走 mini 模型，计入 mini 口径；tokens 为回传
+        ``total_tokens``（缺失容忍 0，路由层已收敛）。
+        """
+        with self._lock:
+            if outcome == "primary":
+                self._primary_calls += 1
+                self._primary_tokens += tokens
+            else:
+                # mini 与 forced_mini 同为 mini 模型口径。
+                self._mini_calls += 1
+                self._mini_tokens += tokens
+
+    def set_tightened(self, tightened: bool) -> None:
+        """同步预算护栏收紧态（迁移点权威写入，快照/告警消费）。"""
+        with self._lock:
+            self._tightened = tightened
+
+    def record_over_limit(self) -> None:
+        """记录一次收紧进入（滑窗累计 ≥ 阈值）。"""
+        with self._lock:
+            self._over_limits += 1
+
+    def record_recovery(self) -> None:
+        """记录一次收紧恢复（滑窗消耗回落 < 阈值）。"""
+        with self._lock:
+            self._recoveries += 1
+
+    def reset(self) -> None:
+        """清零全部计数器并解除收紧态（测试隔离注入点）。"""
+        with self._lock:
+            self._primary_calls = 0
+            self._primary_tokens = 0
+            self._mini_calls = 0
+            self._mini_tokens = 0
+            self._tightened = False
+            self._over_limits = 0
+            self._recoveries = 0
+
+    def snapshot(self) -> ModelRoutingMetricsSnapshot:
+        """返回模型维度计数 + 收紧状态读数（/health 响应与定时日志共用）。"""
+        with self._lock:
+            return ModelRoutingMetricsSnapshot(
+                primary_calls=self._primary_calls,
+                primary_tokens=self._primary_tokens,
+                mini_calls=self._mini_calls,
+                mini_tokens=self._mini_tokens,
+                tightened=self._tightened,
+                over_limits=self._over_limits,
+                recoveries=self._recoveries,
+            )
+
+
+# 模块级单例：路由器与组合根（/health 响应、定时日志）共用。
+_model_routing_collector = ModelRoutingMetricsCollector()
+
+
+def get_model_routing_metrics() -> ModelRoutingMetricsCollector:
+    """返回进程内模块级单例路由指标计数器。"""
+    return _model_routing_collector
+
+
+def reset_model_routing_metrics() -> ModelRoutingMetricsCollector:
+    """清零模块级单例并返回（测试隔离的注入重置点）。"""
+    _model_routing_collector.reset()
+    return _model_routing_collector
+
+
+def emit_model_routing_metrics_log() -> None:
+    """定时发射模型路由结构化日志；收紧态追加 ERROR 级告警。
+
+    告警口径（spec Boundaries）：预算护栏处于收紧态（全部强制 mini，
+    即成本异常持续中）时发射 ERROR 级 ``model_routing_alert`` 告警日志
+    ——与熔断器非 closed 态告警同通道，无需累计样本（状态本身即信号）。
+    日志发射自身 fail-safe：任何异常吞掉，指标记录绝不二次影响买家应答。
+    消息体即纯 JSON（``record.message`` 可直接 ``json.loads``），同 cache 口径。
+    """
+    with suppress(Exception):
+        snapshot = get_model_routing_metrics().snapshot()
+        payload: dict[str, Any] = {"event": "model_routing_metrics", **snapshot}
+        _logger.info("%s", json.dumps(payload, sort_keys=True))
+        if snapshot["tightened"]:
+            alert: dict[str, Any] = {"event": "model_routing_alert", **snapshot}
+            _logger.error("%s", json.dumps(alert, sort_keys=True))

@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-10-31
-last_updated: 2026-11-08
+last_updated: 2026-11-09
 project: test
 project_key: NOKEY
 tracking_system: file-system
@@ -72,7 +72,7 @@ development_status:
   4-3-事实卡片-Grounding-受控生成: review
   4-4-后置风控双审核: review
   4-5-OpenAI-故障降级与步进恢复: review
-  4-6-模型路由与成本护栏: backlog
+  4-6-模型路由与成本护栏: review
   epic-4-retrospective: optional
   epic-5: backlog
   5-1-硬触发条件判定: backlog

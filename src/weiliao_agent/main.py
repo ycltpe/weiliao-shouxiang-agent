@@ -51,6 +51,20 @@ Story 4.5 组合根：LLM 熔断器（``llm.circuit_breaker.LlmCircuitBreaker``�
 ``/health`` 附熔断器快照，lifespan 定时日志增发 ``llm_breaker_metrics``
 （非 closed 态追加 ERROR 级 ``llm_breaker_alert`` 告警）。
 
+Story 4.6 组合根：模型路由与 token 预算护栏（``llm.model_router.ModelRouter``，
+按意图复杂度在 gpt-4o/gpt-4o-mini 间选择 + 每分钟滑窗累计 total_tokens
+≥ 阈值即收紧、全部强制 mini、回落自动恢复）注入 LlmGenerationSubgraph——
+路由层为每个 alias 各持一个 client 实例（client 单模型语义冻结不动）；
+``WEILIAO_LLM_MINI_MODEL`` 缺省 gpt-4o-mini、strip 后为空 fail-fast
+带变量名；``WEILIAO_LLM_ROUTING_SIMPLE_INTENTS`` 缺省由
+DEFAULT_SIMPLE_INTENTS 派生、解析为空或含未知意图标签 fail-fast 带
+变量名；``WEILIAO_LLM_ROUTING_BUDGET_TOKENS`` 缺省 50000、非正整数
+fail-fast 带变量名；``WEILIAO_LLM_ROUTING_WINDOW_SECONDS`` 缺省 60、
+非正或非有限（nan/inf）fail-fast 带变量名；主/mini alias 相同时
+ERROR 告警留痕（不 fail-fast）。指标经模块级单例归集，``/health`` 附
+模型路由快照，lifespan 定时日志增发 ``model_routing_metrics``（收紧态
+追加 ERROR 级 ``model_routing_alert`` 告警）。
+
 Story 3.4 组合根（A 方案）：cache_lookup 的追问禁走与命中率计数经
 ``observability.metrics`` 模块级单例归集；``/health`` 就绪响应附
 metrics snapshot（压测 curl 即读）；lifespan 托管定时结构化 stderr
@@ -83,6 +97,14 @@ from weiliao_agent.filters.risk_review import (
 )
 from weiliao_agent.llm.circuit_breaker import LlmCircuitBreaker
 from weiliao_agent.llm.client import OpenAiGenerationClient
+from weiliao_agent.llm.model_router import (
+    DEFAULT_BUDGET_TOKENS,
+    DEFAULT_MINI_MODEL_ALIAS,
+    DEFAULT_SIMPLE_INTENTS,
+    DEFAULT_WINDOW_SECONDS,
+    KNOWN_INTENTS,
+    ModelRouter,
+)
 from weiliao_agent.llm.subgraph import LlmGenerationSubgraph
 from weiliao_agent.observability import metrics
 from weiliao_agent.pipeline import LLM_GENERATE_BUDGET_SECONDS, PipelineOrchestrator
@@ -213,15 +235,122 @@ _llm_breaker = LlmCircuitBreaker(
     metrics=metrics.get_llm_breaker_metrics(),
 )
 
+# 模型路由 mini alias（Story 4.6）：缺省 gpt-4o-mini；strip 一次后全程
+# 使用 strip 值（带空白 alias 会直达 API）；strip 后为空（空串/纯空白）
+# 为配置错误，fail-fast 拒绝启动（错误消息带变量名）。
+_MINI_MODEL_RAW = os.environ.get("WEILIAO_LLM_MINI_MODEL", DEFAULT_MINI_MODEL_ALIAS)
+_MINI_MODEL_ALIAS = _MINI_MODEL_RAW.strip()
+if not _MINI_MODEL_ALIAS:
+    msg = (
+        f"WEILIAO_LLM_MINI_MODEL must be a non-empty model alias, "
+        f"got {_MINI_MODEL_RAW!r}"
+    )
+    raise ValueError(msg)
+
+# 简单意图名单：逗号分隔（可含空白），空条目容忍跳过；缺省值由
+# model_router.DEFAULT_SIMPLE_INTENTS 派生（排序后逗号拼接），防两处
+# 静默漂移。解析为空（显式置空/全是空白与逗号条目）令 mini 常规路由
+# 静默失效，fail-fast 带变量名；含未知意图标签（不在 models/intent.py
+# IntentTag 枚举内）同口径 fail-fast。
+_SIMPLE_INTENTS_DEFAULT = ",".join(sorted(DEFAULT_SIMPLE_INTENTS))
+_SIMPLE_INTENTS_RAW = os.environ.get(
+    "WEILIAO_LLM_ROUTING_SIMPLE_INTENTS", _SIMPLE_INTENTS_DEFAULT
+)
+_SIMPLE_INTENT_LABELS = [
+    label.strip() for label in _SIMPLE_INTENTS_RAW.split(",") if label.strip()
+]
+if not _SIMPLE_INTENT_LABELS:
+    msg = (
+        f"WEILIAO_LLM_ROUTING_SIMPLE_INTENTS must contain at least one "
+        f"intent label, got {_SIMPLE_INTENTS_RAW!r}"
+    )
+    raise ValueError(msg)
+_UNKNOWN_INTENT_LABELS = sorted(set(_SIMPLE_INTENT_LABELS) - KNOWN_INTENTS)
+if _UNKNOWN_INTENT_LABELS:
+    msg = (
+        f"WEILIAO_LLM_ROUTING_SIMPLE_INTENTS contains unknown intent labels: "
+        f"{_UNKNOWN_INTENT_LABELS!r} (valid: {sorted(KNOWN_INTENTS)!r})"
+    )
+    raise ValueError(msg)
+
+# 滑窗 token 预算阈值：缺省 50000；非正整数（含 0/负数，nan/inf 无法
+# 解析为 int 同归解析失败）fail-fast 拒绝启动（错误消息带变量名）。
+_ROUTING_BUDGET_RAW = os.environ.get(
+    "WEILIAO_LLM_ROUTING_BUDGET_TOKENS", str(DEFAULT_BUDGET_TOKENS)
+)
+try:
+    _ROUTING_BUDGET_TOKENS = int(_ROUTING_BUDGET_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_LLM_ROUTING_BUDGET_TOKENS must be an integer, "
+        f"got {_ROUTING_BUDGET_RAW!r}"
+    )
+    raise ValueError(msg) from exc
+if _ROUTING_BUDGET_TOKENS <= 0:
+    msg = (
+        f"WEILIAO_LLM_ROUTING_BUDGET_TOKENS must be a positive integer, "
+        f"got {_ROUTING_BUDGET_TOKENS}"
+    )
+    raise ValueError(msg)
+
+# 滑窗时长秒数：缺省 60（spec 决策：每分钟滑动窗口）；非正与非有限
+# （nan/inf）fail-fast 拒绝启动（错误消息带变量名，同熔断器冷却口径）。
+_ROUTING_WINDOW_RAW = os.environ.get(
+    "WEILIAO_LLM_ROUTING_WINDOW_SECONDS", str(int(DEFAULT_WINDOW_SECONDS))
+)
+try:
+    _ROUTING_WINDOW_SECONDS = float(_ROUTING_WINDOW_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_LLM_ROUTING_WINDOW_SECONDS must be a number, "
+        f"got {_ROUTING_WINDOW_RAW!r}"
+    )
+    raise ValueError(msg) from exc
+if not math.isfinite(_ROUTING_WINDOW_SECONDS) or _ROUTING_WINDOW_SECONDS <= 0:
+    msg = (
+        f"WEILIAO_LLM_ROUTING_WINDOW_SECONDS must be a positive finite number, "
+        f"got {_ROUTING_WINDOW_SECONDS}"
+    )
+    raise ValueError(msg)
+
+# 组合根构造：主/mini 各持一个 client 实例（client 单模型语义冻结，
+# 惰性构造——装配期不触达 OpenAI 凭据）；指标单例注入（计数/收紧态
+# 归集与 /health、定时日志共用）；纯进程内状态。
+_llm_primary_client = OpenAiGenerationClient(budget_seconds=LLM_GENERATE_BUDGET_SECONDS)
+_llm_mini_client = OpenAiGenerationClient(
+    model=_MINI_MODEL_ALIAS,
+    budget_seconds=LLM_GENERATE_BUDGET_SECONDS,
+)
+_model_router = ModelRouter(
+    _llm_primary_client,
+    _llm_mini_client,
+    simple_intents=frozenset(_SIMPLE_INTENT_LABELS),
+    budget_tokens=_ROUTING_BUDGET_TOKENS,
+    window_seconds=_ROUTING_WINDOW_SECONDS,
+    metrics=metrics.get_model_routing_metrics(),
+)
+if _model_router.primary_alias == _model_router.mini_alias:
+    # 双 alias 相同：路由故事静默失效（无省钱、无模型信号、forced mini
+    # 退化为同模型）——不 fail-fast（默认装配 primary=WEILIAO_LLM_MODEL
+    # 缺省 gpt-4o 与 mini 缺省不同，碰撞属显式配置选择），ERROR 告警留痕。
+    logger.error(
+        "model routing degenerate: primary and mini model aliases are "
+        "identical (%r); routing saves nothing and forced-mini falls back "
+        "to the same model",
+        _model_router.primary_alias,
+    )
+
 
 async def _metrics_log_loop() -> None:
-    """定时发射缓存命中率与审核通过率结构化日志（first 发射在首个
-    间隔之后）；跌破审核阈值时同循环追加 ERROR 级告警日志。"""
+    """定时发射缓存/审核/熔断器/模型路由结构化日志（first 发射在首个
+    间隔之后）；跌破审核阈值、熔断器非 closed、路由收紧态时同循环追加
+    ERROR 级告警日志。"""
     while True:
         await asyncio.sleep(_METRICS_LOG_SECONDS)
         metrics.emit_cache_metrics_log()
         metrics.emit_risk_review_metrics_log()
         metrics.emit_llm_breaker_metrics_log()
+        metrics.emit_model_routing_metrics_log()
 
 
 @asynccontextmanager
@@ -273,7 +402,8 @@ app = create_app(
             CacheLookupFilter(l0_client=_l0_cache),
             LlmGenerateFilter(
                 subgraph=LlmGenerationSubgraph(
-                    OpenAiGenerationClient(budget_seconds=LLM_GENERATE_BUDGET_SECONDS)
+                    _llm_primary_client,
+                    router=_model_router,
                 ),
                 breaker=_llm_breaker,
             ),

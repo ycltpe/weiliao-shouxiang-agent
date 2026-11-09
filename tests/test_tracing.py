@@ -398,3 +398,52 @@ def test_redis_down_fallback_generates_trace_id_when_payload_omits_it() -> None:
     assert body["degraded"] is True
     assert body["trace_id"]  # 非空，兜底路径新生成
     assert _TRACE_ID_HEX.fullmatch(body["trace_id"]) is None  # 与编排器口径无关，仅非空即可
+
+
+# ---- Story 4.6：record_model_routing_event 本体直测（事件名/级别/fail-safe）----
+
+
+def test_record_model_routing_event_forced_mini_is_error_level(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    tracing.record_model_routing_event(
+        "ab" * 16, outcome="forced_mini", intent="PRICE_INQUIRY"
+    )
+
+    (event,) = fake_langfuse.events
+    assert event["name"] == "llm.model_routing_event"
+    assert event["level"] == "ERROR"  # 成本异常信号：级别写反会静默丢失
+    assert event["metadata"]["event"] == "model_routing_event"
+    assert event["metadata"]["outcome"] == "forced_mini"
+    assert event["metadata"]["intent"] == "PRICE_INQUIRY"
+
+
+@pytest.mark.parametrize("outcome", ["primary", "mini", "recovered"])
+def test_record_model_routing_event_routine_outcomes_are_default_level(
+    fake_langfuse: _FakeLangfuse, outcome: str
+) -> None:
+    tracing.record_model_routing_event("ab" * 16, outcome=outcome, intent="GREETING")
+
+    (event,) = fake_langfuse.events
+    assert event["name"] == "llm.model_routing_event"
+    assert event["level"] == "DEFAULT"
+    assert event["metadata"]["outcome"] == outcome
+
+
+def test_record_model_routing_event_skips_missing_trace_id(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    tracing.record_model_routing_event(None, outcome="forced_mini", intent="GREETING")
+
+    assert fake_langfuse.events == []
+
+
+def test_record_model_routing_event_is_fail_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # client.create_event 抛异常也吞掉，绝不向上抛（不影响应答链路）。
+    class _RaisingClient:
+        def create_event(self, **kwargs: Any) -> None:
+            msg = "sdk create_event boom"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(tracing, "_client", _RaisingClient())
+    tracing.record_model_routing_event("ab" * 16, outcome="forced_mini")  # 不抛即通过

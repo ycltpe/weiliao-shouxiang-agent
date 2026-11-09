@@ -24,6 +24,7 @@ from weiliao_agent.health import (
     cache_metrics_payload,
     is_ready,
     llm_breaker_payload,
+    model_routing_payload,
     risk_review_metrics_payload,
 )
 from weiliao_agent.models.envelope import Envelope
@@ -67,8 +68,8 @@ def create_app(
             # 不同，500 属 paging 级事件）：按未就绪收敛，摘除实例待介入。
             ready = False
         if ready:
-            # Story 3.4/4.4/4.5：就绪响应附缓存命中率、审核通过率与
-            # 熔断器快照，压测 curl /health 即读；各快照各包各的
+            # Story 3.4/4.4/4.5/4.6：就绪响应附缓存命中率、审核通过率、
+            # 熔断器与模型路由快照，压测 curl /health 即读；各快照各包各的
             # fail-safe——任一取数失败只丢自己那份，不连坐其他数据源。
             payload: dict[str, Any] = {}
             try:
@@ -91,6 +92,13 @@ def create_app(
             except Exception:
                 logger.warning(
                     "llm breaker snapshot unavailable; omitting from /health",
+                    exc_info=True,
+                )
+            try:
+                payload.update(model_routing_payload())
+            except Exception:
+                logger.warning(
+                    "model routing snapshot unavailable; omitting from /health",
                     exc_info=True,
                 )
             return JSONResponse(status_code=200, content={"status": "ready", **payload})

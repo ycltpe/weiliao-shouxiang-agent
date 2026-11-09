@@ -15,10 +15,12 @@ import weiliao_agent.llm as llm_module
 from weiliao_agent.llm import (
     LlmGenerationError,
     LlmGenerationSubgraph,
+    ModelRouter,
     OpenAiGenerationClient,
 )
 from weiliao_agent.models.fact_card import FactCard
 from weiliao_agent.observability import tracing
+from weiliao_agent.observability.metrics import ModelRoutingMetricsCollector
 
 TRACE_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 USAGE = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
@@ -208,3 +210,211 @@ def test_module_level_generate_lazily_builds_and_reuses_default_subgraph(
             "trace_id": None,
         },
     ]
+
+
+# ---- Story 4.6：可选 router 注入的生成节点调度（I/O 矩阵全分支）----
+
+
+class _FakeClock:
+    """可控单调时钟：注入 router 控制滑窗边界。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _StubChatWithUsage:
+    """返回固定文本与 usage 的 chat 替身（主/mini 各一）。"""
+
+    def __init__(self, text: str, usage: dict[str, int]) -> None:
+        self.calls = 0
+        self._text = text
+        self._usage = usage
+
+    def invoke(self, messages: Any) -> Any:
+        self.calls += 1
+        text, usage = self._text, self._usage
+
+        class _Response:
+            content = text
+            usage_metadata = usage
+
+        return _Response()
+
+
+class _RoutingFixture:
+    """主/mini 双 client + router + 子图装配（fake clock，零网络）。"""
+
+    def __init__(self, *, budget_tokens: int = 50) -> None:
+        self.clock = _FakeClock()
+        self.primary_chat = _StubChatWithUsage("主模型应答", {"total_tokens": 60})
+        self.mini_chat = _StubChatWithUsage("mini 应答", {"total_tokens": 10})
+        self.primary = OpenAiGenerationClient(
+            model="gpt-4o", chat_model=self.primary_chat
+        )
+        self.mini = OpenAiGenerationClient(model="gpt-4o-mini", chat_model=self.mini_chat)
+        self.router = ModelRouter(
+            self.primary,
+            self.mini,
+            simple_intents=frozenset({"GREETING", "LOCATION"}),
+            budget_tokens=budget_tokens,
+            window_seconds=60.0,
+            clock=self.clock,
+        )
+        self.subgraph = LlmGenerationSubgraph(self.primary, router=self.router)
+
+
+def test_router_simple_intent_generates_with_mini_and_records_real_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC 第 1 条：名单内简单意图用 mini alias 生成，generation 观测记
+    # 真实模型名与 token 用量（既有 cost={} 口径不动）。
+    fixture = _RoutingFixture()
+    recorded: list[dict[str, Any]] = []
+
+    def spy(
+        trace_id: str | None,
+        *,
+        model: str,
+        usage: Any,
+        cost: Any,
+        name: str = "model.generation",
+    ) -> None:
+        recorded.append({"model": model, "usage": dict(usage), "cost": dict(cost)})
+
+    monkeypatch.setattr(tracing, "record_generation", spy)
+
+    text = fixture.subgraph.generate("你好", intent="GREETING", trace_id=TRACE_ID)
+
+    assert text == "mini 应答"
+    assert fixture.mini_chat.calls == 1
+    assert fixture.primary_chat.calls == 0
+    assert recorded == [{"model": "gpt-4o-mini", "usage": {"total_tokens": 10}, "cost": {}}]
+
+
+def test_router_complex_intent_generates_with_primary() -> None:
+    fixture = _RoutingFixture()
+
+    text = fixture.subgraph.generate("这套房子什么价位？", intent="PRICE_INQUIRY")
+
+    assert text == "主模型应答"
+    assert fixture.primary_chat.calls == 1
+    assert fixture.mini_chat.calls == 0
+
+
+def test_router_budget_exceeded_forces_mini_and_traces_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC 第 2 条：滑窗累计 ≥ 阈值后，后续请求（无论意图）强制 mini，
+    # trace 留 forced_mini 事件。
+    fixture = _RoutingFixture(budget_tokens=50)
+    events: list[dict[str, Any]] = []
+
+    def spy(trace_id: str | None, *, outcome: Any, intent: Any) -> None:
+        events.append({"outcome": outcome, "intent": intent})
+
+    monkeypatch.setattr(tracing, "record_model_routing_event", spy)
+
+    first = fixture.subgraph.generate("这套房子什么价位？", intent="PRICE_INQUIRY")
+    second = fixture.subgraph.generate("还在租吗？", intent="AVAILABILITY")
+
+    assert first == "主模型应答"
+    assert second == "mini 应答"  # 收紧期名单外意图同样强制 mini
+    assert fixture.primary_chat.calls == 1
+    assert fixture.mini_chat.calls == 1
+    assert events == [
+        {"outcome": "primary", "intent": "PRICE_INQUIRY"},
+        {"outcome": "forced_mini", "intent": "AVAILABILITY"},
+    ]
+
+
+def test_router_recovers_after_window_slide_and_traces_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC 第 3 条：滑窗消耗回落到阈值以下自动恢复常规路由，trace 留
+    # recovered 事件。
+    fixture = _RoutingFixture(budget_tokens=50)
+    events: list[dict[str, Any]] = []
+
+    def spy(trace_id: str | None, *, outcome: Any, intent: Any) -> None:
+        events.append({"outcome": outcome, "intent": intent})
+
+    monkeypatch.setattr(tracing, "record_model_routing_event", spy)
+
+    fixture.subgraph.generate("这套房子什么价位？", intent="PRICE_INQUIRY")  # 60 tokens
+    fixture.subgraph.generate("还在租吗？", intent="AVAILABILITY")  # 收紧期 forced mini
+    fixture.clock.advance(61.0)  # 旧条目滑出窗口
+    text = fixture.subgraph.generate("你好", intent="GREETING")
+
+    assert text == "mini 应答"  # 恢复后名单意图恢复 mini 常规路由
+    assert events == [
+        {"outcome": "primary", "intent": "PRICE_INQUIRY"},
+        {"outcome": "forced_mini", "intent": "AVAILABILITY"},
+        {"outcome": "mini", "intent": "GREETING"},
+        {"outcome": "recovered", "intent": "GREETING"},
+    ]
+
+
+def test_router_select_failure_falls_back_to_primary_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 护栏判定自身异常：吞掉并按常规路由（主模型）放行，绝不阻断生成。
+    fixture = _RoutingFixture()
+
+    class _BoomRouter:
+        def select(self, intent: Any) -> Any:
+            msg = "guardrail boom"
+            raise RuntimeError(msg)
+
+        def account(self, decision: Any, usage: Any) -> None:
+            msg = "guardrail boom"
+            raise RuntimeError(msg)
+
+    subgraph = LlmGenerationSubgraph(fixture.primary, router=_BoomRouter())  # type: ignore[arg-type]
+    text = subgraph.generate("你好", intent="GREETING")
+
+    assert text == "主模型应答"
+    assert fixture.primary_chat.calls == 1
+    assert fixture.mini_chat.calls == 0
+
+
+def test_router_generation_failure_does_not_consume_budget() -> None:
+    # 生成失败不消耗预算：account 只在 generate 成功后触发——若被回归
+    # 挪到 generate 之前，失败请求会静默双计且全库仍绿（防线测试）。
+    class _FailingChat:
+        def invoke(self, messages: Any) -> Any:
+            msg = "model boom"
+            raise RuntimeError(msg)
+
+    clock = _FakeClock()
+    collector = ModelRoutingMetricsCollector()
+    primary = OpenAiGenerationClient(model="gpt-4o", chat_model=_FailingChat())
+    mini = OpenAiGenerationClient(
+        model="gpt-4o-mini",
+        chat_model=_StubChatWithUsage("mini 应答", {"total_tokens": 10}),
+    )
+    router = ModelRouter(
+        primary,
+        mini,
+        simple_intents=frozenset({"GREETING"}),
+        budget_tokens=50,
+        window_seconds=60.0,
+        metrics=collector,
+        clock=clock,
+    )
+    subgraph = LlmGenerationSubgraph(primary, router=router)
+
+    with pytest.raises(LlmGenerationError):
+        subgraph.generate("这套房子什么价位？", intent="PRICE_INQUIRY")  # 主模型路径失败
+
+    assert router.snapshot() == {"tightened": False, "window_tokens": 0}
+    snapshot = collector.snapshot()
+    assert snapshot["primary_calls"] == 0
+    assert snapshot["mini_calls"] == 0
+    assert snapshot["primary_tokens"] == 0
+    assert snapshot["mini_tokens"] == 0

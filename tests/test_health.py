@@ -1,5 +1,6 @@
 """健康检查端点单测（Story 1.4；Story 3.4/4.4 追加 metrics snapshot 读数；
-Story 4.5 追加熔断器快照与快照非零回读）。
+Story 4.5 追加熔断器快照与快照非零回读；Story 4.6 追加模型路由快照与
+快照非零回读）。
 
 覆盖 spec I/O 口径两场景：管道编排完成（含 response_assembler）→ 200；
 链不完整 → 503（非 200 即满足 AC，负载均衡据此刻摘除实例）。
@@ -30,6 +31,7 @@ def test_health_ready_returns_200() -> None:
     metrics_module.reset_cache_metrics()
     metrics_module.reset_risk_review_metrics()
     metrics_module.reset_llm_breaker_metrics()
+    metrics_module.reset_model_routing_metrics()
     client = TestClient(create_app())  # 默认五过滤器链完整
     response = client.get("/health")
     assert response.status_code == 200
@@ -51,6 +53,41 @@ def test_health_ready_returns_200() -> None:
     assert llm_breaker["skipped"] == 0
     assert llm_breaker["trips"] == 0
     assert llm_breaker["recoveries"] == 0
+    # Story 4.6：就绪响应附模型路由快照（各模型调用数/token/收紧状态）。
+    model_routing = body["model_routing"]
+    assert model_routing["primary_calls"] == 0
+    assert model_routing["primary_tokens"] == 0
+    assert model_routing["mini_calls"] == 0
+    assert model_routing["mini_tokens"] == 0
+    assert model_routing["tightened"] is False
+    assert model_routing["over_limits"] == 0
+    assert model_routing["recoveries"] == 0
+
+
+def test_health_model_routing_snapshot_nonzero_readback() -> None:
+    # Story 4.6 AC 第 5 条：路由活动后 /health 快照非零可读（非仅零值占位）。
+    collector = metrics_module.reset_model_routing_metrics()
+    try:
+        collector.record_call("primary", 60)
+        collector.record_call("forced_mini", 10)
+        collector.set_tightened(True)
+        collector.record_over_limit()
+        client = TestClient(create_app())
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        model_routing = response.json()["model_routing"]
+        assert model_routing["primary_calls"] == 1
+        assert model_routing["primary_tokens"] == 60
+        assert model_routing["mini_calls"] == 1
+        assert model_routing["mini_tokens"] == 10
+        assert model_routing["tightened"] is True
+        assert model_routing["over_limits"] == 1
+        assert model_routing["recoveries"] == 0
+    finally:
+        # 共享单例：中途断言失败也不得把收紧态/计数泄漏给后续用例。
+        metrics_module.reset_model_routing_metrics()
 
 
 def test_health_llm_breaker_snapshot_nonzero_readback() -> None:

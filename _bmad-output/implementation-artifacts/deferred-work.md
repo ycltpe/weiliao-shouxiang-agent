@@ -68,3 +68,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-4-3-fact-card-grounding-controlled-generation.md`
   summary: grounding 违禁清单的裸「最」「第一」子串匹配会误伤良性表述（如「最近」「最后」「最好」），可能丢弃合规草稿
   evidence: 该清单沿用 Story AC 既定违禁词与 4.1 `_FORBIDDEN_MATERIAL_FRAGMENTS`，fail-closed 方向安全（影子模式下代价仅为 token 浪费）；改用分词/豁免表等更精确匹配属业务违禁词口径定夺。settle：随 4.4 的审核通过率与 grounding_failed 监控数据观察误报率后定，若误报高再细化匹配语义。
+- source_spec: `/Users/yechen/PycharmProjects/test/_bmad-output/implementation-artifacts/spec-4-6-model-routing-cost-guardrail.md`
+  summary: `.env.example` 把新变量以空值交付，整体拷贝为 .env 即启动失败。
+  evidence: 4.5 的 WEILIAO_LLM_BREAKER_* 变量同样留空（.env.example:27/33），空白交付是仓库既有惯例，非本 Story 引入；如要修应连 4.5 一起统一处理（blank=用缺省值或示例填具体值）。
+- source_spec: `/Users/yechen/PycharmProjects/test/_bmad-output/implementation-artifacts/spec-4-6-model-routing-cost-guardrail.md`
+  summary: 新 env 变量、/health 的 model_routing 快照与 ERROR 级 model_routing_alert 告警无 runbook/README 文档，运维只能读源码。
+  evidence: 4.4/4.5 新增 env 与告警同样只写 .env.example（README 无任何 BREAKER 条目），文档缺口是逐 Story 累积的既有惯例，宜单独立项统一补运维文档。
