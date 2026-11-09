@@ -17,6 +17,7 @@ import pytest
 
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
 from weiliao_agent.handoff.trigger import (
     CONDITION_ASSESSMENT_ERROR,
     CONDITION_FOLLOWUP_THRESHOLD,
@@ -469,7 +470,9 @@ def test_pipeline_handoff_short_circuits_and_replies_fixed_text(
     result = orchestrator.run(_envelope())
 
     assert log == []  # 下游零执行：cache/llm/risk/assembler 全跳过
-    assert result.reply == HANDOFF_REPLY_TEXT == "已为您转接经纪人，请稍候"
+    # Story 5.4 决策 Q1-B：转人工文案携标，常量本身保持纯文案不变。
+    assert HANDOFF_REPLY_TEXT == "已为您转接经纪人，请稍候"
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert result.degraded is False  # 设计内分支，非降级
     assert result.failed_filter is None
 
@@ -498,7 +501,7 @@ def test_pipeline_pre_assessed_envelope_short_circuits_first_filter() -> None:
     )
     envelope = _envelope(handoff={"triggered": True, "conditions": ["x"]})
     result = orchestrator.run(envelope)
-    assert result.reply == HANDOFF_REPLY_TEXT
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert log == ["cache_lookup"]  # 首跳透传执行后立即短路，无后续跳
 
 

@@ -52,6 +52,8 @@ from typing import Any, Literal
 from langfuse import Langfuse, get_client, propagate_attributes
 from langfuse.types import TraceContext
 
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
+
 # SDK 自定义 trace id 的合法口径（Langfuse._is_valid_trace_id 同规则）：
 # 非 32 位小写十六进制的 id 会让 SDK 告警并抛 ValueError，故本层提前
 # 收敛为跳过记录，避免异常驱动的控制流与日志噪音。
@@ -563,6 +565,35 @@ def record_already_handed_off(
                 "event": "handoff_already_handed_off",
                 "session_id": session_id,
                 "turn": turn,
+            },
+        )
+
+
+def record_ai_disclosure(trace_id: str | None, *, disclosed: bool) -> None:
+    """AI 身份披露事件（Story 5.4，AD-10）：买家可见应答是否携标留痕。
+
+    事件名 ``ai.disclosure``，metadata 携带 ``disclosed``（本应答是否
+    携带 AI 标识——全部合规出口均为 True）与 ``label``（披露前缀常量
+    唯一来源，审计侧可直接比对 delivered_text）。编排器三出口
+    （正常/降级/硬触发）与 http 链外出口（终态闸门/兜底）各记一次，
+    与 ``delivered_text`` 双重可验。fail-safe 口径同
+    ``record_already_handed_off``：记录本身再抛异常也吞掉，绝不二次
+    影响买家应答；未配置 Langfuse 或 trace_id 不可挂时 no-op。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="ai.disclosure",
+            metadata={
+                "event": "ai_disclosure",
+                "disclosed": disclosed,
+                "label": AI_DISCLOSURE_PREFIX,
             },
         )
 

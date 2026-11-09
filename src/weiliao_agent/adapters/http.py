@@ -37,7 +37,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from weiliao_agent.filters.templates import render_fallback
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.health import (
     cache_metrics_payload,
     is_ready,
@@ -62,10 +62,17 @@ def _fallback_result(
     intent: IntentTag | None = None,
     trace_id: str | None = None,
 ) -> PipelineResult:
-    """构造 fail-closed 兜底应答：兜底文案 + 新生成 trace_id。"""
+    """构造 fail-closed 兜底应答：兜底文案 + 新生成 trace_id。
+
+    Story 5.4：兜底文案经 render_fallback 自带 AI 披露前缀，出口处记
+    ``ai.disclosure``（disclosed=True）事件——记录 fail-safe，不改变
+    应答语义；trace_id 不可挂 Langfuse（非 32-hex）时事件静默跳过。
+    """
+    resolved_trace_id = trace_id if trace_id is not None else str(uuid.uuid4())
+    tracing.record_ai_disclosure(resolved_trace_id, disclosed=True)
     return PipelineResult(
         reply=render_fallback(intent),
-        trace_id=trace_id if trace_id is not None else str(uuid.uuid4()),
+        trace_id=resolved_trace_id,
         degraded=True,
         failed_filter=None,
     )
@@ -182,12 +189,13 @@ def create_app(
             if snapshot.handoff_status == "triggered":
                 # Story 5.3 终态闸门：已转接会话的消息不进入编排器——
                 # 过滤器全零执行、无二次转交指令（收口 5.2 评审 #18），
-                # 回固定安抚文案（Q1-A，与触发轮出口逐字节一致）；
-                # degraded=False（设计内终态分支）。trace_id 缺失即
-                # 生成回填（与编排器入口同一权威口径）。闸门轮不落
-                # 转写：转写是 buyer/agent 逐对原文，无 agent 回复的
-                # 轮次混入会污染工作台上下文。事件记录与日志均
-                # fail-safe，绝不改变应答。
+                # 回固定安抚文案（Q1-A，携标口径与触发轮出口逐字节
+                # 一致——Story 5.4 决策 Q1-B 前缀由出口处注入，常量
+                # 保持纯文案）；degraded=False（设计内终态分支）。
+                # trace_id 缺失即生成回填（与编排器入口同一权威口径）。
+                # 闸门轮不落转写：转写是 buyer/agent 逐对原文，无
+                # agent 回复的轮次混入会污染工作台上下文。事件记录
+                # 与日志均 fail-safe，绝不改变应答。
                 if envelope.trace_id is None:
                     envelope.trace_id = tracing.new_trace_id()
                 tracing.record_already_handed_off(
@@ -195,6 +203,7 @@ def create_app(
                     session_id=envelope.session_id,
                     turn=envelope.turn,
                 )
+                tracing.record_ai_disclosure(envelope.trace_id, disclosed=True)
                 logger.warning(
                     "session already handed off; gate short-circuits pipeline "
                     "session_id=%s trace_id=%s turn=%s",
@@ -203,7 +212,7 @@ def create_app(
                     envelope.turn,
                 )
                 return PipelineResult(
-                    reply=HANDOFF_REPLY_TEXT,
+                    reply=f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}",
                     trace_id=envelope.trace_id,
                     degraded=False,
                     failed_filter=None,
@@ -211,7 +220,8 @@ def create_app(
             elif snapshot.handoff_status != "none":
                 # 未知 handoff_status（Redis 损坏值/未来新增状态未识别）：
                 # fail-closed 与 begin_turn 失败同一兜底口径——模板兜底、
-                # 原 trace_id、degraded=True、不落转写、不进编排器。
+                # 原 trace_id、degraded=True、不落转写、不进编排器
+                # （_fallback_result 自带前缀与 ai.disclosure 事件）。
                 logger.warning(
                     "unknown handoff_status=%r; fail-closed fallback "
                     "session_id=%s trace_id=%s turn=%s",

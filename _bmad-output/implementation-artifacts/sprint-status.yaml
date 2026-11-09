@@ -78,5 +78,5 @@ development_status:
   5-1-硬触发条件判定: review
   5-2-Kafka-转人工单向指令: review
   5-3-转人工原子终态与买家安抚通知: review
-  5-4-AI-身份披露标识: backlog
+  5-4-AI-身份披露标识: review
   epic-5-retrospective: optional

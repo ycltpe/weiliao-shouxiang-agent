@@ -84,6 +84,11 @@ class Envelope(BaseModel):
     # llm_generate 写入（model_copy 追加可选字段，既有 model_validate
     # 兼容）；任何故障路径保持 None，买家可见语义不变。
     generated_reply: str | None = None
+    # Story 5.4：响应组装产出挂点（AD-10）——response_assembler 是
+    # AI 身份披露前缀的唯一注入载体，本字段为其权威产出（草稿加
+    # 前缀 / 无草稿走模板兜底）；编排器最终返回点只读消费，防御性
+    # 回退 render_fallback，绝不改写已过审草稿之外的文本。
+    assembled_reply: str | None = None
     # Story 5.1：硬触发判定结果挂点（AD-12）——intent_router 内单一
     # 评估模块写入；未评估为 None、评估未触发为 triggered=False（区分
     # 「没评估」与「评估了没命中」），下游短路只认 triggered is True。

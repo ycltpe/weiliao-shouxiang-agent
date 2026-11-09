@@ -19,9 +19,9 @@ from fastapi.testclient import TestClient
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
-from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.models.envelope import Envelope, HandoffAssessment
 from weiliao_agent.observability import tracing
-from weiliao_agent.pipeline import PipelineOrchestrator
+from weiliao_agent.pipeline import HANDOFF_REPLY_TEXT, PipelineOrchestrator
 from weiliao_agent.session import SessionSnapshot
 
 _TRACE_ID_HEX = re.compile(r"^[0-9a-f]{32}$")
@@ -447,3 +447,96 @@ def test_record_model_routing_event_is_fail_safe(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(tracing, "_client", _RaisingClient())
     tracing.record_model_routing_event("ab" * 16, outcome="forced_mini")  # 不抛即通过
+
+
+# ---- ai.disclosure 事件（Story 5.4，AD-10 可审计锚点） ----
+
+
+def test_record_ai_disclosure_writes_event_with_label(fake_langfuse: _FakeLangfuse) -> None:
+    tracing.record_ai_disclosure("ab" * 16, disclosed=True)
+
+    (event,) = fake_langfuse.events
+    assert event["name"] == "ai.disclosure"
+    assert event["metadata"]["event"] == "ai_disclosure"
+    assert event["metadata"]["disclosed"] is True
+    # label 为前缀常量唯一来源，审计侧可直接比对 delivered_text。
+    assert event["metadata"]["label"] == AI_DISCLOSURE_PREFIX
+
+
+def test_record_ai_disclosure_skips_non_recordable_trace_id(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    tracing.record_ai_disclosure(None, disclosed=True)
+    tracing.record_ai_disclosure("trace-001", disclosed=True)  # 非 32-hex
+
+    assert fake_langfuse.events == []
+
+
+def test_record_ai_disclosure_is_fail_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 事件记录抛异常也吞掉，绝不二次影响买家应答。
+    class _RaisingClient:
+        def create_event(self, **kwargs: Any) -> None:
+            msg = "sdk create_event boom"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(tracing, "_client", _RaisingClient())
+    tracing.record_ai_disclosure("ab" * 16, disclosed=True)  # 不抛即通过
+
+
+def test_normal_exit_records_ai_disclosure(fake_langfuse: _FakeLangfuse) -> None:
+    # 正常链出口：disclosed=True 事件与 delivered_text 双重可验。
+    orchestrator = PipelineOrchestrator(filters=_four_pass_through_filters())
+    envelope = Envelope.model_validate(_payload())
+
+    result = orchestrator.run(envelope)
+
+    (disclosure,) = [e for e in fake_langfuse.events if e["name"] == "ai.disclosure"]
+    assert disclosure["metadata"]["disclosed"] is True
+    (delivery,) = [e for e in fake_langfuse.events if e["name"] == "pipeline.delivery"]
+    assert delivery["metadata"]["delivered_text"] == result.reply
+    assert result.reply.startswith(disclosure["metadata"]["label"])
+
+
+def test_degraded_exit_records_ai_disclosure(fake_langfuse: _FakeLangfuse) -> None:
+    # 降级出口：兜底文案携标，披露事件照常记录。
+    orchestrator = PipelineOrchestrator(
+        filters=[
+            _PassThroughFilter("intent_router"),
+            _RaisingFilter(),
+            _PassThroughFilter("response_assembler"),
+        ]
+    )
+    envelope = Envelope.model_validate(_payload())
+
+    result = orchestrator.run(envelope)
+
+    assert result.degraded is True
+    (disclosure,) = [e for e in fake_langfuse.events if e["name"] == "ai.disclosure"]
+    assert disclosure["metadata"]["disclosed"] is True
+    assert result.reply == render_fallback("PRICE_INQUIRY")
+
+
+class _HandoffTriggeringFilter(Filter):
+    """硬触发替身：首跳挂 triggered 判定结果。"""
+
+    def __init__(self) -> None:
+        self.name = "intent_router"
+
+    def process(self, envelope: Envelope) -> Envelope:
+        return envelope.model_copy(
+            update={"handoff": HandoffAssessment(triggered=True, conditions=["redline"])}
+        )
+
+
+def test_handoff_exit_records_ai_disclosure_with_prefixed_reply(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # 硬触发出口（Q1 决策 B）：转人工文案携标 + disclosed=True 事件。
+    orchestrator = PipelineOrchestrator(filters=[_HandoffTriggeringFilter()])
+    envelope = Envelope.model_validate(_payload())
+
+    result = orchestrator.run(envelope)
+
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
+    (disclosure,) = [e for e in fake_langfuse.events if e["name"] == "ai.disclosure"]
+    assert disclosure["metadata"]["disclosed"] is True

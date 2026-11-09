@@ -19,6 +19,7 @@ import pytest
 import redis
 
 from weiliao_agent.filters.base import Filter
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
 from weiliao_agent.handoff import command as command_module
 from weiliao_agent.handoff.command import (
     PAYLOAD_FIELD_CHAR_CAP,
@@ -546,7 +547,9 @@ def test_orchestrator_sends_command_before_reply(fake_langfuse: Any) -> None:
     assert envelope.session_id == "sess-001"
     assert reply == HANDOFF_REPLY_TEXT
     # 出口文案语义不变：固定文案、非降级、绝不兜底。
-    assert result.reply == HANDOFF_REPLY_TEXT == "已为您转接经纪人，请稍候"
+    # 出口文案语义不变（5.4 决策 Q1-B 携标）：固定文案 + 前缀，非降级。
+    assert HANDOFF_REPLY_TEXT == "已为您转接经纪人，请稍候"
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert result.degraded is False
     assert result.failed_filter is None
 
@@ -562,7 +565,7 @@ def test_orchestrator_sender_failure_never_changes_reply(
     with caplog.at_level(logging.WARNING):
         result = orchestrator.run(_envelope())
 
-    assert result.reply == HANDOFF_REPLY_TEXT
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert result.degraded is False  # 发送失败不改变买家应答，非降级
     assert result.failed_filter is None
 
@@ -572,7 +575,7 @@ def test_orchestrator_without_sender_skips_send(fake_langfuse: Any) -> None:
 
     result = orchestrator.run(_envelope())
 
-    assert result.reply == HANDOFF_REPLY_TEXT
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert result.degraded is False
 
 

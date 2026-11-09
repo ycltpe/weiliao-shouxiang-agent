@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
-from weiliao_agent.filters.templates import render_fallback
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.handoff.command import HandoffCommandSender
 from weiliao_agent.models.envelope import Envelope, HandoffAssessment
 from weiliao_agent.pipeline import HANDOFF_REPLY_TEXT, PipelineOrchestrator, PipelineResult
@@ -114,16 +114,21 @@ def test_gate_short_circuits_pipeline_after_handoff(
 
     body = response.json()
     assert response.status_code == 200
-    assert body["reply"] == HANDOFF_REPLY_TEXT  # Q1-A：与触发轮出口同一文案
+    # Q1-A 文案 + 5.4 决策 Q1-B 前缀：与触发轮出口逐字节一致。
+    assert body["reply"] == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert body["degraded"] is False  # 设计内终态分支，非故障降级
     assert body["failed_filter"] is None
     assert body["trace_id"] == trace_id  # 携带值透传
     assert orchestrator.run_calls == 0  # 编排器零调用：闸门在管道之前
     assert manager.read_transcript(SESSION_ID, 10) == []  # 闸门轮不落转写
-    (event,) = fake_langfuse.events
+    (event,) = [e for e in fake_langfuse.events if e["name"] == "handoff.already_handed_off"]
     assert event["name"] == "handoff.already_handed_off"
     assert event["level"] == "WARNING"
     assert event["metadata"]["session_id"] == SESSION_ID
+    # Story 5.4：闸门出口同样留痕 ai.disclosure（disclosed=True）。
+    (disclosure,) = [e for e in fake_langfuse.events if e["name"] == "ai.disclosure"]
+    assert disclosure["metadata"]["disclosed"] is True
+    assert disclosure["metadata"]["label"] == AI_DISCLOSURE_PREFIX
     assert any(
         "session already handed off" in record.message
         for record in caplog.records
@@ -141,12 +146,13 @@ def test_gate_backfills_trace_id_when_missing(
     response = TestClient(app).post("/v1/messages", json=_payload())
 
     assert response.status_code == 200
-    assert response.json()["reply"] == HANDOFF_REPLY_TEXT  # 闸门文案口径
+    # 闸门文案口径（Q1-B 携标）。
+    assert response.json()["reply"] == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert response.json()["degraded"] is False
     trace_id = response.json()["trace_id"]
     assert trace_id is not None and len(trace_id) == 32  # 权威回填口径
     assert orchestrator.run_calls == 0  # 回填路径同样不进编排器
-    (event,) = fake_langfuse.events
+    (event,) = [e for e in fake_langfuse.events if e["name"] == "handoff.already_handed_off"]
     assert event["trace_context"]["trace_id"] == trace_id
 
 
@@ -161,7 +167,7 @@ def test_gate_event_record_failure_keeps_reply(
     response = TestClient(app).post("/v1/messages", json=_payload())
 
     assert response.status_code == 200
-    assert response.json()["reply"] == HANDOFF_REPLY_TEXT
+    assert response.json()["reply"] == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert response.json()["degraded"] is False
 
 
@@ -173,7 +179,7 @@ def test_gate_never_returns_template_fallback(manager: SessionManager) -> None:
     response = TestClient(app).post("/v1/messages", json=_payload())
 
     assert response.json()["reply"] != render_fallback(None)
-    assert response.json()["reply"] == HANDOFF_REPLY_TEXT
+    assert response.json()["reply"] == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
 
 
 def test_trigger_turn_then_gate_no_second_command(
@@ -217,7 +223,7 @@ def test_trigger_turn_then_gate_no_second_command(
     first = client.post(
         "/v1/messages", json=_payload(timestamp=TS_1, trace_id="d" * 32)
     )
-    assert first.json()["reply"] == HANDOFF_REPLY_TEXT
+    assert first.json()["reply"] == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert first.json()["degraded"] is False
     assert len(transport.sent) == 1  # 严格先指令后通知：触发轮恰一条指令
     assert orchestrator.run_calls == 1
@@ -229,7 +235,7 @@ def test_trigger_turn_then_gate_no_second_command(
     second = client.post(
         "/v1/messages", json=_payload(timestamp=TS_2, trace_id="e" * 32)
     )
-    assert second.json()["reply"] == HANDOFF_REPLY_TEXT
+    assert second.json()["reply"] == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert second.json()["degraded"] is False
     assert orchestrator.run_calls == 1  # 零二次执行
     assert len(transport.sent) == 1  # 零二次指令
@@ -238,9 +244,11 @@ def test_trigger_turn_then_gate_no_second_command(
 
 def test_begin_turn_redis_failure_keeps_existing_fallback(
     manager: SessionManager,
+    fake_langfuse: Any,
 ) -> None:
     """I/O 矩阵：Redis 故障 fail-closed 语义不变——模板兜底（非
-    HANDOFF_REPLY_TEXT）、degraded=True、原 trace_id、HTTP 非 5xx。"""
+    HANDOFF_REPLY_TEXT）、degraded=True、原 trace_id、HTTP 非 5xx；
+    Story 5.4：fail-closed 出口同样留痕 ai.disclosure（disclosed=True）。"""
     orchestrator = _CountingOrchestrator(filters=[_CountingFilter()])
     app = create_app(orchestrator, manager)
     with mock.patch.object(
@@ -256,9 +264,13 @@ def test_begin_turn_redis_failure_keeps_existing_fallback(
     assert body["trace_id"] == "f" * 32
     assert body["reply"] == render_fallback(None)  # 既有兜底口径，非闸门文案
     assert orchestrator.run_calls == 0  # 兜底路径不进编排器
+    (disclosure,) = [e for e in fake_langfuse.events if e["name"] == "ai.disclosure"]
+    assert disclosure["metadata"]["disclosed"] is True
+    assert disclosure["metadata"]["label"] == AI_DISCLOSURE_PREFIX
+    assert disclosure["trace_context"]["trace_id"] == "f" * 32
 
 
-def test_unknown_handoff_status_fails_closed() -> None:
+def test_unknown_handoff_status_fails_closed(fake_langfuse: Any) -> None:
     """未知 handoff_status（Redis 损坏值，非 none/triggered）fail-closed：
     与 begin_turn 失败同一兜底口径——模板兜底、degraded=True、原
     trace_id、不落转写、编排器零调用（拿不准绝不人机混答）。"""
@@ -279,6 +291,12 @@ def test_unknown_handoff_status_fails_closed() -> None:
     assert body["reply"] == render_fallback(None)  # 既有兜底，非闸门文案
     assert orchestrator.run_calls == 0  # 不进编排器
     assert manager.read_transcript(SESSION_ID, 10) == []  # 不落转写
+    # Story 5.4：_fallback_result 出口记 ai.disclosure（disclosed=True），
+    # label 为前缀常量唯一来源，挂原 trace_id。
+    (disclosure,) = [e for e in fake_langfuse.events if e["name"] == "ai.disclosure"]
+    assert disclosure["metadata"]["disclosed"] is True
+    assert disclosure["metadata"]["label"] == AI_DISCLOSURE_PREFIX
+    assert disclosure["trace_context"]["trace_id"] == "e" * 32
 
 
 def test_without_session_manager_no_gate() -> None:

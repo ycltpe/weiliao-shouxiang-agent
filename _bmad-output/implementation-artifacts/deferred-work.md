@@ -83,3 +83,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-5-2-kafka-handoff-unidirectional-command.md`
   summary: 同 session 连续命中硬触发会产生多条转交指令，无每会话一次节流
   evidence: 5.2 盲审#4；转人工后 session 响应路径关闭属 Story 5.3 原子终态范畴（5.1 评审#9 已 defer 同根问题），5.3 收口后自然消除；当前每命中即触发符合 Epic「命中任一即立即触发」口径。
+
+## Deferred from: code review of spec-5-4-ai-identity-disclosure-label (2026-11-09)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-4-ai-identity-disclosure-label.md`
+  summary: 无有效 trace_id 的 fail-closed 出口（请求校验失败等）永远记不出 ai.disclosure 事件——`_fallback_result` 回填的 `str(uuid.uuid4())` 是 36 位带横线串，过不了 1.5 起既有 `_recordable` 的 32-hex 校验，事件静默跳过。
+  evidence: 5.4 盲审#3 + 边界#6 + 验证缺口层 other finding 同根（评审轮 1 triage 裁决 medium、route defer）。买家可见携标不受影响（兜底文案自带前缀）；AC1 只要求正常链留痕。settle：需人拍板——要么修订 I/O 矩阵 fail-closed 行的事件口径，要么改出口 trace_id 政策（如响应 trace_id 改用 `uuid.uuid4().hex`，会动 1.x 起的响应契约，须人类显式批准）。
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-4-ai-identity-disclosure-label.md`
+  summary: 空串/仅空白草稿未按「无草稿」处理——空串草稿会产出只有前缀没有正文的买家应答，前导空白+前缀的草稿会双标。
+  evidence: 5.4 边界#1/#2 同根（评审轮 1 triage 裁决 medium、route defer）。两种行为与 5.4 改动前的内联组装逐字节一致（旧代码同样只判 `is not None`），非本 Story 引入；且任何「清洗草稿」的修法都会触碰冻结约束「过审草稿除加前缀外不得再被改写」。settle：单独立项，连同 risk_review 对空草稿的拦截口径一起拍板。

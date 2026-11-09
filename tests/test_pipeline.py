@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
+from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.pipeline import PipelineOrchestrator
@@ -204,14 +205,15 @@ def test_default_chain_intent_router_defaults_missing_intent_to_unknown() -> Non
 
 
 def test_final_assembly_consumes_approved_draft_with_ai_prefix() -> None:
-    # Story 4.4 最终组装点：已过审草稿（generated_reply 非 None 经
-    # risk_review 放行）买家可见 reply = AI 前缀+草稿；无草稿回模板兜底。
+    # Story 5.4：真实 response_assembler 是前缀唯一注入载体——已过审
+    # 草稿（generated_reply 非 None）产出 前缀+草稿 挂 assembled_reply，
+    # 编排器最终返回点只读消费；无草稿回模板兜底。
     log: list[str] = []
     orchestrator = PipelineOrchestrator(
         filters=[
             _RecordingFilter("intent_router", log),
             _RecordingFilter("risk_review", log),
-            _RecordingFilter("response_assembler", log),
+            ResponseAssemblerFilter(),
         ]
     )
     envelope = Envelope.model_validate(

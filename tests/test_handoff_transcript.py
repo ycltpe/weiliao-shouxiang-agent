@@ -22,6 +22,7 @@ from test_handoff_command import _FakeTransport, _HandoffFilter
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
+from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
 from weiliao_agent.handoff.command import HandoffCommand, HandoffCommandSender
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.pipeline import HANDOFF_REPLY_TEXT, PipelineOrchestrator, PipelineResult
@@ -335,7 +336,7 @@ def test_real_orchestrator_with_real_sender_builds_payload_from_redis(
     )
     result = orchestrator.run(_trigger_envelope())
 
-    assert result.reply == HANDOFF_REPLY_TEXT
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert result.degraded is False
     assert len(transport.sent) == 1  # 指令先于应答发出
     ((_, value, key, _),) = transport.sent

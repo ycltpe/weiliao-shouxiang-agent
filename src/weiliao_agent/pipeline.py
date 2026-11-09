@@ -55,8 +55,10 @@ DEFAULT_BUDGET_SECONDS = 2.5
 # 买家应答与 degraded 语义逐字节保持 4.2 前口径）。装配期不触达凭据。
 LLM_GENERATE_BUDGET_SECONDS = 0.9
 # 转人工固定出口文案（Story 5.1 决策 Q1-A）：硬触发命中后由编排器
-# 出口分支直接回复；转人工专用文案不走模板兜底库、不加 AI 披露前缀
-# （AD-10 前缀统一注入归 Story 5.4）。
+# 出口分支直接回复；转人工专用文案不走模板兜底库。常量本身保持纯
+# 文案不变，AI 披露前缀由出口处统一注入（Story 5.4 决策 Q1-B：转人工
+# 文案同样携标——买家可见文本 100% 携带），编排器出口与 http 终态
+# 闸门两处逐字节一致。
 HANDOFF_REPLY_TEXT = "已为您转接经纪人，请稍候"
 
 logger = logging.getLogger(__name__)
@@ -191,17 +193,17 @@ class PipelineOrchestrator:
         finally:
             # 超时跳的执行线程结果已丢弃，等待其完成无意义（不傻等）。
             executor.shutdown(wait=False)
-        # 最终组装点（Story 4.4）：已过审草稿（risk_review 放行，信封
-        # generated_reply 非 None）携带 AI 身份披露前缀下发；无草稿
-        # （未生成/审核未过/红线意图）回模板兜底（render_fallback 自带
-        # 前缀）。通过审核的内容到达本点后不得再被改写；response_assembler
-        # 占位不动，完整组装器归后续 Epic。
+        # 最终返回点（Story 5.4）：只读消费 response_assembler 的权威
+        # 产出 assembled_reply（AI 披露前缀的唯一注入载体，4.4 冻结
+        # 语义——通过审核的草稿除加前缀外不得再被改写）；组装产出缺失
+        # （替身过滤器透传等）防御性回退模板兜底（render_fallback 自带
+        # 前缀），正常链输出逐字节不变。
+        reply = envelope.assembled_reply
+        if reply is None:
+            reply = render_fallback(envelope.intent)
+        tracing.record_ai_disclosure(trace_id, disclosed=True)
         return PipelineResult(
-            reply=(
-                f"{AI_DISCLOSURE_PREFIX}{envelope.generated_reply}"
-                if envelope.generated_reply is not None
-                else render_fallback(envelope.intent)
-            ),
+            reply=reply,
             trace_id=trace_id,
             degraded=False,
             failed_filter=None,
@@ -233,8 +235,12 @@ class PipelineOrchestrator:
                 )
         trace_id = envelope.trace_id
         assert trace_id is not None  # _run_chain 已权威回填，供 mypy 收窄
+        # Story 5.4 决策 Q1-B：转人工文案同样携标（买家可见文本 100%
+        # 携带）——前缀在出口处注入，常量保持纯文案；与 http 终态
+        # 闸门回包逐字节一致，「转人工后标识消失」由 5.3 闸门拦截保证。
+        tracing.record_ai_disclosure(trace_id, disclosed=True)
         return PipelineResult(
-            reply=HANDOFF_REPLY_TEXT,
+            reply=f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}",
             trace_id=trace_id,
             degraded=False,
             failed_filter=None,
@@ -256,6 +262,9 @@ class PipelineOrchestrator:
             failed_filter=failed_filter,
             slow_filter=slow_filter,
         )
+        # Story 5.4：降级兜底文案经 render_fallback 携标下发，披露事件
+        # 与降级归因同点记录；记录本身 fail-safe，绝不二次影响应答。
+        tracing.record_ai_disclosure(trace_id, disclosed=True)
         culprit = failed_filter if failed_filter is not None else slow_filter
         return PipelineResult(
             reply=render_fallback(envelope.intent),
