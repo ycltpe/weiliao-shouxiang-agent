@@ -74,3 +74,9 @@
 - source_spec: `/Users/yechen/PycharmProjects/test/_bmad-output/implementation-artifacts/spec-4-6-model-routing-cost-guardrail.md`
   summary: 新 env 变量、/health 的 model_routing 快照与 ERROR 级 model_routing_alert 告警无 runbook/README 文档，运维只能读源码。
   evidence: 4.4/4.5 新增 env 与告警同样只写 .env.example（README 无任何 BREAKER 条目），文档缺口是逐 Story 累积的既有惯例，宜单独立项统一补运维文档。
+
+## Deferred from: code review of spec-5-1-hard-trigger-handoff-judgment (2026-11-09)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-1-hard-trigger-handoff-judgment.md`
+  summary: handoff 状态经 mark_handoff 落盘 Redis 后无任何读取方——转人工后同 session 的后续消息仍重建信封走完整 AI 管道，"转人工后 Agent 响应路径关闭、避免人机混答"未在 5.1  enforced。
+  evidence: 5.1 冻结块 Never 明确 Kafka 指令与买家安抚归 5.2/5.3，会话响应路径关闭（原子终态）属 Story 5.3 范畴；评审轮 1 triage #9 裁决 medium、route defer。settle：Story 5.3 实现原子终态时，在入口/编排器消费 handoff_status（权威值在 Redis，经 SessionManager 读取）短路后续消息，并补"转人工后零 AI 回复"的端到端测试。

@@ -70,6 +70,17 @@ Story 3.4 组合根（A 方案）：cache_lookup 的追问禁走与命中率计�
 metrics snapshot（压测 curl 即读）；lifespan 托管定时结构化 stderr
 日志任务（间隔 ``WEILIAO_METRICS_LOG_SECONDS`` 缺省 60，非正整数
 fail-fast 带变量名）。
+
+Story 5.1 组合根：硬触发评估模块（``handoff.trigger.HardTriggerAssessor``，
+AD-12 单一评估点——红线意图 / 非文本媒体 / 追问达阈值 / 负面词四类
+条件集中判定）注入 intent_router，命中即由编排器短路下游走转人工
+出口分支回固定文案；``handoff_marker`` 注入 ``SessionManager.mark_handoff``
+（AD-4 单写者）。``WEILIAO_HANDOFF_FOLLOWUP_THRESHOLD`` 缺省 3、非正
+整数 fail-fast 带变量名；``WEILIAO_HANDOFF_REDLINE_INTENTS`` 缺省
+NEGOTIATION,LOAN_POLICY,COMPLAINT、解析为空或含未知意图标签 fail-fast
+带变量名；``WEILIAO_HANDOFF_NEGATIVE_WORDS_PATH`` 缺省仓库内置词表
+（``handoff/negative_words.txt``，风控中台产出发布），文件不可读或
+无词条 fail-fast 带变量名（加载失败启动即败，不静默放行）。
 """
 
 import asyncio
@@ -78,6 +89,7 @@ import math
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 import redis
 
@@ -95,6 +107,7 @@ from weiliao_agent.filters.risk_review import (
     RiskReviewClient,
     RiskReviewFilter,
 )
+from weiliao_agent.handoff.trigger import HardTriggerAssessor, load_negative_words
 from weiliao_agent.llm.circuit_breaker import LlmCircuitBreaker
 from weiliao_agent.llm.client import OpenAiGenerationClient
 from weiliao_agent.llm.model_router import (
@@ -341,6 +354,77 @@ if _model_router.primary_alias == _model_router.mini_alias:
     )
 
 
+# ---- Story 5.1：硬触发评估（AD-12 单一评估点）组合根配置 ----
+
+# 追问触发阈值：缺省 3（FR 值，权威在 handoff.trigger 模块常量）；
+# 非正整数（含 0/负数）fail-fast 拒绝启动（错误消息带变量名）。
+_HANDOFF_THRESHOLD_RAW = os.environ.get("WEILIAO_HANDOFF_FOLLOWUP_THRESHOLD", "3")
+try:
+    _HANDOFF_FOLLOWUP_THRESHOLD = int(_HANDOFF_THRESHOLD_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_HANDOFF_FOLLOWUP_THRESHOLD must be an integer, "
+        f"got {_HANDOFF_THRESHOLD_RAW!r}"
+    )
+    raise ValueError(msg) from exc
+if _HANDOFF_FOLLOWUP_THRESHOLD <= 0:
+    msg = (
+        f"WEILIAO_HANDOFF_FOLLOWUP_THRESHOLD must be a positive integer, "
+        f"got {_HANDOFF_FOLLOWUP_THRESHOLD}"
+    )
+    raise ValueError(msg)
+
+# 红线意图集合：逗号分隔（可含空白），空条目容忍跳过；缺省
+# NEGOTIATION,LOAN_POLICY,COMPLAINT（FR 值）；解析为空（显式置空会
+# 令红线触发静默失效）或含未知意图标签（不在 models/intent.py
+# IntentTag 枚举内）fail-fast 带变量名（同简单意图名单口径）。
+_HANDOFF_REDLINE_RAW = os.environ.get(
+    "WEILIAO_HANDOFF_REDLINE_INTENTS", "NEGOTIATION,LOAN_POLICY,COMPLAINT"
+)
+_HANDOFF_REDLINE_LABELS = [
+    label.strip() for label in _HANDOFF_REDLINE_RAW.split(",") if label.strip()
+]
+if not _HANDOFF_REDLINE_LABELS:
+    msg = (
+        f"WEILIAO_HANDOFF_REDLINE_INTENTS must contain at least one "
+        f"intent label, got {_HANDOFF_REDLINE_RAW!r}"
+    )
+    raise ValueError(msg)
+_UNKNOWN_HANDOFF_LABELS = sorted(set(_HANDOFF_REDLINE_LABELS) - KNOWN_INTENTS)
+if _UNKNOWN_HANDOFF_LABELS:
+    msg = (
+        f"WEILIAO_HANDOFF_REDLINE_INTENTS contains unknown intent labels: "
+        f"{_UNKNOWN_HANDOFF_LABELS!r} (valid: {sorted(KNOWN_INTENTS)!r})"
+    )
+    raise ValueError(msg)
+
+# 负面词表文件路径：缺省仓库内置词表（handoff/negative_words.txt，
+# 风控中台产出发布）；词表加载失败（文件不可读/无词条）fail-fast 拒绝
+# 启动（错误消息带变量名——不静默放行，决策 Q2-A）。
+_DEFAULT_NEGATIVE_WORDS_PATH = (
+    Path(__file__).resolve().parent / "handoff" / "negative_words.txt"
+)
+_HANDOFF_WORDS_PATH_RAW = os.environ.get(
+    "WEILIAO_HANDOFF_NEGATIVE_WORDS_PATH", str(_DEFAULT_NEGATIVE_WORDS_PATH)
+)
+try:
+    _HANDOFF_NEGATIVE_WORDS = load_negative_words(_HANDOFF_WORDS_PATH_RAW)
+except ValueError as exc:
+    msg = (
+        f"WEILIAO_HANDOFF_NEGATIVE_WORDS_PATH is not loadable, "
+        f"got {_HANDOFF_WORDS_PATH_RAW!r}: {exc}"
+    )
+    raise ValueError(msg) from exc
+
+# 组合根构造：纯进程内状态，装配期只读词表文件（无网络/凭据触达）；
+# 注入 intent_router（评估 + 命中后单写者落 handoff 状态）。
+_handoff_assessor = HardTriggerAssessor(
+    followup_threshold=_HANDOFF_FOLLOWUP_THRESHOLD,
+    redline_intents=_HANDOFF_REDLINE_LABELS,
+    negative_words=_HANDOFF_NEGATIVE_WORDS,
+)
+
+
 async def _metrics_log_loop() -> None:
     """定时发射缓存/审核/熔断器/模型路由结构化日志（first 发射在首个
     间隔之后）；跌破审核阈值、熔断器非 closed、路由收紧态时同循环追加
@@ -398,6 +482,8 @@ app = create_app(
                 followup_recorder=_session_manager.record_followup,
                 recent_intent_writer=_l1_cache.set_recent_intent,
                 followup_snapshot_writer=_l1_cache.set_followup_count,
+                handoff_assessor=_handoff_assessor,
+                handoff_marker=_session_manager.mark_handoff,
             ),
             CacheLookupFilter(l0_client=_l0_cache),
             LlmGenerateFilter(

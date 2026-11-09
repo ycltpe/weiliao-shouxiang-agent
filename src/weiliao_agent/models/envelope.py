@@ -31,8 +31,13 @@
   可选字段；红线意图/非文本/空消息跳过、生成异常、校验未过一律保持
   None。买家可见应答仍由 response_assembler 模板兜底产出——4.4 审核
   就位前 LLM 内容不得触达买家；
+- ``handoff``（Story 5.1，硬触发判定结果挂点，AD-12）：intent_router
+  内单一评估模块产出——未评估为 None、评估未触发为 ``triggered=False``
+  （区分「没评估」与「评估了没命中」）；编排器只认 ``triggered is True``
+  短路下游（cache/llm/risk/assembler 零执行）走转人工出口分支；
 - ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
-  预留字段，本 Story 仅定义、不消费，默认 None。
+ 预留字段，默认 None；``media_type`` 自 Story 5.1 起由硬触发评估消费
+  （None / "text" 视为文本，其余一律判触发），其余仍不消费。
 """
 
 from datetime import datetime
@@ -42,6 +47,18 @@ from pydantic import BaseModel, Field, field_validator
 
 from weiliao_agent.models.fact_card import FactCard
 from weiliao_agent.models.intent import IntentTag
+
+
+class HandoffAssessment(BaseModel):
+    """Story 5.1 硬触发判定结果（AD-12 单一评估点产出）。
+
+    ``conditions`` 为命中条件清单（标识词与负面词条，判定顺序固定），
+    未命中为空清单；评估代码自身异常时 fail-closed 记
+    ``triggered=True`` + ``conditions=["assessment_error"]``（调用方口径）。
+    """
+
+    triggered: bool = False
+    conditions: list[str] = Field(default_factory=list)
 
 
 class Envelope(BaseModel):
@@ -67,6 +84,10 @@ class Envelope(BaseModel):
     # llm_generate 写入（model_copy 追加可选字段，既有 model_validate
     # 兼容）；任何故障路径保持 None，买家可见语义不变。
     generated_reply: str | None = None
+    # Story 5.1：硬触发判定结果挂点（AD-12）——intent_router 内单一
+    # 评估模块写入；未评估为 None、评估未触发为 triggered=False（区分
+    # 「没评估」与「评估了没命中」），下游短路只认 triggered is True。
+    handoff: HandoffAssessment | None = None
     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
     # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
     message: str | None = None

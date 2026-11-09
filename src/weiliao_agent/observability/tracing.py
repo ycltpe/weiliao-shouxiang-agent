@@ -31,6 +31,12 @@ context 传播（spec Never 约束）。
 信号事件（命中条件=追问≥3，判定与转人工归 Epic 5 的 AD-12 模块）。
 记录失败经 ``record_classification_failure``（reason=
 ``followup_record_failed``）观测，fail-safe 口径不变。
+
+硬触发判定事件（Story 5.1）：intent_router 内 AD-12 单一评估模块
+产出判定结果后 ``record_handoff_assessment`` 补挂事件——命中与未
+命中全量记录（未命中 DEFAULT 级，支撑漏判审计）；触发为 WARNING 级
+（设计内转人工，非故障）；判定代码自身异常 fail-closed 按触发处理，
+ERROR 级并携带 error 归因。
 """
 
 import re
@@ -412,6 +418,75 @@ def record_generation(
             pass
     except Exception:
         pass
+
+
+def record_handoff_assessment(
+    trace_id: str | None,
+    *,
+    triggered: bool,
+    conditions: list[str],
+    error: str | None = None,
+) -> None:
+    """硬触发判定事件（Story 5.1，AD-12）：命中与否全量记录，可审计漏判。
+
+    事件分级：未命中为 DEFAULT 级（漏判审计基线）；触发为 WARNING 级
+    （设计内转人工出口，非链路故障）；判定代码自身异常（fail-closed
+    按触发处理）为 ERROR 级并携带 error 归因。fail-safe 口径同
+    ``record_followup_hard_trigger``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    level: Literal["DEFAULT", "WARNING", "ERROR"]
+    if error is not None:
+        level = "ERROR"
+    elif triggered:
+        level = "WARNING"
+    else:
+        level = "DEFAULT"
+    metadata: dict[str, Any] = {
+        "event": "handoff_assessment",
+        "triggered": triggered,
+        "conditions": list(conditions),
+        "error": error[:_STATUS_MESSAGE_LIMIT] if error else None,
+    }
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="handoff.assessment",
+            level=level,
+            metadata=metadata,
+        )
+
+
+def record_handoff_mark_failed(trace_id: str | None) -> None:
+    """handoff 状态写失败事件（Story 5.1）：marker 单写者落盘失败的
+    专用观测锚点。
+
+    不复用 ``record_classification_failure``：handoff 标记失败与意图
+    分类失败是两条独立信号，混用会污染分类失败归因（评审补丁）。
+    ERROR 级，fail-safe 口径同 ``record_handoff_assessment``：记录
+    本身再抛异常也吞掉，绝不二次影响买家应答。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="handoff.mark_failed",
+            level="ERROR",
+            metadata={
+                "event": "handoff_mark_failed",
+                "reason": "handoff_mark_failed",
+            },
+        )
 
 
 def record_cache_event(

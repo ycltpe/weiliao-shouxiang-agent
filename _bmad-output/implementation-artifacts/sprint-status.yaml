@@ -74,8 +74,8 @@ development_status:
   4-5-OpenAI-故障降级与步进恢复: review
   4-6-模型路由与成本护栏: review
   epic-4-retrospective: optional
-  epic-5: backlog
-  5-1-硬触发条件判定: backlog
+  epic-5: in-progress
+  5-1-硬触发条件判定: review
   5-2-Kafka-转人工单向指令: backlog
   5-3-转人工原子终态与买家安抚通知: backlog
   5-4-AI-身份披露标识: backlog

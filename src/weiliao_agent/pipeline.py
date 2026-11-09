@@ -4,6 +4,12 @@
 intent_router → cache_lookup → llm_generate → risk_review →
 response_assembler，过滤器间仅经信封传递。
 
+Story 5.1 转人工短路：信封经 intent_router 挂 ``handoff`` 判定结果后，
+若 ``triggered is True`` 编排器立即跳过剩余过滤器（cache/llm/risk/
+assembler 零执行，红线意图 100% 无生成回答），走转人工出口分支回复
+固定文案 ``HANDOFF_REPLY_TEXT``（决策 Q1-A：转人工专用出口文案，不走
+模板兜底库）；短路非降级（degraded=False，设计内分支）。
+
 Story 1.5 追踪挂点：``run()`` 入口为 trace_id 单一权威生成点（信封
 缺失即回填；携带值透传——既有测试锁定该语义，非 32-hex 值仅跳过
 Langfuse 追踪）；消息级 trace 上下文包裹整条链；每过滤器执行在
@@ -46,6 +52,10 @@ DEFAULT_BUDGET_SECONDS = 2.5
 # 0.9s 使慢调用在过滤器内超时归一为生成失败（仅丢草稿 + trace 事件，
 # 买家应答与 degraded 语义逐字节保持 4.2 前口径）。装配期不触达凭据。
 LLM_GENERATE_BUDGET_SECONDS = 0.9
+# 转人工固定出口文案（Story 5.1 决策 Q1-A）：硬触发命中后由编排器
+# 出口分支直接回复；转人工专用文案不走模板兜底库、不加 AI 披露前缀
+# （AD-10 前缀统一注入归 Story 5.4）。
+HANDOFF_REPLY_TEXT = "已为您转接经纪人，请稍候"
 
 
 @dataclass(frozen=True)
@@ -140,6 +150,11 @@ class PipelineOrchestrator:
                     # 线程，不做 OTel 跨线程传播（Story 1.5 约定）。
                     with tracing.filter_span(trace_id, filter_.name):
                         envelope = future.result(timeout=remaining)
+                    if envelope.handoff is not None and envelope.handoff.triggered:
+                        # 硬触发命中（Story 5.1，AD-12）：短路剩余过滤
+                        # 器——cache/llm/risk/assembler 零执行，红线意图
+                        # 100% 无生成回答；走转人工出口分支回固定文案。
+                        return self._handoff_result(trace_id)
                 except FutureTimeoutError:
                     return self._degraded(envelope, trace_id, slow_filter=filter_.name)
                 except Exception:
@@ -166,6 +181,22 @@ class PipelineOrchestrator:
                 if envelope.generated_reply is not None
                 else render_fallback(envelope.intent)
             ),
+            trace_id=trace_id,
+            degraded=False,
+            failed_filter=None,
+        )
+
+    @staticmethod
+    def _handoff_result(trace_id: str) -> PipelineResult:
+        """转人工出口分支（Story 5.1 决策 Q1-A）：固定专用文案直接下发。
+
+        非降级（设计内分支，failed_filter 为 None）：降级事件属故障
+        归因，转人工是正常合规出口；判定过程已由 intent_router 记
+        ``handoff.assessment`` trace 事件，最终下发文本仍由 run() 的
+        ``record_delivery`` 补记。
+        """
+        return PipelineResult(
+            reply=HANDOFF_REPLY_TEXT,
             trace_id=trace_id,
             degraded=False,
             failed_filter=None,

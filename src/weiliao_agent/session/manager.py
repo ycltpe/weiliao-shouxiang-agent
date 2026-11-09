@@ -2,9 +2,12 @@
 
 会话状态仅本模块写入：Redis hash 单键 ``weiliao:session:{session_id}``，
 字段 ``turn``（会话内绝对消息序号）、``followup_count``（追问计数，Epic 2
-消费）、``handoff_status``（Epic 5 消费，本 Story 恒 ``"none"``）、
-``last_message_at``（ISO8601 字符串）。TTL 30 分钟（可配置），每次入口
-调用刷新。
+消费）、``handoff_status``（Epic 5 消费；Lua 初始化恒 ``"none"``，
+Story 5.1 ``mark_handoff`` 置 ``"triggered"``）、
+``handoff_conditions``（Story 5.1，命中条件清单 JSON——5.2/5.3 转交
+载荷消费，``SessionSnapshot`` 解析为 ``list[str]``，缺省空清单）、
+``last_message_at``（ISO8601 字符串）。TTL 30 分钟（可配置），每次
+入口调用刷新。
 
 原子性落点：``begin_turn`` 与 ``increment_followup`` 均为 Lua 脚本单
 roundtrip（读旧态/初始化/自增/刷新时间戳/EXPIRE 一次完成），满足延迟
@@ -23,11 +26,19 @@ per-intent 追问计数（会话 hash 字段 ``followup:{TAG}``）与会话追�
 总数 ``followup_count``（仅追问命中——per-intent ≥2——时自增），并
 随脚本刷新 EXPIRE；返回 ``(per_intent_count, followup_count)`` 双计数。
 追问判定的权威值只存 Redis（AD-4），UNKNOWN 不参与计数（调用方
-口径）。仍待后续交付：``write_coref``（指代消解 Story）、
-``mark_handoff``（Epic 5）及 ``:coref:{turn}`` 键落盘。
+口径）。
+
+Story 5.1 已交付：``mark_handoff`` 经 Lua 单 roundtrip 原子置位
+``handoff_status``（``"none"`` → ``"triggered"``）并把命中条件清单
+JSON 落同 hash（``handoff_conditions`` 字段，供 5.2/5.3 消费），
+AD-4 单写者约束不变。
+
+仍待后续交付：``write_coref``（指代消解 Story）及 ``:coref:{turn}``
+键落盘。
 """
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import cast
 
@@ -59,7 +70,8 @@ redis.call('HSET', key, 'last_message_at', last_message_at)
 redis.call('EXPIRE', key, ttl_seconds)
 local followup_count = tonumber(redis.call('HGET', key, 'followup_count'))
 local handoff_status = redis.call('HGET', key, 'handoff_status')
-return {turn, followup_count, handoff_status}
+local handoff_conditions = redis.call('HGET', key, 'handoff_conditions')
+return {turn, followup_count, handoff_status, handoff_conditions or ''}
 """
 
 _LUA_INCREMENT_FOLLOWUP = """
@@ -90,6 +102,16 @@ redis.call('EXPIRE', key, ttl_seconds)
 return {per_intent, session_count}
 """
 
+_LUA_MARK_HANDOFF = """
+local key = KEYS[1]
+local conditions = ARGV[1]
+local ttl_seconds = tonumber(ARGV[2])
+redis.call('HSET', key, 'handoff_status', 'triggered')
+redis.call('HSET', key, 'handoff_conditions', conditions)
+redis.call('EXPIRE', key, ttl_seconds)
+return 1
+"""
+
 
 @dataclass(frozen=True)
 class SessionSnapshot:
@@ -99,6 +121,9 @@ class SessionSnapshot:
     followup_count: int
     handoff_status: str
     last_message_at: datetime
+    # handoff 命中条件清单（Story 5.1，5.2/5.3 转交载荷消费；缺省
+    # 空列表——字段未落盘或损坏时防御为未携带条件）。
+    handoff_conditions: list[str] = field(default_factory=list)
 
 
 class SessionManager:
@@ -119,6 +144,7 @@ class SessionManager:
         self._begin_turn_script = client.register_script(_LUA_BEGIN_TURN)
         self._increment_followup_script = client.register_script(_LUA_INCREMENT_FOLLOWUP)
         self._record_followup_script = client.register_script(_LUA_RECORD_FOLLOWUP)
+        self._mark_handoff_script = client.register_script(_LUA_MARK_HANDOFF)
 
     def begin_turn(self, session_id: str, timestamp: datetime) -> SessionSnapshot:
         """入管道前快照：初始化/自增 turn、刷新 TTL 与 ``last_message_at``。
@@ -130,8 +156,9 @@ class SessionManager:
             keys=[self._key(session_id)],
             args=[timestamp.isoformat(), self._ttl_seconds],
         )
-        turn, followup_count, handoff_status = cast(
-            "tuple[object, object, object]", tuple(cast("list[object]", raw))
+        turn, followup_count, handoff_status, handoff_conditions = cast(
+            "tuple[object, object, object, object]",
+            tuple(cast("list[object]", raw)),
         )
         return SessionSnapshot(
             turn=int(cast("int | str | bytes", turn)),
@@ -141,6 +168,7 @@ class SessionManager:
                 if isinstance(handoff_status, bytes)
                 else str(handoff_status)
             ),
+            handoff_conditions=self._parse_conditions(handoff_conditions),
             last_message_at=timestamp,
         )
 
@@ -184,6 +212,21 @@ class SessionManager:
             int(cast("int | str | bytes", session_count)),
         )
 
+    def mark_handoff(self, session_id: str, conditions: list[str]) -> None:
+        """转人工状态单写者落盘（Story 5.1，AD-4）：``"none"`` →
+        ``"triggered"``。
+
+        Lua 单 roundtrip 原子置位 ``handoff_status`` 并把命中条件清单
+        JSON（``handoff_conditions`` 字段，ensure_ascii=False）落同
+        hash，EXPIRE 随脚本刷新（TTL 与会话一致）；本期值域只新增
+        ``"triggered"``（更细状态机归 5.2/5.3）。写失败不吞异常：
+        调用方（intent_router）经 try 包裹 fail-safe，应答不降级。
+        """
+        self._mark_handoff_script(
+            keys=[self._key(session_id)],
+            args=[json.dumps(list(conditions), ensure_ascii=False), self._ttl_seconds],
+        )
+
     def write_intent(
         self,
         session_id: str,
@@ -215,8 +258,30 @@ class SessionManager:
             turn=int(raw_turn),
             followup_count=int(fields.get("followup_count", "0")),
             handoff_status=fields.get("handoff_status", "none"),
+            handoff_conditions=self._parse_conditions(
+                fields.get("handoff_conditions")
+            ),
             last_message_at=datetime.fromisoformat(raw_last_message_at),
         )
+
+    @staticmethod
+    def _parse_conditions(raw: object) -> list[str]:
+        """handoff_conditions 权威值解析：缺省/损坏 JSON 防御为空清单。
+
+        字段由 ``mark_handoff`` 单写者落盘（JSON list[str]）；读取侧
+        不做严格校验——非 list 或坏 JSON 一律归一为 []，绝不令快照
+        读取抛错（防御非本模块写入）。
+        """
+        if raw is None:
+            return []
+        text = raw.decode() if isinstance(raw, bytes) else str(raw)
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed]
 
     @staticmethod
     def _key(session_id: str) -> str:

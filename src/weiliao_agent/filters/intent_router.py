@@ -37,6 +37,23 @@ Story 3.3：可选注入 ``recent_intent_writer`` / ``followup_snapshot_writer``
 写会话追问计数快照（会话总数）。两者均 try 包裹静默 fail-safe——
 与 intent_writer 的非对称设计：L1 是进程内优化层，写失败只可能是
 程序错误，不记 trace（避免热路径噪音）、不应答降级，信封结果不变。
+
+Story 5.1：可选注入 ``handoff_assessor``（AD-12 单一评估点——四类
+硬触发条件集中判定：红线意图 / 非文本媒体 / 追问达阈值 / 负面词）
+与 ``handoff_marker``（AD-4 单写者——组合根注入
+``SessionManager.mark_handoff`` 方法引用，过滤器不持有 Redis 客户端）。
+分类与追问记录完成后调用评估模块，结果（触发标记 + 命中条件清单）
+写信封 ``handoff`` 字段并记 trace（未命中也记，支撑漏判审计）；
+追问记录失败 fail-safe 路径（2.3 语义）传追问序号 0 继续评估——
+Redis 故障时追问条件不触发，但红线 / 媒体 / 负面条件照常判定。
+评估代码自身异常 fail-closed：按触发处理（``conditions=
+["assessment_error"]``），绝不放行到生成链路，并记 trace 告警；
+触发时调用 marker（try 包裹 fail-safe，写失败经
+``tracing.record_handoff_mark_failed`` 专用事件观测，不复用分类失败
+信号）。分类异常 fail-closed 路径与空消息路径同口径：以 UNKNOWN /
+追问序号 0 照常评估——媒体与负面词条件不依赖分类器输出，高风险
+消息绝不在分类失败时漏入 cache/LLM。判定结果由编排器消费
+（``triggered is True`` 短路下游走转人工出口分支）。
 """
 
 import time
@@ -45,7 +62,11 @@ from contextlib import suppress
 from typing import Any, Protocol
 
 from weiliao_agent.filters.base import Filter
-from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.handoff.trigger import (
+    CONDITION_ASSESSMENT_ERROR,
+    HardTriggerAssessor,
+)
+from weiliao_agent.models.envelope import Envelope, HandoffAssessment
 from weiliao_agent.models.intent import IntentClassification, IntentTag
 from weiliao_agent.observability import tracing
 
@@ -76,12 +97,16 @@ class IntentRouterFilter(Filter):
         followup_recorder: Callable[[str, IntentTag], tuple[int, int]] | None = None,
         recent_intent_writer: Callable[[str, IntentTag], None] | None = None,
         followup_snapshot_writer: Callable[[str, int], None] | None = None,
+        handoff_assessor: HardTriggerAssessor | None = None,
+        handoff_marker: Callable[[str, list[str]], None] | None = None,
     ) -> None:
         self._classifier = classifier
         self._intent_writer = intent_writer
         self._followup_recorder = followup_recorder
         self._recent_intent_writer = recent_intent_writer
         self._followup_snapshot_writer = followup_snapshot_writer
+        self._handoff_assessor = handoff_assessor
+        self._handoff_marker = handoff_marker
 
     def process(self, envelope: Envelope) -> Envelope:
         if self._classifier is None:
@@ -99,7 +124,10 @@ class IntentRouterFilter(Filter):
         if not message:
             # 分类器契约要求非空消息文本：None 与空串一律 fail-closed
             # UNKNOWN，不调用分类器。
-            return envelope.model_copy(update={"intent": "UNKNOWN"})
+            unknown = envelope.model_copy(update={"intent": "UNKNOWN"})
+            # 硬触发评估不依赖分类器输出（媒体条件照常判定）：空消息
+            # 路径以 UNKNOWN / 追问序号 0 评估，追问条件天然不触发。
+            return self._assess_handoff(unknown, "UNKNOWN", 0, message)
         context: Mapping[str, Any] = {
             "session_id": envelope.session_id,
             "house_id": envelope.house_id,
@@ -122,10 +150,14 @@ class IntentRouterFilter(Filter):
             confidence = classification.confidence
         except Exception as exc:
             # 分类异常 fail-closed：UNKNOWN，过滤器自身不向上抛。
+            # 硬触发评估照常执行（UNKNOWN / 追问序号 0，同空消息路径
+            # 口径）：媒体与负面词条件不依赖分类器输出，绝不让高风险
+            # 消息在分类失败时流入 cache/LLM。
             tracing.record_classification_failure(
                 envelope.trace_id, reason=_failure_reason(exc)
             )
-            return envelope.model_copy(update={"intent": "UNKNOWN"})
+            unknown = envelope.model_copy(update={"intent": "UNKNOWN"})
+            return self._assess_handoff(unknown, "UNKNOWN", 0, message)
         # 分类成功：trace 事件（来源取实现自报 source，缺省类名）。
         latency_ms = (time.monotonic() - started) * 1000
         tracing.record_classification(
@@ -149,36 +181,43 @@ class IntentRouterFilter(Filter):
             # 不记 trace、不应答降级，信封保留分类结果。
             with suppress(Exception):
                 self._recent_intent_writer(envelope.session_id, classification.tag)
-        is_followup = self._record_followup(envelope, classification.tag)
+        is_followup, per_intent_count = self._record_followup(envelope, classification.tag)
+        assessed = self._assess_handoff(
+            classified, classification.tag, per_intent_count, message
+        )
         if not is_followup:
-            return classified
-        return classified.model_copy(update={"is_followup": True})
+            return assessed
+        return assessed.model_copy(update={"is_followup": True})
 
-    def _record_followup(self, envelope: Envelope, tag: IntentTag) -> bool:
+    def _record_followup(self, envelope: Envelope, tag: IntentTag) -> tuple[bool, int]:
         """追问识别落点（Story 2.3）：原子计数、信封标记、trace 挂点。
 
-        返回是否追问命中（per-intent ≥2）。前置条件不满足（turn 为
-        None、未注入 recorder、tag 为 UNKNOWN）一律跳过：不调 recorder、
-        不累积计数、信封 ``is_followup`` 保持默认 False。recorder 异常
-        fail-safe 收敛在本方法内，不外抛。
+        返回 ``(是否追问命中, per_intent 计数)``——追问命中为
+        per-intent ≥2（is_followup 口径）；per_intent 计数供 Story 5.1
+        硬触发追问条件消费（达阈值判定归 AD-12 评估模块，勿复用
+        is_followup）。前置条件不满足（turn 为 None、未注入 recorder、
+        tag 为 UNKNOWN）一律跳过：不调 recorder、不累积计数、计数返回
+        0（追问条件不触发）、信封 ``is_followup`` 保持默认 False。
+        recorder 异常 fail-safe 收敛在本方法内，不外抛。
         """
         if (
             envelope.turn is None
             or self._followup_recorder is None
             or tag == "UNKNOWN"
         ):
-            return False
+            return False, 0
         try:
             per_intent_count, session_followup_count = self._followup_recorder(
                 envelope.session_id, tag
             )
         except Exception:
             # 记录失败 fail-safe：应答不降级、信封保留分类结果、
-            # is_followup 保持默认 False，trace 记失败事件。
+            # is_followup 保持默认 False、追问序号按 0 处理（追问条件
+            # 不触发，2.3 语义沿用），trace 记失败事件。
             tracing.record_classification_failure(
                 envelope.trace_id, reason="followup_record_failed"
             )
-            return False
+            return False, 0
         is_followup = per_intent_count >= 2
         if self._followup_snapshot_writer is not None:
             # 同 recent_intent_writer：L1 快照写失败静默吞，不记 trace。
@@ -201,7 +240,67 @@ class IntentRouterFilter(Filter):
             tracing.record_followup_hard_trigger(
                 envelope.trace_id, count=session_followup_count
             )
-        return is_followup
+        return is_followup, per_intent_count
+
+    def _assess_handoff(
+        self,
+        envelope: Envelope,
+        tag: IntentTag,
+        per_intent_count: int,
+        message: str | None,
+    ) -> Envelope:
+        """硬触发评估落点（Story 5.1，AD-12）：集中判定、写信封、记 trace。
+
+        未注入 assessor 时透传（判定集中挂载点缺失即不评估，信封
+        ``handoff`` 保持 None）。评估未命中也记 trace（支撑漏判审计）；
+        评估代码自身异常 fail-closed：按触发处理（conditions=
+        [assessment_error]）并记 ERROR 级 trace 告警，消息绝不放行到
+        生成链路。触发时经 marker 单写者落 handoff 状态（try 包裹
+        fail-safe，写失败经 ``record_handoff_mark_failed`` 专用事件
+        观测）；信封条件清单含内部诊断哨兵 assessment_error（审计归因），
+        但传给 marker 的清单过滤该哨兵——5.2 的转交载荷消费
+        handoff_conditions，只携带真实命中条件。
+        """
+        if self._handoff_assessor is None:
+            return envelope
+        try:
+            assessment = self._handoff_assessor.assess(
+                intent=tag,
+                media_type=envelope.media_type,
+                per_intent_followup_count=per_intent_count,
+                message=message,
+            )
+        except Exception as exc:
+            tracing.record_handoff_assessment(
+                envelope.trace_id,
+                triggered=True,
+                conditions=[CONDITION_ASSESSMENT_ERROR],
+                error=_failure_reason(exc),
+            )
+            assessment = HandoffAssessment(
+                triggered=True, conditions=[CONDITION_ASSESSMENT_ERROR]
+            )
+        else:
+            tracing.record_handoff_assessment(
+                envelope.trace_id,
+                triggered=assessment.triggered,
+                conditions=assessment.conditions,
+            )
+        if assessment.triggered and self._handoff_marker is not None:
+            # 内部诊断哨兵不入 Redis：handoff_conditions 供 5.2 转交
+            # 载荷消费，只携带真实命中条件；信封清单保持不变。
+            mark_conditions = [
+                condition
+                for condition in assessment.conditions
+                if condition != CONDITION_ASSESSMENT_ERROR
+            ]
+            try:
+                self._handoff_marker(envelope.session_id, mark_conditions)
+            except Exception:
+                # 状态写失败 fail-safe：判定结果已挂信封，应答不降级，
+                # trace 记专用失败事件（绝不二次影响买家应答）。
+                tracing.record_handoff_mark_failed(envelope.trace_id)
+        return envelope.model_copy(update={"handoff": assessment})
 
 
 def _failure_reason(exc: Exception) -> str:
