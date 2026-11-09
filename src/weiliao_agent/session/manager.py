@@ -33,11 +33,22 @@ Story 5.1 已交付：``mark_handoff`` 经 Lua 单 roundtrip 原子置位
 JSON 落同 hash（``handoff_conditions`` 字段，供 5.2/5.3 消费），
 AD-4 单写者约束不变。
 
+Story 5.2 已交付：``record_transcript`` / ``read_transcript`` 为会话
+转写原语（AD-4 单写者口径不变）——per-turn 一条 JSON
+（turn/buyer_message/agent_reply/timestamp）右进 Redis list
+``weiliao:session:{session_id}:transcript``，LTRIM 截断保留最近
+``TRANSCRIPT_KEEP_TURNS`` 轮，TTL 与会话一致（key 过期即从零开始）；
+``read_transcript(session_id, limit)`` 只取 list 尾部最近 limit 条，
+损坏条目防御为空白条目（绝不令读取抛错）。转人工指令 payload 的
+「最近 3 轮对话原文」上下文权威来源（Story 5.2 决策 Q1-A：原文，
+无 LLM 依赖）。
+
 仍待后续交付：``write_coref``（指代消解 Story）及 ``:coref:{turn}``
 键落盘。
 """
 
 import json
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import cast
@@ -51,6 +62,11 @@ KEY_PREFIX = "weiliao:session:"
 
 # 会话 TTL 默认 30 分钟（FR-10），可配置。
 DEFAULT_TTL_SECONDS = 1800
+
+# 转写 list 截断保留上限（Story 5.2 设计 Notes「如 10 轮」落地）：
+# 读取只取最近 PAYLOAD_RECENT_TURNS-1 条 + 当前信封轮，上限留足工作台
+# 侧潜在的更宽读取窗口。
+TRANSCRIPT_KEEP_TURNS = 10
 
 _LUA_BEGIN_TURN = """
 local key = KEYS[1]
@@ -112,6 +128,17 @@ redis.call('EXPIRE', key, ttl_seconds)
 return 1
 """
 
+_LUA_RECORD_TRANSCRIPT = """
+local key = KEYS[1]
+local entry = ARGV[1]
+local keep = tonumber(ARGV[2])
+local ttl_seconds = tonumber(ARGV[3])
+redis.call('RPUSH', key, entry)
+redis.call('LTRIM', key, -keep, -1)
+redis.call('EXPIRE', key, ttl_seconds)
+return 1
+"""
+
 
 @dataclass(frozen=True)
 class SessionSnapshot:
@@ -124,6 +151,21 @@ class SessionSnapshot:
     # handoff 命中条件清单（Story 5.1，5.2/5.3 转交载荷消费；缺省
     # 空列表——字段未落盘或损坏时防御为未携带条件）。
     handoff_conditions: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TranscriptTurn:
+    """单轮转写记录（Story 5.2）：买家原文 + Agent 回复逐字原文。
+
+    存储形态为 per-turn 一条 JSON（键
+    ``weiliao:session:{session_id}:transcript``）；字段全部可选——
+    读取侧防御损坏条目（坏 JSON / 缺字段）归一为空白条目，绝不抛错。
+    """
+
+    turn: int | None
+    buyer_message: str | None
+    agent_reply: str | None
+    timestamp: datetime | None
 
 
 class SessionManager:
@@ -145,6 +187,7 @@ class SessionManager:
         self._increment_followup_script = client.register_script(_LUA_INCREMENT_FOLLOWUP)
         self._record_followup_script = client.register_script(_LUA_RECORD_FOLLOWUP)
         self._mark_handoff_script = client.register_script(_LUA_MARK_HANDOFF)
+        self._record_transcript_script = client.register_script(_LUA_RECORD_TRANSCRIPT)
 
     def begin_turn(self, session_id: str, timestamp: datetime) -> SessionSnapshot:
         """入管道前快照：初始化/自增 turn、刷新 TTL 与 ``last_message_at``。
@@ -227,6 +270,47 @@ class SessionManager:
             args=[json.dumps(list(conditions), ensure_ascii=False), self._ttl_seconds],
         )
 
+    def record_transcript(
+        self,
+        session_id: str,
+        *,
+        turn: int | None,
+        buyer_message: str | None,
+        agent_reply: str,
+        timestamp: datetime,
+    ) -> None:
+        """本轮转写单写者落盘（Story 5.2，AD-4）：per-turn 一条 JSON。
+
+        Lua 单 roundtrip：RPUSH 右进 list ``weiliao:session:{id}:transcript``
+        → LTRIM 截断保留最近 ``TRANSCRIPT_KEEP_TURNS`` 轮（右进左出）→
+        EXPIRE 刷新（TTL 与会话一致，key 过期即从零开始）。条目 JSON：
+        turn / buyer_message / agent_reply / timestamp（ISO8601）。
+        写失败不吞异常：调用方（HTTP 入口）经 try 包裹 fail-safe，仅
+        告警不影响买家应答。
+        """
+        entry = json.dumps(
+            {
+                "turn": turn,
+                "buyer_message": buyer_message,
+                "agent_reply": agent_reply,
+                "timestamp": timestamp.isoformat(),
+            },
+            ensure_ascii=False,
+        )
+        self._record_transcript_script(
+            keys=[self._transcript_key(session_id)],
+            args=[entry, TRANSCRIPT_KEEP_TURNS, self._ttl_seconds],
+        )
+
+    def read_transcript(self, session_id: str, limit: int) -> list[TranscriptTurn]:
+        """只读最近 ``limit`` 条历史转写（list 尾部，旧→新序）；key 不
+        存在返回空清单。损坏条目防御为空白 ``TranscriptTurn``（绝不抛错，
+        防御非本模块写入）。"""
+        if limit <= 0:
+            return []
+        raw_entries = self._client.lrange(self._transcript_key(session_id), -limit, -1)
+        return [self._parse_transcript_turn(raw) for raw in raw_entries]
+
     def write_intent(
         self,
         session_id: str,
@@ -286,6 +370,43 @@ class SessionManager:
     @staticmethod
     def _key(session_id: str) -> str:
         return f"{KEY_PREFIX}{session_id}"
+
+    @staticmethod
+    def _transcript_key(session_id: str) -> str:
+        return f"{KEY_PREFIX}{session_id}:transcript"
+
+    @staticmethod
+    def _parse_transcript_turn(raw: str | bytes) -> TranscriptTurn:
+        """单条转写 JSON 防御解析：坏 JSON / 非 dict / 字段类型不符一律
+        归一为空白条目（与 ``_parse_conditions`` 同口径）。"""
+        text = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return TranscriptTurn(None, None, None, None)
+        if not isinstance(parsed, dict):
+            return TranscriptTurn(None, None, None, None)
+
+        def _optional_str(value: object) -> str | None:
+            return value if isinstance(value, str) else None
+
+        raw_turn = parsed.get("turn")
+        turn = (
+            raw_turn
+            if isinstance(raw_turn, int) and not isinstance(raw_turn, bool)
+            else None
+        )
+        timestamp: datetime | None = None
+        raw_timestamp = parsed.get("timestamp")
+        if isinstance(raw_timestamp, str):
+            with suppress(ValueError):
+                timestamp = datetime.fromisoformat(raw_timestamp)
+        return TranscriptTurn(
+            turn=turn,
+            buyer_message=_optional_str(parsed.get("buyer_message")),
+            agent_reply=_optional_str(parsed.get("agent_reply")),
+            timestamp=timestamp,
+        )
 
     @staticmethod
     def _decode(value: str | bytes) -> str:

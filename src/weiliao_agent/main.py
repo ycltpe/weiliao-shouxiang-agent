@@ -81,6 +81,17 @@ NEGOTIATION,LOAN_POLICY,COMPLAINT、解析为空或含未知意图标签 fail-fa
 带变量名；``WEILIAO_HANDOFF_NEGATIVE_WORDS_PATH`` 缺省仓库内置词表
 （``handoff/negative_words.txt``，风控中台产出发布），文件不可读或
 无词条 fail-fast 带变量名（加载失败启动即败，不静默放行）。
+
+Story 5.2 组合根：转人工单向指令发送器（``handoff.command.
+HandoffCommandSender``，AD-7 先指令后通知——编排器出口分支先发送
+转交指令、后返回安抚文案）注入编排器。复用 ``WEILIAO_KAFKA_BROKERS``
+门控（与消费者同口径）：非空才装配发送器（本地开发/测试零 broker 时
+注入 None，出口分支跳过发送、文案语义不变）。``WEILIAO_HANDOFF_KAFKA_TOPIC``
+缺省 handoff.commands、``WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC`` 缺省
+handoff.commands.dlq，strip 后为空或与指令 topic 相同 fail-fast 带
+变量名（后者防死信写进 live topic）。发送器后台事件循环线程与
+producer start/stop 归 lifespan 托管（装配期零网络触达）；producer
+启动失败不拖垮服务——ERROR 告警 + 禁用发送器。
 """
 
 import asyncio
@@ -107,6 +118,7 @@ from weiliao_agent.filters.risk_review import (
     RiskReviewClient,
     RiskReviewFilter,
 )
+from weiliao_agent.handoff.command import HandoffCommandSender
 from weiliao_agent.handoff.trigger import HardTriggerAssessor, load_negative_words
 from weiliao_agent.llm.circuit_breaker import LlmCircuitBreaker
 from weiliao_agent.llm.client import OpenAiGenerationClient
@@ -425,6 +437,54 @@ _handoff_assessor = HardTriggerAssessor(
 )
 
 
+# ---- Story 5.2：转人工单向指令（Kafka producer 装配） ----
+
+# 指令 topic：缺省 handoff.commands；strip 后为空 fail-fast（错误消息
+# 带变量名）——空 topic 会让 producer 发送即败，配置错误拒绝启动。
+_HANDOFF_TOPIC_RAW = os.environ.get("WEILIAO_HANDOFF_KAFKA_TOPIC", "handoff.commands")
+_HANDOFF_KAFKA_TOPIC = _HANDOFF_TOPIC_RAW.strip()
+if not _HANDOFF_KAFKA_TOPIC:
+    msg = (
+        f"WEILIAO_HANDOFF_KAFKA_TOPIC must be a non-empty topic, "
+        f"got {_HANDOFF_TOPIC_RAW!r}"
+    )
+    raise ValueError(msg)
+
+# DLQ topic：缺省 handoff.commands.dlq（独立死信队列）；strip 后为空
+# fail-fast；与指令 topic 相同 fail-fast（构造器同口径拦截，死信写进
+# live topic 且告警误导——评审轮次 1 补丁）。
+_HANDOFF_DLQ_TOPIC_RAW = os.environ.get(
+    "WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC", "handoff.commands.dlq"
+)
+_HANDOFF_KAFKA_DLQ_TOPIC = _HANDOFF_DLQ_TOPIC_RAW.strip()
+if not _HANDOFF_KAFKA_DLQ_TOPIC:
+    msg = (
+        f"WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC must be a non-empty topic, "
+        f"got {_HANDOFF_DLQ_TOPIC_RAW!r}"
+    )
+    raise ValueError(msg)
+if _HANDOFF_KAFKA_DLQ_TOPIC == _HANDOFF_KAFKA_TOPIC:
+    msg = (
+        f"WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC must differ from "
+        f"WEILIAO_HANDOFF_KAFKA_TOPIC, both are {_HANDOFF_KAFKA_DLQ_TOPIC!r}"
+    )
+    raise ValueError(msg)
+
+# 发送器装配：复用 WEILIAO_KAFKA_BROKERS 门控（与消费者同口径）——
+# broker 未配置（本地开发/测试）不创建发送器，编排器注入 None，出口
+# 分支跳过发送、出口文案语义不变。装配期零网络触达：后台事件循环
+# 线程与 producer start/stop 归 lifespan 托管。
+_KAFKA_BROKERS = os.environ.get("WEILIAO_KAFKA_BROKERS")
+_handoff_command_sender: HandoffCommandSender | None = None
+if _KAFKA_BROKERS:
+    _handoff_command_sender = HandoffCommandSender.kafka(
+        brokers=_KAFKA_BROKERS,
+        topic=_HANDOFF_KAFKA_TOPIC,
+        dlq_topic=_HANDOFF_KAFKA_DLQ_TOPIC,
+        transcript_reader=_session_manager.read_transcript,
+    )
+
+
 async def _metrics_log_loop() -> None:
     """定时发射缓存/审核/熔断器/模型路由结构化日志（first 发射在首个
     间隔之后）；跌破审核阈值、熔断器非 closed、路由收紧态时同循环追加
@@ -439,26 +499,43 @@ async def _metrics_log_loop() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: object) -> AsyncIterator[None]:
-    """托管 Story 3.2 消费者任务；broker 未配置时消费者不创建。"""
+    """托管 Story 3.2 消费者任务与 Story 5.2 指令发送器生命周期。
+
+    broker 未配置时消费者不创建、发送器不 start；发送器 producer
+    启动失败不拖垮服务——ERROR 告警 + 禁用（出口分支跳过发送，
+    出口文案语义不变）。
+    """
     consumer: HouseSyncConsumer | None = None
     consumer_task: asyncio.Task[None] | None = None
     metrics_task: asyncio.Task[None] | None = None
-    brokers = os.environ.get("WEILIAO_KAFKA_BROKERS")
-    if brokers:
+    # 消费者门控运行期读 env（既有测试 monkeypatch env 的口径）；发送器
+    # 装配期门控见模块级 _KAFKA_BROKERS（import 时定版）。
+    if os.environ.get("WEILIAO_KAFKA_BROKERS"):
         consumer = HouseSyncConsumer(
             L0CacheClient(_redis_client),
             source=KafkaMessageSource(
-                brokers=brokers,
+                brokers=os.environ["WEILIAO_KAFKA_BROKERS"],
                 topic=os.environ.get("WEILIAO_KAFKA_TOPIC", "house.sync.trigger"),
                 group_id=os.environ.get("WEILIAO_KAFKA_GROUP_ID", "weiliao-house-sync"),
             ),
         )
         consumer_task = asyncio.create_task(consumer.run())
+    if _handoff_command_sender is not None:
+        try:
+            await asyncio.to_thread(_handoff_command_sender.start)
+        except Exception as exc:  # 启动失败不拖垮服务：禁用 + ERROR 告警
+            logger.error(
+                "handoff_command_alert producer start failed; sender disabled: %s",
+                exc,
+            )
+            _handoff_command_sender.disable()
     metrics_task = asyncio.create_task(_metrics_log_loop())
     yield
     metrics_task.cancel()
     with suppress(asyncio.CancelledError):
         await metrics_task
+    if _handoff_command_sender is not None:
+        await asyncio.to_thread(_handoff_command_sender.close)
     if consumer is not None and consumer_task is not None:
         await consumer.stop()
         try:
@@ -495,7 +572,9 @@ app = create_app(
             ),
             RiskReviewFilter(client=_risk_review_client),
             ResponseAssemblerFilter(),
-        ]
+        ],
+        # Story 5.2（AD-7）：None（broker 未配置）时出口分支跳过发送。
+        handoff_sender=_handoff_command_sender,
     ),
     _session_manager,
 )

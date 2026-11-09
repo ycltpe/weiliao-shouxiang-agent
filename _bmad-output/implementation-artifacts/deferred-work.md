@@ -80,3 +80,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-5-1-hard-trigger-handoff-judgment.md`
   summary: handoff 状态经 mark_handoff 落盘 Redis 后无任何读取方——转人工后同 session 的后续消息仍重建信封走完整 AI 管道，"转人工后 Agent 响应路径关闭、避免人机混答"未在 5.1  enforced。
   evidence: 5.1 冻结块 Never 明确 Kafka 指令与买家安抚归 5.2/5.3，会话响应路径关闭（原子终态）属 Story 5.3 范畴；评审轮 1 triage #9 裁决 medium、route defer。settle：Story 5.3 实现原子终态时，在入口/编排器消费 handoff_status（权威值在 Redis，经 SessionManager 读取）短路后续消息，并补"转人工后零 AI 回复"的端到端测试。
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-2-kafka-handoff-unidirectional-command.md`
+  summary: 同 session 连续命中硬触发会产生多条转交指令，无每会话一次节流
+  evidence: 5.2 盲审#4；转人工后 session 响应路径关闭属 Story 5.3 原子终态范畴（5.1 评审#9 已 defer 同根问题），5.3 收口后自然消除；当前每命中即触发符合 Epic「命中任一即立即触发」口径。

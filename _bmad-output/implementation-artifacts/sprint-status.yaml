@@ -76,7 +76,7 @@ development_status:
   epic-4-retrospective: optional
   epic-5: in-progress
   5-1-硬触发条件判定: review
-  5-2-Kafka-转人工单向指令: backlog
+  5-2-Kafka-转人工单向指令: review
   5-3-转人工原子终态与买家安抚通知: backlog
   5-4-AI-身份披露标识: backlog
   epic-5-retrospective: optional

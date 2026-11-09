@@ -7,10 +7,17 @@
 前赋值，AD-4 单写者）；Redis 故障 fail-closed：兜底应答 + 原 trace_id，
 HTTP 非 5xx。未注入 SessionManager（如测试）则跳过会话步骤。鉴权/限流等
 横切能力与 Kafka 接入不在本 Story 范围。
+
+Story 5.2 转写挂点：管道返回后经 SessionManager 记录本轮转写（买家
+原文 + 最终回复，AD-4 单写者）——转人工指令 payload 的会话上下文权威
+来源；编排器逃逸兜底路径同样落转写（评审轮次 1 补丁：降级轮次不得
+从上下文缺失）。写失败仅告警，绝不改变应答（仅追加，不改既有
+fail-closed 语义）。
 """
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import redis
@@ -46,6 +53,36 @@ def _fallback_result(
         degraded=True,
         failed_filter=None,
     )
+
+
+def _record_transcript(
+    session_manager: SessionManager | None,
+    envelope: Envelope,
+    reply: str,
+) -> None:
+    """本轮转写落盘（Story 5.2，AD-4 单写者）：买家原文 + 最终回复。
+
+    正常路径与编排器逃逸兜底路径共用（降级轮次也入上下文，后续
+    handoff 不缺轮）；未注入 SessionManager（测试替身）跳过；写失败
+    仅告警，绝不改变应答。
+    """
+    if session_manager is None:
+        return
+    try:
+        session_manager.record_transcript(
+            envelope.session_id,
+            turn=envelope.turn,
+            buyer_message=envelope.message,
+            agent_reply=reply,
+            timestamp=datetime.now(UTC),
+        )
+    except redis.RedisError:
+        logger.warning(
+            "transcript record failed session_id=%s trace_id=%s; reply unaffected",
+            envelope.session_id,
+            envelope.trace_id,
+            exc_info=True,
+        )
 
 
 def create_app(
@@ -131,9 +168,14 @@ def create_app(
             # 自带值，置 None 防止客户端伪造序号混入管道。
             envelope.turn = None
         try:
-            return orchestrator_.run(envelope).to_dict()
+            result = orchestrator_.run(envelope)
         except Exception:
-            # 编排器逃逸异常兜底：买家侧永不暴露 5xx。
-            return _fallback_result(envelope.intent, envelope.trace_id).to_dict()
+            # 编排器逃逸异常兜底：买家侧永不暴露 5xx；降级轮次同样落
+            # 转写（评审轮次 1 补丁），后续 handoff 上下文不缺轮。
+            fallback = _fallback_result(envelope.intent, envelope.trace_id)
+            _record_transcript(session_manager_, envelope, fallback.reply)
+            return fallback.to_dict()
+        _record_transcript(session_manager_, envelope, result.reply)
+        return result.to_dict()
 
     return app

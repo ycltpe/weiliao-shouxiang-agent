@@ -27,10 +27,12 @@ Langfuse 追踪）；消息级 trace 上下文包裹整条链；每过滤器执�
 trace_id 且 ``degraded=True``。
 """
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass
+from typing import Protocol
 
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.filters.cache_lookup import CacheLookupFilter
@@ -57,6 +59,21 @@ LLM_GENERATE_BUDGET_SECONDS = 0.9
 # （AD-10 前缀统一注入归 Story 5.4）。
 HANDOFF_REPLY_TEXT = "已为您转接经纪人，请稍候"
 
+logger = logging.getLogger(__name__)
+
+
+class HandoffCommandSender(Protocol):
+    """Story 5.2 转交指令发送器协议（AD-7）：编排器只依赖本协议，组合根
+    注入 ``handoff.command.HandoffCommandSender``（或测试替身）。
+
+    ``send_command`` 为同步有界阻塞调用：返回即「发送完成或重试耗尽
+    归一 DLQ」——编排器据此保证严格先指令后通知。实现须 fail-safe：
+    任何发送失败不得抛出、不得改变买家应答。
+    """
+
+    def send_command(self, envelope: Envelope, *, reply: str) -> None:
+        """发送转交指令（reply 为当前轮 Agent 回复原文，供上下文拼轮）。"""
+
 
 @dataclass(frozen=True)
 class PipelineResult:
@@ -79,6 +96,7 @@ class PipelineOrchestrator:
         self,
         filters: list[Filter] | None = None,
         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+        handoff_sender: HandoffCommandSender | None = None,
     ) -> None:
         self._filters: list[Filter] = (
             filters
@@ -98,6 +116,9 @@ class PipelineOrchestrator:
             ]
         )
         self._budget_seconds = budget_seconds
+        # Story 5.2（AD-7）：None（broker 未配置）时出口分支跳过发送，
+        # 出口文案语义不变（与消费者门控同口径）。
+        self._handoff_sender = handoff_sender
 
     @property
     def filter_names(self) -> tuple[str, ...]:
@@ -154,7 +175,7 @@ class PipelineOrchestrator:
                         # 硬触发命中（Story 5.1，AD-12）：短路剩余过滤
                         # 器——cache/llm/risk/assembler 零执行，红线意图
                         # 100% 无生成回答；走转人工出口分支回固定文案。
-                        return self._handoff_result(trace_id)
+                        return self._handoff_result(envelope)
                 except FutureTimeoutError:
                     return self._degraded(envelope, trace_id, slow_filter=filter_.name)
                 except Exception:
@@ -186,15 +207,32 @@ class PipelineOrchestrator:
             failed_filter=None,
         )
 
-    @staticmethod
-    def _handoff_result(trace_id: str) -> PipelineResult:
+    def _handoff_result(self, envelope: Envelope) -> PipelineResult:
         """转人工出口分支（Story 5.1 决策 Q1-A）：固定专用文案直接下发。
 
         非降级（设计内分支，failed_filter 为 None）：降级事件属故障
         归因，转人工是正常合规出口；判定过程已由 intent_router 记
         ``handoff.assessment`` trace 事件，最终下发文本仍由 run() 的
         ``record_delivery`` 补记。
+
+        Story 5.2（AD-7 严格先指令后通知）：发送器注入时先构建并发送
+        转交指令（conditions 过滤 assessment_error 哨兵由发送器内收口），
+        发送完成（或重试耗尽归一 DLQ）后才返回安抚文案；发送器为 None
+        跳过发送。发送器自身 fail-safe，本分支再包一层防御：任何逃逸
+        异常不得改变应答（绝不降级为模板兜底）。
         """
+        if self._handoff_sender is not None:
+            try:
+                self._handoff_sender.send_command(envelope, reply=HANDOFF_REPLY_TEXT)
+            except Exception:
+                # 防御层（发送器契约已承诺不抛）：指令发送失败绝不影响
+                # 买家应答，出口文案语义逐字节不变。
+                logger.warning(
+                    "handoff command sender raised unexpectedly; reply unchanged",
+                    exc_info=True,
+                )
+        trace_id = envelope.trace_id
+        assert trace_id is not None  # _run_chain 已权威回填，供 mypy 收窄
         return PipelineResult(
             reply=HANDOFF_REPLY_TEXT,
             trace_id=trace_id,

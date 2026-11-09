@@ -639,6 +639,67 @@ def test_lifespan_forces_cancel_on_blocking_consumer(
     assert any("forcing cancel" in record.message for record in caplog.records)
 
 
+# ---- Story 5.2：转人工指令发送器 lifespan（启动失败禁用 / 关停关闭） ----
+
+
+class _SpyHandoffSender:
+    """HandoffCommandSender 替身：记录 start/close/disable 调用。"""
+
+    def __init__(self, *, start_error: Exception | None = None) -> None:
+        self.start_error = start_error
+        self.started = False
+        self.closed = False
+        self.disabled = False
+
+    def start(self) -> None:
+        self.started = True
+        if self.start_error is not None:
+            raise self.start_error
+
+    def close(self) -> None:
+        self.closed = True
+
+    def disable(self) -> None:
+        self.disabled = True
+
+    def send_command(self, envelope: Any, *, reply: str) -> None:
+        pass  # lifespan 测试不触发出口分支
+
+
+def test_lifespan_sender_start_failure_disables_sender(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """验证缺口修补（评审轮次 1）：producer start 失败不得拖垮服务——
+    ERROR 告警 + sender.disable()（出口分支跳过发送，文案语义不变）。
+    删掉 disable 一行本测试即红。"""
+    sender = _SpyHandoffSender(start_error=RuntimeError("connect boom"))
+    monkeypatch.setattr(main_module, "_handoff_command_sender", sender)
+    with (
+        caplog.at_level(logging.ERROR, logger="weiliao_agent.main"),
+        TestClient(main_module.app),
+    ):
+        assert sender.started
+        assert sender.disabled is True
+    alerts = [
+        record
+        for record in caplog.records
+        if "handoff_command_alert" in record.message
+    ]
+    assert len(alerts) == 1
+    assert alerts[0].levelno == logging.ERROR
+
+
+def test_lifespan_closes_sender_on_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证缺口修补（评审轮次 1）：lifespan 退出须关闭发送器
+    （后台事件循环线程 + producer 回收，不悬挂进程）。"""
+    sender = _SpyHandoffSender()
+    monkeypatch.setattr(main_module, "_handoff_command_sender", sender)
+    with TestClient(main_module.app):
+        assert sender.started
+        assert sender.closed is False
+    assert sender.closed is True
+
+
 def test_lifespan_runs_and_cancels_metrics_log_loop(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

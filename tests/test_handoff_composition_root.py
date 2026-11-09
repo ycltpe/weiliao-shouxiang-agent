@@ -22,6 +22,9 @@ _SCRUB_VARS = (
     "WEILIAO_HANDOFF_FOLLOWUP_THRESHOLD",
     "WEILIAO_HANDOFF_REDLINE_INTENTS",
     "WEILIAO_HANDOFF_NEGATIVE_WORDS_PATH",
+    "WEILIAO_HANDOFF_KAFKA_TOPIC",
+    "WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC",
+    "WEILIAO_KAFKA_BROKERS",
 )
 
 
@@ -113,3 +116,76 @@ def test_valid_handoff_env_reaches_assessor(tmp_path: Path) -> None:
     assert lines[0] == "2"
     assert lines[1] == "['COMPLAINT', 'GREETING']"
     assert lines[2] == "['定制负面词']"
+
+
+# ---- Story 5.2：转交指令 Kafka topic env fail-fast 与装配 ----
+
+
+@pytest.mark.parametrize(
+    "var", ("WEILIAO_HANDOFF_KAFKA_TOPIC", "WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC")
+)
+def test_empty_handoff_kafka_topic_fails_startup_with_variable_name(var: str) -> None:
+    # strip 后为空的 topic（空串/纯空白）会让 producer 发送即败——
+    # 配置错误拒绝启动（错误消息带变量名），不静默放行。
+    result = _import_main({var: "   "})
+    assert result.returncode != 0
+    assert var.encode() in result.stderr
+
+
+def test_dlq_topic_colliding_with_live_topic_fails_startup() -> None:
+    # 评审轮次 1 补丁：DLQ topic 与指令 topic 相同会让死信写进 live
+    # topic 且告警误导——装配期 fail-fast（两变量名均须出现）。
+    result = _import_main(
+        {
+            "WEILIAO_HANDOFF_KAFKA_TOPIC": "same.topic",
+            "WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC": "same.topic",
+        }
+    )
+    assert result.returncode != 0
+    assert b"WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC" in result.stderr
+    assert b"WEILIAO_HANDOFF_KAFKA_TOPIC" in result.stderr
+
+
+def test_default_config_imports_cleanly_without_brokers() -> None:
+    # broker 未配置（本地开发/测试）：发送器不装配（None），缺省 topic
+    # 仅解析不校验通过——与消费者门控同口径，导入即装配零网络。
+    result = _import_main(
+        {},
+        program=(
+            "import weiliao_agent.main as m; "
+            "print(m._handoff_command_sender is None); "
+            "print(m._HANDOFF_KAFKA_TOPIC); "
+            "print(m._HANDOFF_KAFKA_DLQ_TOPIC)"
+        ),
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    lines = result.stdout.decode().splitlines()
+    assert lines == ["True", "handoff.commands", "handoff.commands.dlq"]
+
+
+def test_valid_handoff_kafka_env_reaches_sender_and_orchestrator() -> None:
+    """验证缺口修补：合法 env 值须真的落到发送器并注入编排器（防死
+    配置面）。"""
+    result = _import_main(
+        {
+            "WEILIAO_KAFKA_BROKERS": "localhost:9092",
+            "WEILIAO_HANDOFF_KAFKA_TOPIC": "handoff.cmd",
+            "WEILIAO_HANDOFF_KAFKA_DLQ_TOPIC": "handoff.cmd.dlq",
+        },
+        program=(
+            "import weiliao_agent.main as m; "
+            "from weiliao_agent.pipeline import PipelineOrchestrator; "
+            "s = m._handoff_command_sender; "
+            "print(s.topic); "
+            "print(s.dlq_topic); "
+            "route = next(r for r in m.app.routes "
+            "             if getattr(r, 'path', '') == '/v1/messages'); "
+            "cells = route.endpoint.__closure__ or (); "
+            "orch = next(c.cell_contents for c in cells "
+            "            if isinstance(c.cell_contents, PipelineOrchestrator)); "
+            "print(orch._handoff_sender is s)"
+        ),
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    lines = result.stdout.decode().splitlines()
+    assert lines == ["handoff.cmd", "handoff.cmd.dlq", "True"]

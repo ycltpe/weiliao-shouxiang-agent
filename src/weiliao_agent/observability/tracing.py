@@ -60,6 +60,10 @@ _STATUS_MESSAGE_LIMIT = 500
 # 四值 Literal 权威定义，拼错即静态报错，防 ERROR 词被静默降级 DEFAULT。
 HouseSyncOperation = Literal["consumed", "stale_alert", "corrupted", "failure"]
 
+# ``handoff.command`` 发送事件 operation 词表（Story 5.2，AD-7）：三值
+# Literal 权威定义（同 HouseSyncOperation 先例），拼错即静态报错。
+HandoffCommandOperation = Literal["sent", "failed", "dlq"]
+
 # 惰性单例缓存（get_client 内部按 public_key 单例）；测试可经
 # ``set_langfuse_client`` 注入替身或重置回 None 走惰性初始化。
 _client: Langfuse | None = None
@@ -485,6 +489,43 @@ def record_handoff_mark_failed(trace_id: str | None) -> None:
             metadata={
                 "event": "handoff_mark_failed",
                 "reason": "handoff_mark_failed",
+            },
+        )
+
+
+def record_handoff_command(
+    trace_id: str | None,
+    *,
+    operation: HandoffCommandOperation,
+    attempts: int,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """转人工指令发送事件（Story 5.2，AD-7）：sent / failed / dlq 三事件。
+
+    sent 为 DEFAULT 级（设计内单向出口）；failed（重试耗尽，含阻塞
+    预算耗尽归一）与 dlq（死信写入）为 ERROR 级。保留键（event /
+    operation / attempts）由本函数权威写入，调用方 ``metadata`` 一律
+    挂于独立 ``metadata`` 子键（同 ``record_cache_event`` 评审口径）。
+    fail-safe 口径同 ``record_handoff_assessment``：记录本身再抛异常
+    也吞掉，绝不二次影响买家应答。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    level: Literal["DEFAULT", "ERROR"] = "ERROR" if operation != "sent" else "DEFAULT"
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name=f"handoff.command.{operation}",
+            level=level,
+            metadata={
+                "event": "handoff_command",
+                "operation": operation,
+                "attempts": attempts,
+                "metadata": dict(metadata or {}),
             },
         )
 
