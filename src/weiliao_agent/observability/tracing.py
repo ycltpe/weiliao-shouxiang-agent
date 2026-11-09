@@ -37,6 +37,10 @@ context 传播（spec Never 约束）。
 命中全量记录（未命中 DEFAULT 级，支撑漏判审计）；触发为 WARNING 级
 （设计内转人工，非故障）；判定代码自身异常 fail-closed 按触发处理，
 ERROR 级并携带 error 归因。
+
+终态闸门事件（Story 5.3）：已转接会话再收买家消息时入口适配器短路
+（编排器零执行），``record_already_handed_off`` 补挂 WARNING 级事件——
+消息不进入管道、无二次转交指令、回固定安抚文案，全程可审计。
 """
 
 import re
@@ -526,6 +530,39 @@ def record_handoff_command(
                 "operation": operation,
                 "attempts": attempts,
                 "metadata": dict(metadata or {}),
+            },
+        )
+
+
+def record_already_handed_off(
+    trace_id: str | None,
+    *,
+    session_id: str,
+    turn: int | None,
+) -> None:
+    """终态闸门事件（Story 5.3）：已转接会话再收买家消息时补挂消息 trace。
+
+    事件名 ``handoff.already_handed_off``，WARNING 级（设计内终态分支，
+    非链路故障——与 ``record_handoff_assessment`` 触发同级口径）：
+    消息未进入编排器（过滤器零执行、无二次转交指令），买家收到
+    ``HANDOFF_REPLY_TEXT``。fail-safe 口径同 ``record_handoff_command``：
+    记录本身再抛异常也吞掉，绝不二次影响买家应答。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="handoff.already_handed_off",
+            level="WARNING",
+            metadata={
+                "event": "handoff_already_handed_off",
+                "session_id": session_id,
+                "turn": turn,
             },
         )
 

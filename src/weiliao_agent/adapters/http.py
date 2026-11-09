@@ -13,6 +13,17 @@ Story 5.2 转写挂点：管道返回后经 SessionManager 记录本轮转写（
 来源；编排器逃逸兜底路径同样落转写（评审轮次 1 补丁：降级轮次不得
 从上下文缺失）。写失败仅告警，绝不改变应答（仅追加，不改既有
 fail-closed 语义）。
+
+Story 5.3 终态闸门：``begin_turn`` 快照的 ``handoff_status`` 为
+``"triggered"`` 时消息不再进入编排器（intent_router/cache/llm/risk/
+assembler 全零执行，无二次转交指令），直接回固定安抚文案
+``HANDOFF_REPLY_TEXT``（Q1-A 与触发轮出口同一文案口径）；trace_id
+缺失即生成回填；记 Langfuse 闸门事件 + WARNING 日志（可审计，记录
+本身 fail-safe）；闸门轮不落转写（无 agent 回复，逐对语义）。闸门
+应答 ``degraded=False``（设计内终态分支，非故障降级）。快照出现
+未知值（非 ``"none"``/``"triggered"``，如 Redis 损坏数据）一律
+fail-closed：与 ``begin_turn`` 失败同一兜底口径（degraded 模板兜底、
+不落转写、不进编排器）——拿不准就回既有兜底，绝不人机混答。
 """
 
 import logging
@@ -36,7 +47,12 @@ from weiliao_agent.health import (
 )
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.models.intent import IntentTag
-from weiliao_agent.pipeline import PipelineOrchestrator, PipelineResult
+from weiliao_agent.observability import tracing
+from weiliao_agent.pipeline import (
+    HANDOFF_REPLY_TEXT,
+    PipelineOrchestrator,
+    PipelineResult,
+)
 from weiliao_agent.session import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -163,6 +179,48 @@ def create_app(
                 # 照常上抛，不静默降级掩盖缺陷。
                 return _fallback_result(envelope.intent, envelope.trace_id).to_dict()
             envelope.turn = snapshot.turn
+            if snapshot.handoff_status == "triggered":
+                # Story 5.3 终态闸门：已转接会话的消息不进入编排器——
+                # 过滤器全零执行、无二次转交指令（收口 5.2 评审 #18），
+                # 回固定安抚文案（Q1-A，与触发轮出口逐字节一致）；
+                # degraded=False（设计内终态分支）。trace_id 缺失即
+                # 生成回填（与编排器入口同一权威口径）。闸门轮不落
+                # 转写：转写是 buyer/agent 逐对原文，无 agent 回复的
+                # 轮次混入会污染工作台上下文。事件记录与日志均
+                # fail-safe，绝不改变应答。
+                if envelope.trace_id is None:
+                    envelope.trace_id = tracing.new_trace_id()
+                tracing.record_already_handed_off(
+                    envelope.trace_id,
+                    session_id=envelope.session_id,
+                    turn=envelope.turn,
+                )
+                logger.warning(
+                    "session already handed off; gate short-circuits pipeline "
+                    "session_id=%s trace_id=%s turn=%s",
+                    envelope.session_id,
+                    envelope.trace_id,
+                    envelope.turn,
+                )
+                return PipelineResult(
+                    reply=HANDOFF_REPLY_TEXT,
+                    trace_id=envelope.trace_id,
+                    degraded=False,
+                    failed_filter=None,
+                ).to_dict()
+            elif snapshot.handoff_status != "none":
+                # 未知 handoff_status（Redis 损坏值/未来新增状态未识别）：
+                # fail-closed 与 begin_turn 失败同一兜底口径——模板兜底、
+                # 原 trace_id、degraded=True、不落转写、不进编排器。
+                logger.warning(
+                    "unknown handoff_status=%r; fail-closed fallback "
+                    "session_id=%s trace_id=%s turn=%s",
+                    snapshot.handoff_status,
+                    envelope.session_id,
+                    envelope.trace_id,
+                    envelope.turn,
+                )
+                return _fallback_result(envelope.intent, envelope.trace_id).to_dict()
         else:
             # 无会话管理器（测试替身）时 turn 无权威来源：不信任 payload
             # 自带值，置 None 防止客户端伪造序号混入管道。
