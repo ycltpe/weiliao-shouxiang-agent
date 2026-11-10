@@ -16,6 +16,15 @@ Langfuse 追踪）；消息级 trace 上下文包裹整条链；每过滤器执�
 主线程侧包 span；降级路径写降级事件；管道完成后补记最终下发文本。
 全部追踪 fail-safe，未配置 Langfuse 时 no-op，编排与兜底语义不变。
 
+Story 5.5 编排器级终态闸门：``run()`` 入口在 trace_id 回填后、打开
+trace 上下文之前，经注入的 ``HandoffStatusReader`` 实读 Redis 权威
+``handoff_status``——``"triggered"`` 即短路（零过滤器执行、零 LLM、
+零模板兜底），应答/事件/日志与 5.3 http 适配器闸门共享同一构建
+来源（``handoff_gate_result``）；未知值与读取失败 fail-closed
+既有兜底（degraded 模板兜底 + 原 trace_id），绝不人机混答；未注入
+reader 时闸门禁用，行为与 5.5 前逐字节一致。5.3 适配器闸门保留
+不动（HTTP 主流径），编排器闸门为覆盖全部直接调用入口的权威关闭点。
+
 统一错误兜底：
 - 任一过滤器抛异常 → 捕获并降级模板兜底，跳过剩余过滤器；
 - 端到端 deadline（默认内部预算 2.5s，为 NFR-1 P99 < 3s 留出口余量，
@@ -78,6 +87,21 @@ class HandoffCommandSender(Protocol):
         """发送转交指令（reply 为当前轮 Agent 回复原文，供上下文拼轮）。"""
 
 
+class HandoffStatusReader(Protocol):
+    """Story 5.5 终态闸门状态读取协议：编排器只依赖本窄协议（同
+    ``HandoffCommandSender`` 先例），组合根注入 ``SessionManager``
+    （或测试替身）。
+
+    ``read_handoff_status`` 为 Redis 权威实读（不缓存、不读 L1 快照）：
+    返回 ``"triggered"`` / ``"none"`` 等状态值，key 或字段缺失返回
+    None（会话过期语义）。实现不吞异常：读取失败由编排器闸门
+    fail-closed 收口。
+    """
+
+    def read_handoff_status(self, session_id: str) -> str | None:
+        """实读会话 ``handoff_status`` 权威值；缺失返回 None。"""
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     """管道执行结果：买家侧应答与降级元数据。"""
@@ -92,6 +116,42 @@ class PipelineResult:
         return asdict(self)
 
 
+def handoff_gate_result(
+    trace_id: str,
+    *,
+    session_id: str,
+    turn: int | None,
+) -> PipelineResult:
+    """终态闸门共享出口（Story 5.5）：构建闸门 ``PipelineResult`` 并留痕。
+
+    编排器闸门与 5.3 http 适配器闸门两处同字节出口的公开共享契约
+    （跨模块导入，防漂移）：reply 逐字节为 ``前缀+HANDOFF_REPLY_TEXT``，
+    degraded=False（设计内终态分支）；记 ``already_handed_off`` 与
+    ``ai.disclosure``（disclosed=True）事件 + WARNING 日志（可审计，
+    记录本身 fail-safe，绝不改变应答）。无 ``record_delivery`` 事件
+    （消息未进管道）。
+    """
+    tracing.record_already_handed_off(
+        trace_id,
+        session_id=session_id,
+        turn=turn,
+    )
+    tracing.record_ai_disclosure(trace_id, disclosed=True)
+    logger.warning(
+        "session already handed off; gate short-circuits pipeline "
+        "session_id=%s trace_id=%s turn=%s",
+        session_id,
+        trace_id,
+        turn,
+    )
+    return PipelineResult(
+        reply=f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}",
+        trace_id=trace_id,
+        degraded=False,
+        failed_filter=None,
+    )
+
+
 class PipelineOrchestrator:
     """顺序编排五过滤器链，统一异常捕获与逐跳 deadline 预算。"""
 
@@ -100,6 +160,7 @@ class PipelineOrchestrator:
         filters: list[Filter] | None = None,
         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
         handoff_sender: HandoffCommandSender | None = None,
+        handoff_status_reader: HandoffStatusReader | None = None,
     ) -> None:
         self._filters: list[Filter] = (
             filters
@@ -126,6 +187,9 @@ class PipelineOrchestrator:
         # Story 5.2（AD-7）：None（broker 未配置）时出口分支跳过发送，
         # 出口文案语义不变（与消费者门控同口径）。
         self._handoff_sender = handoff_sender
+        # Story 5.5：终态闸门状态读取引用。None（未注入，本地/测试
+        # 组装）时闸门禁用——行为与 5.5 之前逐字节一致。
+        self._handoff_status_reader = handoff_status_reader
 
     @property
     def filter_names(self) -> tuple[str, ...]:
@@ -138,6 +202,51 @@ class PipelineOrchestrator:
         # 十六进制，Langfuse trace id 口径）；payload 携带值透传。
         if envelope.trace_id is None:
             envelope.trace_id = tracing.new_trace_id()
+        trace_id = envelope.trace_id  # mypy 收窄：上方已权威回填
+        # Story 5.5 编排器级终态闸门：对直接调用 run() 的入口（绕过
+        # 5.3 http 适配器闸门）实读 Redis 权威 handoff_status——
+        # 已转接会话绝不进 AI 管道（防人机混答，FR-12 红线）。判定
+        # 只认 Redis 实读（不缓存、不读 L1 快照）；未知值与读取失败
+        # 一律 fail-closed 既有兜底（绝不放行管道）。
+        if self._handoff_status_reader is not None:
+            try:
+                handoff_status = self._handoff_status_reader.read_handoff_status(
+                    envelope.session_id
+                )
+            except Exception:
+                # reader 读取失败（Redis 故障、解码错误等任何异常——
+                # HandoffStatusReader 契约：读取失败由编排器闸门
+                # fail-closed 收口）与未知状态值同一兜底口径（degraded
+                # 模板兜底 + 原 trace_id），绝不人机混答、绝不向上抛。
+                return self._degraded(
+                    envelope, trace_id, failed_filter="handoff_gate"
+                )
+            if handoff_status == "triggered":
+                # 短路：不打开 trace_message、不进 _run_chain——全部
+                # 过滤器零执行、零 LLM、零模板兜底，无二次转交指令；
+                # 应答与事件/日志经共享 helper 与 5.3 闸门逐字节一致。
+                return handoff_gate_result(
+                    trace_id,
+                    session_id=envelope.session_id,
+                    turn=envelope.turn,
+                )
+            if handoff_status is not None and handoff_status != "none":
+                # 未知状态值（Redis 损坏值）：fail-closed 与读取失败
+                # 同一兜底口径，绝不放行 AI 管道。
+                logger.warning(
+                    "unknown handoff_status=%r; fail-closed fallback "
+                    "session_id=%s trace_id=%s turn=%s",
+                    handoff_status,
+                    envelope.session_id,
+                    trace_id,
+                    envelope.turn,
+                )
+                return self._degraded(
+                    envelope, trace_id, failed_filter="handoff_gate"
+                )
+            # "none" / None（会话过期）：放行正常管道，行为与 5.5 前
+            # 逐字节一致（编排器不做 begin_turn/会话写，AD-4 单写者
+            # 仍归入口适配器）。
         with tracing.trace_message(
             trace_id=envelope.trace_id,
             session_id=envelope.session_id,

@@ -828,3 +828,48 @@ def test_main_metrics_log_seconds_invalid_fails_fast_at_import(
     monkeypatch.setenv("WEILIAO_METRICS_LOG_SECONDS", raw)
     with pytest.raises(ValueError, match="WEILIAO_METRICS_LOG_SECONDS"):
         importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+
+# ---- Story 5.5：read_handoff_status 只读原语（编排器闸门权威读取） ----
+
+
+def test_read_handoff_status_returns_none_for_missing_key(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # key 不存在（会话过期）：返回 None；纯读不初始化——key 仍不存在。
+    assert manager.read_handoff_status(SESSION_ID) is None
+    assert client.exists(f"{KEY_PREFIX}{SESSION_ID}") == 0
+
+
+def test_read_handoff_status_returns_none_for_missing_field(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    manager.begin_turn(SESSION_ID, TS_1)
+    client.hdel(f"{KEY_PREFIX}{SESSION_ID}", "handoff_status")
+    assert manager.read_handoff_status(SESSION_ID) is None
+
+
+def test_read_handoff_status_does_not_refresh_ttl(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 纯读：不刷新 TTL（压短后读取，TTL 保持压短值——刷新会回到默认）。
+    manager.begin_turn(SESSION_ID, TS_1)
+    client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 模拟中途 TTL 被压短
+    assert manager.read_handoff_status(SESSION_ID) == "none"
+    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == 60
+
+
+def test_read_handoff_status_returns_triggered_verbatim(
+    manager: SessionManager,
+) -> None:
+    manager.mark_handoff(SESSION_ID, conditions=["redline_intent"])
+    assert manager.read_handoff_status(SESSION_ID) == "triggered"
+
+
+def test_read_handoff_status_returns_corrupt_value_verbatim(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 损坏值原样返回（判定归调用方），不做归一化/清洗。
+    manager.begin_turn(SESSION_ID, TS_1)
+    client.hset(f"{KEY_PREFIX}{SESSION_ID}", "handoff_status", "garbage-value")
+    assert manager.read_handoff_status(SESSION_ID) == "garbage-value"

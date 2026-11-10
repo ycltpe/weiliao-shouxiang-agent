@@ -585,6 +585,10 @@ app = create_app(
         ],
         # Story 5.2（AD-7）：None（broker 未配置）时出口分支跳过发送。
         handoff_sender=_handoff_command_sender,
+        # Story 5.5：编排器级终态闸门——实读 Redis 权威 handoff_status，
+        # 对直接调用 run() 的入口关闭响应路径（http 主流径仍由 5.3
+        # 适配器闸门先行拦截）。None 时闸门禁用（无新 env）。
+        handoff_status_reader=_session_manager,
     ),
     _session_manager,
 )

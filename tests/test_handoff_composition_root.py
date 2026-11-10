@@ -189,3 +189,26 @@ def test_valid_handoff_kafka_env_reaches_sender_and_orchestrator() -> None:
     assert result.returncode == 0, result.stderr.decode()
     lines = result.stdout.decode().splitlines()
     assert lines == ["handoff.cmd", "handoff.cmd.dlq", "True"]
+
+
+# ---- Story 5.5：编排器终态闸门 reader 装配 ----
+
+
+def test_handoff_status_reader_wired_to_session_manager() -> None:
+    """验证缺口修补：生产编排器须注入 SessionManager 作终态闸门 reader
+    （防死配置面）——删掉 main.py 的注入行，本测试即红。"""
+    result = _import_main(
+        {},
+        program=(
+            "import weiliao_agent.main as m; "
+            "from weiliao_agent.pipeline import PipelineOrchestrator; "
+            "route = next(r for r in m.app.routes "
+            "             if getattr(r, 'path', '') == '/v1/messages'); "
+            "cells = route.endpoint.__closure__ or (); "
+            "orch = next(c.cell_contents for c in cells "
+            "            if isinstance(c.cell_contents, PipelineOrchestrator)); "
+            "print(orch._handoff_status_reader is m._session_manager)"
+        ),
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.decode().splitlines() == ["True"]

@@ -37,7 +37,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
+from weiliao_agent.filters.templates import render_fallback
 from weiliao_agent.health import (
     cache_metrics_payload,
     is_ready,
@@ -49,9 +49,9 @@ from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.models.intent import IntentTag
 from weiliao_agent.observability import tracing
 from weiliao_agent.pipeline import (
-    HANDOFF_REPLY_TEXT,
     PipelineOrchestrator,
     PipelineResult,
+    handoff_gate_result,
 )
 from weiliao_agent.session import SessionManager
 
@@ -190,32 +190,19 @@ def create_app(
                 # Story 5.3 终态闸门：已转接会话的消息不进入编排器——
                 # 过滤器全零执行、无二次转交指令（收口 5.2 评审 #18），
                 # 回固定安抚文案（Q1-A，携标口径与触发轮出口逐字节
-                # 一致——Story 5.4 决策 Q1-B 前缀由出口处注入，常量
-                # 保持纯文案）；degraded=False（设计内终态分支）。
-                # trace_id 缺失即生成回填（与编排器入口同一权威口径）。
+                # 一致——应答/事件/日志构建收口 pipeline 共享 helper
+                # ``handoff_gate_result``，与编排器级闸门（Story 5.5）
+                # 单一字节来源，防两处漂移）；degraded=False（设计内
+                # 终态分支）。trace_id 缺失即生成回填（与编排器入口
+                # 同一权威口径）。
                 # 闸门轮不落转写：转写是 buyer/agent 逐对原文，无
-                # agent 回复的轮次混入会污染工作台上下文。事件记录
-                # 与日志均 fail-safe，绝不改变应答。
+                # agent 回复的轮次混入会污染工作台上下文。
                 if envelope.trace_id is None:
                     envelope.trace_id = tracing.new_trace_id()
-                tracing.record_already_handed_off(
+                return handoff_gate_result(
                     envelope.trace_id,
                     session_id=envelope.session_id,
                     turn=envelope.turn,
-                )
-                tracing.record_ai_disclosure(envelope.trace_id, disclosed=True)
-                logger.warning(
-                    "session already handed off; gate short-circuits pipeline "
-                    "session_id=%s trace_id=%s turn=%s",
-                    envelope.session_id,
-                    envelope.trace_id,
-                    envelope.turn,
-                )
-                return PipelineResult(
-                    reply=f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}",
-                    trace_id=envelope.trace_id,
-                    degraded=False,
-                    failed_filter=None,
                 ).to_dict()
             elif snapshot.handoff_status != "none":
                 # 未知 handoff_status（Redis 损坏值/未来新增状态未识别）：

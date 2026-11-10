@@ -384,6 +384,18 @@ class SessionManager:
             last_message_at=datetime.fromisoformat(raw_last_message_at),
         )
 
+    def read_handoff_status(self, session_id: str) -> str | None:
+        """只读 ``handoff_status`` 权威值（Story 5.5 编排器终态闸门）：
+        HGET 单 roundtrip，key 或字段缺失返回 None（会话过期即读不到，
+        放行正常管道——从零初始化语义由入口 ``begin_turn`` 承载）。
+        纯读：不刷新 TTL、不初始化字段；损坏值原样返回（判定归调用方）。
+        写失败不吞异常：调用方（编排器闸门）经 try 包裹 fail-closed。
+        """
+        raw = self._client.hget(self._key(session_id), "handoff_status")
+        if raw is None:
+            return None
+        return self._decode(raw)
+
     @staticmethod
     def _parse_conditions(raw: object) -> list[str]:
         """handoff_conditions 权威值解析：缺省/损坏 JSON 防御为空清单。
