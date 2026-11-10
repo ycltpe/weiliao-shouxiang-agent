@@ -103,6 +103,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import redis
+from dotenv import load_dotenv
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.cache.l0_client import L0CacheClient
@@ -144,6 +145,14 @@ REDIS_SOCKET_TIMEOUT_SECONDS = 0.5
 CONSUMER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
+
+# Story 7.1（OQ1=B）：组合根启动早期加载项目根 .env——``cp .env.example
+# .env`` 后 ``uvicorn weiliao_agent.main:app`` 裸命令即可启动。
+# override=False 不覆盖已存在的进程环境变量；.env 不存在时静默跳过。
+# 路径显式锚定仓库根（parents[2]）：无参 find_dotenv 在安装到
+# site-packages 或异 cwd 场景静默失效、且可能向上命中父目录 stray .env
+# （审查 G2/E1/E2）。必须位于下方全部 env 读取之前。
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=False)
 
 _redis_client = redis.Redis.from_url(
     os.environ.get("WEILIAO_REDIS_URL", "redis://127.0.0.1:6379/0"),

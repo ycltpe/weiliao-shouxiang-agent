@@ -15,6 +15,7 @@ dependencies = [
     "langfuse==5.0.4",
     "cachetools==7.2.4",
     "aiokafka==0.15.0",
+    "python-dotenv==1.2.2",
 ]
 
 [dependency-groups]

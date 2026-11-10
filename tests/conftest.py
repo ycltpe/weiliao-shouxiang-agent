@@ -5,12 +5,48 @@ test_cache_lookup.py，逐文件复制会漂移——收敛为单一共享实现
 teardown 快照先前 client 恢复，而非无条件置 None）。
 """
 
+import os
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
 from weiliao_agent.observability import tracing
+
+# Story 7.1（审查 G3/B10/V2）+ 评审补丁：组合根导入期 load_dotenv 会
+# 读取仓库根 .env 并写入 os.environ。处置分三层：
+# 1. conftest 导入（收集期最先执行，早于任何测试模块可能模块级导入
+#    组合根）时快照现存 WEILIAO_*/OPENAI_*——运维/CI 刻意导出的值不能
+#    无差别删除；
+# 2. 快照后立即 scrub，消除本机 .env 与 CI 的行为分叉；
+# 3. autouse fixture 在每个测试后重 scrub（importlib.reload(组合根) 会
+#    重跑 load_dotenv 把本机 .env 重新注入、击穿 monkeypatch.delenv——
+#    tests/test_session.py:677 场景），session 结束恢复快照。
+_ENV_PREFIXES = ("WEILIAO_", "OPENAI_")
+_ENV_SNAPSHOT = {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES)}
+
+
+def _scrub_env() -> None:
+    for name in [k for k in os.environ if k.startswith(_ENV_PREFIXES)]:
+        del os.environ[name]
+
+
+_scrub_env()
+
+
+@pytest.fixture(autouse=True)
+def _re_scrub_env_after_test() -> Iterator[None]:
+    """每个测试后重 scrub 两前缀，防 importlib.reload 重注入击穿隔离。"""
+    yield
+    _scrub_env()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _restore_env_snapshot_at_session_end() -> Iterator[None]:
+    """session 结束恢复导入期快照（scrub 后重新导出运维/CI 原值）。"""
+    yield
+    _scrub_env()
+    os.environ.update(_ENV_SNAPSHOT)
 
 
 class _FakeLangfuse:
