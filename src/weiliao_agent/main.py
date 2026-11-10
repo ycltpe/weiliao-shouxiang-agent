@@ -21,6 +21,13 @@ Story 3.2 组合根：``house.sync.trigger`` 消费者任务由 lifespan 托管�
 超时强退不悬挂进程；消费者健康不挂 /health（fail-closed 逐消息降级
 先例，Story 3.1 口径不变）。
 
+Story 7.2 组合根：Redis socket 超时改经 ``WEILIAO_REDIS_SOCKET_TIMEOUT``
+配置（浮点秒，缺省 0.5s 现状值）——会话写路径（begin_turn / write_intent
+/ write_coref 等同步 SET，6.1 挂账）的有界阻塞兜底；非数值、非正、
+非有限（nan/inf）或超上界（1.0s，须远小于 2.5s 内部预算）fail-fast
+拒绝启动，错误消息带变量名；合法值同时生效于 redis 客户端
+``socket_timeout`` / ``socket_connect_timeout`` 两个 timeout 位。
+
 Story 3.3 组合根：``L1CacheClient``（``WEILIAO_L1_TTL_SECONDS`` 缺省
 30，AD-5 硬上限 30 超限 fail-fast）方法引用注入 intent_router
 （``set_recent_intent`` / ``set_followup_count``——AD-4 权威写仍在
@@ -139,8 +146,11 @@ from weiliao_agent.pipeline import LLM_GENERATE_BUDGET_SECONDS, PipelineOrchestr
 from weiliao_agent.session import SessionManager
 from weiliao_agent.workers import HouseSyncConsumer, KafkaMessageSource
 
-# Redis socket 超时须远小于 2.5s 内部预算（NFR-1 P99 < 3s 出口余量口径）。
-REDIS_SOCKET_TIMEOUT_SECONDS = 0.5
+# Redis socket 超时上界（Story 7.2，收口 6.1 挂账）：会话写路径
+# （begin_turn / write_intent / write_coref 等同步 SET）由本超时兜
+# 底有界阻塞——上界须远小于 2.5s 内部预算（NFR-1 P99 < 3s 出口余量
+# 口径），Redis 慢/网络抖动不得拖住热路径过滤器直至编排器逐跳超时。
+REDIS_SOCKET_TIMEOUT_MAX_SECONDS = 1.0
 # 关停消费者任务等待上限：超时强退（cancel 回收），不悬挂进程。
 CONSUMER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
@@ -154,10 +164,34 @@ logger = logging.getLogger(__name__)
 # （审查 G2/E1/E2）。必须位于下方全部 env 读取之前。
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=False)
 
+def _resolve_redis_socket_timeout() -> float:
+    """Redis socket 超时（Story 7.2，收口 6.1 挂账）：``WEILIAO_REDIS_
+    SOCKET_TIMEOUT`` 浮点秒，缺省 0.5s（现状值）；非数值、非正、非有限
+    （nan/inf）或超上界（须远小于 2.5s 内部预算）一律 fail-fast 拒绝
+    启动，错误消息带变量名。合法值同时生效于 redis 客户端
+    ``socket_timeout`` / ``socket_connect_timeout`` 两个 timeout 位。
+    """
+    raw = os.environ.get("WEILIAO_REDIS_SOCKET_TIMEOUT", "0.5")
+    try:
+        seconds = float(raw)
+    except ValueError as exc:
+        msg = f"WEILIAO_REDIS_SOCKET_TIMEOUT must be a number, got {raw!r}"
+        raise ValueError(msg) from exc
+    if not math.isfinite(seconds) or not 0 < seconds <= REDIS_SOCKET_TIMEOUT_MAX_SECONDS:
+        msg = (
+            f"WEILIAO_REDIS_SOCKET_TIMEOUT must be within "
+            f"(0, {REDIS_SOCKET_TIMEOUT_MAX_SECONDS}], got {raw!r}"
+        )
+        raise ValueError(msg)
+    return seconds
+
+
+_REDIS_SOCKET_TIMEOUT_SECONDS = _resolve_redis_socket_timeout()
+
 _redis_client = redis.Redis.from_url(
     os.environ.get("WEILIAO_REDIS_URL", "redis://127.0.0.1:6379/0"),
-    socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-    socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+    socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+    socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
 )
 
 _session_manager = SessionManager(_redis_client)
@@ -505,6 +539,9 @@ async def _metrics_log_loop() -> None:
         metrics.emit_cache_metrics_log()
         metrics.emit_risk_review_metrics_log()
         metrics.emit_llm_breaker_metrics_log()
+        # Story 7.2（D4）：被丢弃生成调用的 token 归因读数（INFO 级，
+        # 纯浪费成本信号，非故障形态，无 alert）。
+        metrics.emit_discarded_generation_metrics_log()
         metrics.emit_model_routing_metrics_log()
 
 

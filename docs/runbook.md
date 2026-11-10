@@ -20,6 +20,7 @@ INFO 级结构化日志，消息体即纯 JSON 单行（`record.message` 可直�
 | `risk_review_metrics` | INFO | 审核 total/passed/rejected/timeout/error/pass_rate |
 | `llm_breaker_metrics` | INFO | 熔断器 state/requests/skipped/trips/recoveries |
 | `model_routing_metrics` | INFO | 路由 primary/mini 调用与 token 累计、tightened 等 |
+| `discarded_generation_metrics` | INFO | 被超时丢弃但后台跑完的生成调用数与 token 累计（Story 7.2 纯浪费成本口径，与成功口径互斥不重叠；无告警形态） |
 
 同循环内满足条件时追加 ERROR 级告警日志：
 

@@ -734,6 +734,42 @@ def record_llm_generate_event(
         )
 
 
+def record_discarded_generation(
+    trace_id: str | None,
+    *,
+    model: str,
+    usage: Mapping[str, int],
+) -> None:
+    """被丢弃生成调用完成事件（Story 7.2，收口 4.3 挂账）。
+
+    口径：客户端硬预算已放弃（FutureTimeoutError 放弃分支注册的完成
+    回调）、调用在后台跑完且成功回传 usage——纯浪费的 token 消耗在
+    本事件归因，与 ``record_generation``（成功口径）互斥不重叠。已知
+    边界同 ``DiscardedGenerationMetricsCollector``：编排器逐跳先丢但
+    客户端预算内成功的窗口不进本事件（spec-7.2 Design Notes D4）。
+    DEFAULT 级（买家应答不受影响，非故障信号）；usage 缺失容忍空表。
+    fail-safe 口径同 ``record_llm_generate_event``：记录本身再抛异常
+    也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="llm.discarded_generation",
+            level="DEFAULT",
+            metadata={
+                "event": "discarded_generation",
+                "model": model,
+                "usage": dict(usage),
+            },
+        )
+
+
 def record_risk_review_event(
     trace_id: str | None,
     *,

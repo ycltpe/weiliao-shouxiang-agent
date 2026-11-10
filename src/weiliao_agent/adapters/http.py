@@ -185,7 +185,10 @@ def create_app(
                 # 仅收敛 redis 异常族：编程错误（如返回值解析 TypeError）
                 # 照常上抛，不静默降级掩盖缺陷。
                 return _fallback_result(envelope.intent, envelope.trace_id).to_dict()
-            envelope.turn = snapshot.turn
+            # Story 7.2（D3）：frozen 信封禁止原地写——入口适配经
+            # model_copy 整信封替换（D3 决策的全部 blast radius：
+            # 本文件 3 处写点 + 编排器 trace_id 回填 1 处）。
+            envelope = envelope.model_copy(update={"turn": snapshot.turn})
             if snapshot.handoff_status == "triggered":
                 # Story 5.3 终态闸门：已转接会话的消息不进入编排器——
                 # 过滤器全零执行、无二次转交指令（收口 5.2 评审 #18），
@@ -198,7 +201,12 @@ def create_app(
                 # 闸门轮不落转写：转写是 buyer/agent 逐对原文，无
                 # agent 回复的轮次混入会污染工作台上下文。
                 if envelope.trace_id is None:
-                    envelope.trace_id = tracing.new_trace_id()
+                    envelope = envelope.model_copy(
+                        update={"trace_id": tracing.new_trace_id()}
+                    )
+                # mypy 收窄：上方已权威回填（model_copy 后属性类型回宽，
+                # 同编排器入口 assert 口径）。
+                assert envelope.trace_id is not None
                 return handoff_gate_result(
                     envelope.trace_id,
                     session_id=envelope.session_id,
@@ -221,7 +229,7 @@ def create_app(
         else:
             # 无会话管理器（测试替身）时 turn 无权威来源：不信任 payload
             # 自带值，置 None 防止客户端伪造序号混入管道。
-            envelope.turn = None
+            envelope = envelope.model_copy(update={"turn": None})
         try:
             result = orchestrator_.run(envelope)
         except Exception:

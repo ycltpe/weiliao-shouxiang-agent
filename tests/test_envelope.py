@@ -143,3 +143,33 @@ def test_optional_turn_and_intent_accept_none() -> None:
 
     assert envelope.turn is None
     assert envelope.intent is None
+
+
+# ---- Story 7.2（D3）：信封 frozen——全链 model_copy 所有权冻结 ----
+
+
+def test_frozen_rejects_in_place_mutation() -> None:
+    """D3 落地：原地写一律 loud failure（开发期爆开，绝不带病进生产）。
+
+    原 4 处生产写点（编排器 trace_id 回填 + http 适配器 3 处）已全部改
+    model_copy（见 pipeline.py / adapters/http.py），本断言防回潮。"""
+    envelope = Envelope.model_validate(_valid_payload())
+    for field, value in (
+        ("trace_id", None),
+        ("turn", 2),
+        ("intent", None),
+        ("generated_reply", "草稿"),
+    ):
+        with pytest.raises(ValidationError):
+            setattr(envelope, field, value)
+
+
+def test_model_copy_remains_the_evolution_form() -> None:
+    """D3 落地：model_copy 整信封替换为唯一合法演进形态（既有全链
+    过滤器语义逐字节不变）。"""
+    envelope = Envelope.model_validate(_valid_payload())
+    evolved = envelope.model_copy(update={"generated_reply": "草稿"})
+
+    assert evolved.generated_reply == "草稿"
+    assert envelope.generated_reply is None  # 上游信封不可变
+    assert evolved is not envelope

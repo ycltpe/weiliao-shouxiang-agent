@@ -280,7 +280,8 @@ def test_in_flight_message_continues_with_snapshot_after_key_expiry(
     client.delete(f"{KEY_PREFIX}{SESSION_ID}")  # 模拟处理中途 key 被 TTL 清除
 
     envelope = Envelope.model_validate(_valid_payload())
-    envelope.turn = snapshot.turn
+    # Story 7.2（D3）：信封 frozen——原地写改 model_copy 整信封替换。
+    envelope = envelope.model_copy(update={"turn": snapshot.turn})
     result = PipelineOrchestrator().run(envelope)
 
     assert envelope.turn == 1  # 在途消息持有入管道时快照，不随 key 过期而失效

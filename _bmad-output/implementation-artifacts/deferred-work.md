@@ -11,10 +11,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md`
   summary: 每请求新建 ThreadPoolExecutor，超时丢弃的执行线程无取消/复用机制，超时风暴下线程可能积累（severity 未核验）
   evidence: 占位过滤器生产环境均为微秒级透传、不可能触发超时，线程积累场景当前不可达；若真实过滤器（Epic 4）落地后为真预计 medium（P99 劣化/资源膨胀）。settle：Epic 4 接入带副作用的真实过滤器后做超时风暴压测，重审执行器生命周期（共享池/cancel/信封所有权）。
+  status: closed-2026-11-10，Story 7.2 超时风暴压测实证（24 并发 × 4 请求，scripts/loadtest_timeout_storm.py 形态 A）：每请求新建执行器形态风暴期存活线程峰值 100（基线 1），挂账预估坐实为真。D1 决策落地共享池（pipeline.py 编排器级 ThreadPoolExecutor，大小 max(1, len(filters))，thread_name_prefix="weiliao-pipeline"），重测峰值 41 ≤ 预算 42、P99 506ms ≤ 预算 +200ms、应答字节与 degraded 语义逐字节不变；D2 取消机制决策「不做」（理由见 spec-7.2 Design Notes D2）；回归测试 tests/test_executor_lifecycle.py。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md`
   summary: 信封模型未设 frozen，超时丢弃的线程若在原地变更信封可能污染编排器持有的引用
   evidence: Envelope 无 frozen 是 Story 1.1 既有状态（pre-existing），非本 Story 引入；危害需"带副作用过滤器 + 超时丢弃"组合，当前占位过滤器只读或整信封替换（model_copy），不可达。随 Epic 4 真实过滤器落地与上条同批重审。
+  status: closed-2026-11-10，Story 7.2 D3 决策落地 frozen：信封原地写仅 4 处（编排器 trace_id 回填 + http 适配器 turn/trace_id 三处），已全部改 model_copy 整信封替换（Envelope.model_config frozen=True）；重构面实测 = 4 写点 + 2 测试行（test_session / test_handoff_response_path_closure 同语义改写），收益 = 未来过滤器原地变更信封从隐患变为开发期 loud failure；防回潮回归 tests/test_envelope.py::test_frozen_rejects_in_place_mutation。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md`
   summary: spec 声明的验证命令 `uv run ruff check .` 全仓执行报 302 个存量告警，按字面跑验收会失败
@@ -65,6 +67,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-4-3-fact-card-grounding-controlled-generation.md`
   summary: 编排器逐跳超时丢弃的执行线程无取消机制，llm_generate 慢调用被丢弃后 OpenAI 请求仍在后台跑完，产生纯浪费的 token 花费（无任何归因/记账）
   evidence: 1.2 deferred 条目已记「超时丢弃的执行线程无取消/复用机制……Epic 4 接入带副作用的真实过滤器后做超时风暴压测，重审执行器生命周期」；本 Story 影子接入真实生成过滤器后该场景首次可达。settle：与该挂账项同批——超时风暴压测时重审执行器生命周期（共享池/cancel/草稿丢弃通知），并评估是否需要为被丢弃的生成调用记 token 归因。
+  status: closed-2026-11-10，Story 7.2 D4 决策落地「记账」：调用完成点归因（llm/client.py 超时放弃路径注册 done-callback，后台跑完且成功回传 usage 才计入，与成功口径互斥不重叠）——observability.metrics.DiscardedGenerationMetricsCollector（模块级单例 + 定时 discarded_generation_metrics 结构化日志）+ tracing.record_discarded_generation trace 事件（DEFAULT 级，fail-safe）；压测三方一致实测（96 请求风暴：慢调用完成 == 归因 calls，tokens == calls × 27）；回归 tests/test_executor_lifecycle.py。
 - source_spec: `_bmad-output/implementation-artifacts/spec-4-3-fact-card-grounding-controlled-generation.md`
   summary: grounding 违禁清单的裸「最」「第一」子串匹配会误伤良性表述（如「最近」「最后」「最好」），可能丢弃合规草稿
   evidence: 该清单沿用 Story AC 既定违禁词与 4.1 `_FORBIDDEN_MATERIAL_FRAGMENTS`，fail-closed 方向安全（影子模式下代价仅为 token 浪费）；改用分词/豁免表等更精确匹配属业务违禁词口径定夺。settle：随 4.4 的审核通过率与 grounding_failed 监控数据观察误报率后定，若误报高再细化匹配语义。
@@ -98,6 +101,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
   summary: 会话状态写路径（含新增 write_coref 与既有 write_intent/record_transcript）全部为同步 Redis SET 且默认 socket 超时，Redis 慢/网络抖动时会拖住热路径过滤器，fail-safe 只在异常发生后生效。
   evidence: 6.1 盲审#4；write_intent 自 2.x 起同模式，非本 Story 引入。settle：单独立项评估会话写超时预算（如 WEILIAO_REDIS_SOCKET_TIMEOUT 组合根 fail-fast 配置），属 Epic 7 可运维性范畴。
+  status: closed-2026-11-10，Story 7.2 按 settle 路径落地：WEILIAO_REDIS_SOCKET_TIMEOUT 组合根 fail-fast 配置（main.py 缺省 0.5s 现状值；非数值/非正/非有限 nan/inf/超上界 1.0s 拒绝启动且错误消息带变量名；上界 1.0s 远小于 2.5s 内部预算），合法值同时生效 redis 客户端 socket_timeout / socket_connect_timeout 两个 timeout 位；README 变量表 + .env.example + 守护测试（非法取值矩阵 6 值参数化）同步。
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
   summary: coreference 过滤器自身延迟 P99 < 10ms 预算无任何自动化验证路径（仓库无压测设施，唯一延迟断言是符号非负检查）。
   evidence: 6.1 验证缺口层 filed disposition defer。P99 是压测属性，端到端延迟验收（含消解口径的 FR-1 P99 < 50ms）归 Story 6.3/FR-1 验收范围。
@@ -121,3 +125,4 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-3-downstream-consumption-followup-retrofit.md`
   summary: FR-1「含消解端到端意图分类 P99 < 50ms」实测 deferred——仓库无压测设施，无法产出真实 P99 测量，不虚构数据冒充验收门（关闭 6.1#15 / 6.2 盲#4 同根挂账，重路由至 Story 7.2 压测设施）。
   evidence: 6.1 过滤器自身 P99 < 10ms、6.2 resolver 微秒级单趟规则扫描均已 defer 同根条目；分类器 45ms 硬超时守卫 + `latency_ms` 埋点已就位，唯一延迟断言为符号非负检查。settle：Story 7.2 压测故事落地后，以含 coreference → intent_router 全链的压测执行 FR-1 P99 < 50ms 实测验收。
+  status: open-2026-11-10——审查 IA(a) 补丁重开：Story 7.2 压测设施已落地（scripts/loadtest_intent_chain.py：真实 RuleBasedCorefResolver + llm_zero_shot 全链，凭据门内测真实延迟、无 OPENAI_API_KEY 时显式 skip 退出码 0 不虚构数据），但 P99 < 50ms 实测门本环境未执行（无凭据）——配置 OPENAI_API_KEY 后复跑该脚本取得判定即关闭。

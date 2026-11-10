@@ -8,6 +8,7 @@ cp 后启动」行为全部钉成自动化断言，防文档/样例漂移。
 
 import contextlib
 import io
+import json
 import math
 import os
 import re
@@ -39,6 +40,7 @@ COMMENTED_OPT_OUT = frozenset(
 # 数值型变量（空串无法解析，启动 fail-fast 且错误消息带变量名——既有
 # 行为；README 注明「留空即启动失败，需删行恢复缺省」）。
 NUMERIC_VARS = [
+    "WEILIAO_REDIS_SOCKET_TIMEOUT",
     "WEILIAO_L1_TTL_SECONDS",
     "WEILIAO_METRICS_LOG_SECONDS",
     "WEILIAO_RISK_REVIEW_TIMEOUT_MS",
@@ -77,6 +79,7 @@ STRING_BLANK_FAIL_FAST_VARS = [
 # 结构 (low, low_inclusive, high, high_inclusive)；正数必需变量用左开
 # 区间（0 会通过闭区间守卫但 main.py 非正 fail-fast）。
 DOCUMENTED_BOUNDS: dict[str, tuple[float, bool, float, bool]] = {
+    "WEILIAO_REDIS_SOCKET_TIMEOUT": (0, False, 1.0, True),  # >0，上界 1.0
     "WEILIAO_L1_TTL_SECONDS": (1, True, 30, True),  # AD-5 硬上限 30
     "WEILIAO_METRICS_LOG_SECONDS": (1, True, math.inf, True),
     "WEILIAO_RISK_REVIEW_TIMEOUT_MS": (300, True, 800, True),
@@ -87,6 +90,10 @@ DOCUMENTED_BOUNDS: dict[str, tuple[float, bool, float, bool]] = {
     "WEILIAO_LLM_ROUTING_WINDOW_SECONDS": (0, False, math.inf, True),  # >0
     "WEILIAO_HANDOFF_FOLLOWUP_THRESHOLD": (1, True, math.inf, True),
 }
+
+# Story 7.2 非法取值 fail-fast 矩阵（WEILIAO_REDIS_SOCKET_TIMEOUT）：
+# 非数值 / 非正 / 非有限（nan/inf）/ 超上界——全部须带变量名拒绝启动。
+REDIS_SOCKET_TIMEOUT_ILLEGAL_VALUES = ["abc", "0", "-0.5", "nan", "inf", "2.0"]
 
 # 引号内字面量扫描（B5）：覆盖 os.environ.get 读点与 _ENDPOINT_ENV 等
 # 模块级常量；docstring 反引号形态天然排除。
@@ -437,6 +444,67 @@ def test_blank_string_var_fails_fast_with_var_name(var_name: str) -> None:
     assert var_name in result.stderr, (
         f"fail-fast 错误消息缺变量名 {var_name}：\n{result.stderr}"
     )
+
+
+@pytest.mark.parametrize("raw_value", REDIS_SOCKET_TIMEOUT_ILLEGAL_VALUES)
+def test_redis_socket_timeout_illegal_value_fails_fast_with_var_name(
+    raw_value: str,
+) -> None:
+    """Story 7.2 非法取值 fail-fast 矩阵（AC 第 4 条收口 6.1 挂账）：
+    WEILIAO_REDIS_SOCKET_TIMEOUT 为非数值 / 非正 / 非有限（nan/inf）/
+    超上界时启动失败，错误消息带变量名。"""
+    env = _example_env()
+    env["WEILIAO_REDIS_SOCKET_TIMEOUT"] = raw_value
+    result = _run_subprocess(
+        [sys.executable, "-c", "import weiliao_agent.main"],
+        env=env,
+    )
+    assert result.returncode != 0, (
+        f"WEILIAO_REDIS_SOCKET_TIMEOUT={raw_value!r} 竟启动成功（应 fail-fast）"
+    )
+    assert "WEILIAO_REDIS_SOCKET_TIMEOUT" in result.stderr, (
+        f"fail-fast 错误消息缺变量名：\n{result.stderr}"
+    )
+
+
+def test_redis_socket_timeout_legal_value_reaches_client_kwargs() -> None:
+    """Story 7.2（审查 G1 补丁）合法值正路径：WEILIAO_REDIS_SOCKET_TIMEOUT
+    须同时落到 redis 客户端 socket_timeout / socket_connect_timeout 两个
+    timeout 位（AC 第 4 条后半；非法矩阵只证 fail-fast、不证接线——接线
+    回归回硬编码时全部测试仍绿，必须有本用例钉住）。"""
+    env = _example_env()
+    env["WEILIAO_REDIS_SOCKET_TIMEOUT"] = "0.7"
+    result = _run_subprocess(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json\n"
+                "import weiliao_agent.main as m\n"
+                "kw = m._redis_client.connection_pool.connection_kwargs\n"
+                "print(json.dumps({k: kw.get(k) for k in "
+                "('socket_timeout', 'socket_connect_timeout')}))"
+            ),
+        ],
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    timeouts = json.loads(result.stdout.strip().splitlines()[-1])
+    assert timeouts == {"socket_timeout": 0.7, "socket_connect_timeout": 0.7}
+
+
+@pytest.mark.parametrize("raw_value", ["1.0", "0.1"])
+def test_redis_socket_timeout_boundary_values_accepted(raw_value: str) -> None:
+    """边界接受（审查 G1）：上界 1.0 接受、小正值接受——与非法矩阵的
+    上界拒绝（2.0）/ 非正拒绝（0）对称成对（缺省 0.5 由 clean-checkout
+    导入用例覆盖）。"""
+    env = _example_env()
+    env["WEILIAO_REDIS_SOCKET_TIMEOUT"] = raw_value
+    result = _run_subprocess(
+        [sys.executable, "-c", "import weiliao_agent.main"],
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @contextlib.contextmanager

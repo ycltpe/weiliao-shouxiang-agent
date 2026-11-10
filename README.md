@@ -104,6 +104,7 @@ curl -s localhost:8000/health
 | 变量 | 缺省 | 说明 | 调参影响 |
 |------|------|------|----------|
 | `WEILIAO_REDIS_URL` | `redis://127.0.0.1:6379/0` | 会话状态 Redis（会话状态唯一写入者） | 指向实例须可用；Redis 故障按 fail-closed 逐消息降级，服务仍就绪 |
+| `WEILIAO_REDIS_SOCKET_TIMEOUT` | `0.5` | Redis socket 超时秒数（Story 7.2，须 (0, 1.0]，非数值/非正/非有限 nan/inf/超上界启动 fail-fast）；会话写路径（begin_turn/write_intent/write_coref 等同步 SET）的有界阻塞兜底 | 调大容忍慢 Redis（占用热路径过滤器预算，上界 1.0s 须远小于 2.5s 内部预算）；调小更快 fail-safe 回落 |
 | `WEILIAO_L1_TTL_SECONDS` | `30` | L1 进程内缓存 TTL（AD-5 硬上限 30，>30 启动 fail-fast）；仅存会话热点快照，事实卡片严禁入 L1 | 调小：追问状态更快回落 Redis 权威值；硬上限防事实卡片过期前外发 |
 
 **意图分类（Story 2.2）：**
@@ -182,4 +183,19 @@ uv run pytest
 # 代码检查
 uv run ruff check src tests
 uv run mypy src
+```
+
+**压测设施（Story 7.2）：**
+
+```bash
+# 超时风暴压测（NFR10 验收工具）：进程内 stub 慢调用驱动，零外部服务依赖
+uv run python scripts/loadtest_timeout_storm.py                # 形态 B（生产影子口径，默认）
+uv run python scripts/loadtest_timeout_storm.py --budget 0.5   # 形态 A（逐跳丢弃口径）
+# 退出码 0 = 全部断言通过（线程有界 / P99 在预算内 / 丢弃归因一致）；
+# 非零 = 打印断言失败清单。读数口径见脚本 docstring。
+
+# FR-1 全链压测：coreference → intent_router 端到端 P99 < 50ms
+uv run python scripts/loadtest_intent_chain.py
+# 无 OPENAI_API_KEY 时显式 skip（退出码 0，不产出数据）；有凭据时
+# 默认参数发起 8×50=400 次真实结构化输出调用——评估 OpenAI 成本后再执行。
 ```

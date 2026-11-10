@@ -117,7 +117,9 @@ def test_gate_short_circuits_all_filters_after_handoff(
     sender = _RecordingSender()
     orchestrator = _orchestrator(counting, sender, manager)
     envelope = _envelope()
-    envelope.turn = 7  # 具体轮次：透传进闸门事件与 WARNING 日志
+    # Story 7.2（D3）：信封 frozen——原地写改 model_copy 整信封替换
+    #（轮次语义不变：透传进闸门事件与 WARNING 日志）。
+    envelope = envelope.model_copy(update={"turn": 7})
 
     with caplog.at_level(logging.WARNING):
         result = orchestrator.run(envelope)

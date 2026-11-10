@@ -32,6 +32,16 @@ reader 时闸门禁用，行为与 5.5 前逐字节一致。5.3 适配器闸门�
   执行，超时立即兜底、不傻等全量超时，执行线程结果丢弃（占位过滤器
   无副作用，可安全丢弃）。
 
+Story 7.2（D1 决策落地，收口 1.2 挂账）：执行器生命周期重审——压测
+实测（scripts/loadtest_timeout_storm.py，24 并发 × 4 请求超时风暴）
+每请求新建 ``ThreadPoolExecutor`` 形态风暴期存活线程峰值 100（基线 1），
+随并发线性膨胀；落地为编排器级共享池（大小 ``max(1, len(filters))``，
+随编排器生命周期共存，不随请求生灭）：超时丢弃的跳不再泄漏执行线程，
+风暴期线程数不随并发增长（重测峰值回落到预算内），逐跳超时/异常兜底、
+应答字节与 degraded 语义逐字节不变。D2 取消机制决策「不做」（Python
+无法强杀运行中线程，cooperative cancel 需过滤器契约变更；共享池已使
+线程有界，理由详见 spec-7.2 Design Notes D2）。
+
 买家侧永不暴露 5xx：所有路径返回 ``PipelineResult``，错误应答携带
 trace_id 且 ``degraded=True``。
 """
@@ -184,6 +194,17 @@ class PipelineOrchestrator:
             ]
         )
         self._budget_seconds = budget_seconds
+        # Story 7.2（D1）：编排器级共享执行池——替代每请求新建
+        # ThreadPoolExecutor + shutdown(wait=False)（压测实证线程随
+        # 并发线性膨胀，见模块 docstring）。池大小 = max(1, len(filters))：
+        # 顺序跳提交同一时刻每请求至多占用一个 worker（慢调用由
+        # llm 客户端自有有界池承接，不占本池等待），进程内线程数有界；
+        # 池随编排器生命周期共存（atexit 回收空闲 worker，进程退出
+        # 不悬挂），空闲零开销（ThreadPoolExecutor 按需起线程）。
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, len(self._filters)),
+            thread_name_prefix="weiliao-pipeline",
+        )
         # Story 5.2（AD-7）：None（broker 未配置）时出口分支跳过发送，
         # 出口文案语义不变（与消费者门控同口径）。
         self._handoff_sender = handoff_sender
@@ -200,9 +221,12 @@ class PipelineOrchestrator:
         """执行过滤器链；异常/超时一律降级模板兜底，不向上抛。"""
         # trace_id 单一权威生成点：缺失即由服务生成回填（32 位小写
         # 十六进制，Langfuse trace id 口径）；payload 携带值透传。
+        # Story 7.2（D3）：frozen 信封禁止原地写——回填经 model_copy
+        # 整信封替换（局部变量重新绑定，下游行为逐字节不变）。
         if envelope.trace_id is None:
-            envelope.trace_id = tracing.new_trace_id()
-        trace_id = envelope.trace_id  # mypy 收窄：上方已权威回填
+            envelope = envelope.model_copy(update={"trace_id": tracing.new_trace_id()})
+        assert envelope.trace_id is not None  # mypy 收窄：上方已权威回填
+        trace_id = envelope.trace_id
         # Story 5.5 编排器级终态闸门：对直接调用 run() 的入口（绕过
         # 5.3 http 适配器闸门）实读 Redis 权威 handoff_status——
         # 已转接会话绝不进 AI 管道（防人机混答，FR-12 红线）。判定
@@ -272,7 +296,6 @@ class PipelineOrchestrator:
         assert envelope.trace_id is not None
         trace_id = envelope.trace_id
         deadline = time.monotonic() + self._budget_seconds
-        executor = ThreadPoolExecutor(max_workers=max(1, len(self._filters)))
         last_filter: Filter | None = None
         try:
             for filter_ in self._filters:
@@ -281,7 +304,7 @@ class PipelineOrchestrator:
                 if remaining <= 0:
                     # 剩余预算耗尽：立即兜底，不傻等。
                     return self._degraded(envelope, trace_id, slow_filter=filter_.name)
-                future = executor.submit(filter_.process, envelope)
+                future = self._executor.submit(filter_.process, envelope)
                 try:
                     # span 在主线程侧包 future.result()：过滤器跑在执行
                     # 线程，不做 OTel 跨线程传播（Story 1.5 约定）。
@@ -304,9 +327,6 @@ class PipelineOrchestrator:
             else:
                 culprit = getattr(last_filter, "name", None) or type(last_filter).__name__
             return self._degraded(envelope, trace_id, failed_filter=culprit)
-        finally:
-            # 超时跳的执行线程结果已丢弃，等待其完成无意义（不傻等）。
-            executor.shutdown(wait=False)
         # 最终返回点（Story 5.4）：只读消费 response_assembler 的权威
         # 产出 assembled_reply（AI 披露前缀的唯一注入载体，4.4 冻结
         # 语义——通过审核的草稿除加前缀外不得再被改写）；组装产出缺失

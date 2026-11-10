@@ -87,7 +87,7 @@ development_status:
   6-2-房源指代归一化默认实现: review
   6-3-下游消费接入与追问判定-retrofit: done
   epic-6-retrospective: optional
-  epic-7: in-progress
-  7-1-运维文档与配置交付: review
-  7-2-超时风暴压测与执行器生命周期重审: backlog
+  epic-7: done
+  7-1-运维文档与配置交付: done
+  7-2-超时风暴压测与执行器生命周期重审: done
   epic-7-retrospective: optional

@@ -478,6 +478,92 @@ def reset_model_routing_metrics() -> ModelRoutingMetricsCollector:
     return _model_routing_collector
 
 
+# ---- 被丢弃生成调用的 token 归因（Story 7.2，收口 4.3 挂账） ----
+
+
+class DiscardedGenerationMetricsSnapshot(TypedDict):
+    """``snapshot()`` 返回结构（压测设施与定时日志消费）。"""
+
+    calls: int  # 预算已放弃、后台跑完成功回传 usage 的生成调用数
+    tokens: int  # 上述调用的 total_tokens 累计（纯浪费口径）
+
+
+class DiscardedGenerationMetricsCollector:
+    """被丢弃生成调用的 token 归因计数器（线程安全）。
+
+    口径（Story 7.2 D4 决策落地）：仅统计「客户端硬预算已放弃
+    （``OpenAiGenerationClient.generate`` 的 FutureTimeoutError 放弃
+    分支）、调用在后台跑完且成功回传 usage」的生成——与成功口径
+    （``ModelRoutingMetricsCollector.record_call``，路由层记账）互斥
+    不重叠：一次调用要么走成功口径，要么在本计数器记账，绝不重复。
+    记账发生在调用完成点（客户端后台线程的 done-callback），模型维度
+    不在本口径归并（成功口径已按 primary/mini 归并；trace 事件另记
+    model 供复盘）。已知边界（spec-7.2 Design Notes D4 记录）：「编排器
+    逐跳先丢弃、但调用在客户端预算内成功完成」的窗口不进本口径——
+    其 token 由成功口径/成本护栏照常捕获，丢弃桶的信令化归因属 D2
+    cooperative-cancel 已拒范畴。
+    全部入口自身不抛异常（调用方仍按 fail-safe 口径兜底吞错，对齐
+    tracing 约定）。模块级单例供客户端完成回调与压测设施共用；测试经
+    ``reset_discarded_generation_metrics`` 注入重置实现隔离。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._calls = 0
+        self._tokens = 0
+
+    def record_discarded(self, tokens: int) -> None:
+        """记录一次被丢弃但后台跑完的生成调用（tokens=回传 total_tokens）。"""
+        with self._lock:
+            self._calls += 1
+            self._tokens += max(0, tokens)
+
+    def reset(self) -> None:
+        """清零计数器（测试隔离注入点）。"""
+        with self._lock:
+            self._calls = 0
+            self._tokens = 0
+
+    def snapshot(self) -> DiscardedGenerationMetricsSnapshot:
+        """返回丢弃调用数与 token 累计读数。"""
+        with self._lock:
+            return DiscardedGenerationMetricsSnapshot(
+                calls=self._calls,
+                tokens=self._tokens,
+            )
+
+
+# 模块级单例：客户端完成回调与压测设施（scripts/loadtest_timeout_storm.py）
+# 及组合根定时日志共用。
+_discarded_generation_collector = DiscardedGenerationMetricsCollector()
+
+
+def get_discarded_generation_metrics() -> DiscardedGenerationMetricsCollector:
+    """返回进程内模块级单例丢弃归因计数器。"""
+    return _discarded_generation_collector
+
+
+def reset_discarded_generation_metrics() -> DiscardedGenerationMetricsCollector:
+    """清零模块级单例并返回（测试隔离的注入重置点）。"""
+    _discarded_generation_collector.reset()
+    return _discarded_generation_collector
+
+
+def emit_discarded_generation_metrics_log() -> None:
+    """定时发射被丢弃生成调用的结构化日志（INFO 级，无告警形态）。
+
+    纯浪费口径是成本观测信号而非故障信号（买家应答不受影响的影子
+    链路固有代价）——参考 llm_breaker_metrics 的 INFO/DEBUG 形态，
+    不挂 alert。日志发射自身 fail-safe：任何异常吞掉，指标记录绝不
+    二次影响买家应答。消息体即纯 JSON（``record.message`` 可直接
+    ``json.loads``），同 cache 口径。
+    """
+    with suppress(Exception):
+        snapshot = get_discarded_generation_metrics().snapshot()
+        payload: dict[str, Any] = {"event": "discarded_generation_metrics", **snapshot}
+        _logger.info("%s", json.dumps(payload, sort_keys=True))
+
+
 def emit_model_routing_metrics_log() -> None:
     """定时发射模型路由结构化日志；收紧态追加 ERROR 级告警。
 

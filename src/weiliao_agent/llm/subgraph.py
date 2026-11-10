@@ -66,7 +66,7 @@ def build_generation_graph(
         if router is not None:
             result = _generate_via_router(router, client, messages, state)
         else:
-            result = client.generate(messages)
+            result = client.generate(messages, trace_id=state["trace_id"])
         # fail-safe 追踪：record_generation 内部吞异常，不阻断应答链路；
         # cost 不在本 Story 计算（由 Langfuse 按模型自算，Story 4.6 细化）。
         tracing.record_generation(
@@ -98,8 +98,8 @@ def _generate_via_router(
     except Exception:
         decision = None
     if decision is None:
-        return fallback.generate(messages)
-    result = decision.client.generate(messages)
+        return fallback.generate(messages, trace_id=state["trace_id"])
+    result = decision.client.generate(messages, trace_id=state["trace_id"])
     # fail-safe 追踪（tracing 内部吞异常）：单条消息可复盘路由 outcome；
     # 收紧→恢复迁移的判定瞬间补记 recovered 事件。
     tracing.record_model_routing_event(

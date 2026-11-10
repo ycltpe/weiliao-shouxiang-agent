@@ -48,7 +48,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from weiliao_agent.models.coref import CorefRef
 from weiliao_agent.models.fact_card import FactCard
@@ -69,6 +69,14 @@ class HandoffAssessment(BaseModel):
 
 class Envelope(BaseModel):
     """管道内传递的标准化消息信封。"""
+
+    # Story 7.2（D3 决策落地，收口 1.2 frozen 挂账）：信封全链所有权冻结
+    # ——过滤器已全链 model_copy 整信封替换（唯一合法演进形态），原地
+    # 写仅余编排器 trace_id 权威回填与 http 入口适配器 3 处（均已改
+    # model_copy，见 pipeline.py / adapters/http.py）；frozen 使「超时
+    # 丢弃线程原地变更信封污染编排器引用」从隐患变为构造期 loud
+    # failure（未来过滤器误用即开发期爆开，绝不带病进生产）。
+    model_config = ConfigDict(frozen=True)
 
     session_id: str = Field(min_length=1)
     house_id: str = Field(min_length=1)

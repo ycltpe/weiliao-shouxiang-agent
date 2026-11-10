@@ -159,8 +159,11 @@ def test_missing_trace_id_backfilled_and_returned(fake_langfuse: _FakeLangfuse) 
     assert result.degraded is False
     assert result.trace_id is not None
     assert _TRACE_ID_HEX.fullmatch(result.trace_id)  # 服务端生成（Langfuse 口径）
-    # 响应 trace_id 与信封回填值一致（客户端无关）。
-    assert envelope.trace_id == result.trace_id
+    # Story 7.2（D3 frozen 所有权裁断）：回填不再原地变更调用方信封——
+    # 调用方持有的信封保持 None（frozen，model_copy 产出内部副本），
+    # 响应 trace_id 即权威生成值（客户端契约不变）。
+    assert envelope.trace_id is None
+    assert result.trace_id is not None
     # 消息级根 span + 4 个过滤器 span，全部挂在同一 trace。
     names = [obs["name"] for obs in fake_langfuse.observations]
     assert "pipeline.message" in names

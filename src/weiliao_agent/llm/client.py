@@ -15,14 +15,18 @@
 """
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import BaseMessage
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
+
+from weiliao_agent.observability import tracing
+from weiliao_agent.observability.metrics import get_discarded_generation_metrics
 
 # 默认模型 alias（脊柱：模型名禁硬编码，gpt-4o 系关停前可经配置整体迁移）；
 # 可被构造参数 / ``WEILIAO_LLM_MODEL`` 环境变量覆盖。
@@ -132,14 +136,28 @@ class OpenAiGenerationClient:
         """实际生效的模型 alias（追踪埋点消费）。"""
         return self._model
 
-    def generate(self, messages: Sequence[BaseMessage]) -> GenerationResult:
-        """预算内同步生成（至多 1 次重试）；失败抛 ``LlmGenerationError``。"""
+    def generate(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        trace_id: str | None = None,
+    ) -> GenerationResult:
+        """预算内同步生成（至多 1 次重试）；失败抛 ``LlmGenerationError``。
+
+        ``trace_id`` 可选透传（Story 7.2）：仅用于被丢弃调用的完成归因
+        事件（``tracing.record_discarded_generation``），缺省 None 时
+        归因记账照常、trace 事件按既有不可记录口径跳过。
+        """
         future = self._executor.submit(self._generate_with_retry, list(messages))
         future.add_done_callback(_retrieve_future_exception)
         try:
             return future.result(timeout=self._budget_seconds)
         except FutureTimeoutError:
             # 硬预算耗尽：执行线程无法中止，待其自行结束（不傻等）。
+            # Story 7.2（收口 4.3 挂账）：被丢弃的调用在后台跑完后经
+            # 完成回调记账 token 归因（区别于成功口径，互斥不重叠）——
+            # 回调自身 fail-safe，绝不阻塞应答路径。
+            future.add_done_callback(_discarded_completion_callback(trace_id))
             msg = f"llm generation exceeded {self._budget_seconds:.2f}s budget"
             raise LlmGenerationError("timeout", msg) from None
         except LlmGenerationError:
@@ -180,6 +198,28 @@ class OpenAiGenerationClient:
         )
         self._chat_model = chat
         return chat
+
+
+def _discarded_completion_callback(
+    trace_id: str | None,
+) -> Callable[[Future[GenerationResult]], None]:
+    """构造「被丢弃调用完成」回调：成功回传 usage 才记账（失败无 token）。
+
+    仅超时放弃路径注册本回调，故回调内任何成功完成都属于被丢弃口径
+    （成功口径在调用侧正常返回时由路由层记账，互斥不重叠）。记账/
+    trace 两动作全部吞异常：归因本身绝不影响任何线程。
+    """
+
+    def _callback(future: Future[GenerationResult]) -> None:
+        with suppress(Exception):
+            result = future.result()
+            tokens = result.usage.get("total_tokens", 0)
+            get_discarded_generation_metrics().record_discarded(tokens)
+            tracing.record_discarded_generation(
+                trace_id, model=result.model, usage=result.usage
+            )
+
+    return _callback
 
 
 def _to_result(response: Any, *, model: str) -> GenerationResult:
