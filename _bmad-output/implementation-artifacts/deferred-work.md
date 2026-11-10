@@ -92,3 +92,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-5-4-ai-identity-disclosure-label.md`
   summary: 空串/仅空白草稿未按「无草稿」处理——空串草稿会产出只有前缀没有正文的买家应答，前导空白+前缀的草稿会双标。
   evidence: 5.4 边界#1/#2 同根（评审轮 1 triage 裁决 medium、route defer）。两种行为与 5.4 改动前的内联组装逐字节一致（旧代码同样只判 `is not None`），非本 Story 引入；且任何「清洗草稿」的修法都会触碰冻结约束「过审草稿除加前缀外不得再被改写」。settle：单独立项，连同 risk_review 对空草稿的拦截口径一起拍板。
+
+## Deferred from: code review of spec-6-1-coreference-filter-interface-pipeline-integration (2026-11-10)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
+  summary: 会话状态写路径（含新增 write_coref 与既有 write_intent/record_transcript）全部为同步 Redis SET 且默认 socket 超时，Redis 慢/网络抖动时会拖住热路径过滤器，fail-safe 只在异常发生后生效。
+  evidence: 6.1 盲审#4；write_intent 自 2.x 起同模式，非本 Story 引入。settle：单独立项评估会话写超时预算（如 WEILIAO_REDIS_SOCKET_TIMEOUT 组合根 fail-fast 配置），属 Epic 7 可运维性范畴。
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
+  summary: coreference 过滤器自身延迟 P99 < 10ms 预算无任何自动化验证路径（仓库无压测设施，唯一延迟断言是符号非负检查）。
+  evidence: 6.1 验证缺口层 filed disposition defer。P99 是压测属性，端到端延迟验收（含消解口径的 FR-1 P99 < 50ms）归 Story 6.3/FR-1 验收范围。
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
+  summary: sprint-status.yaml 头部注释的 `# last_updated: 2026-11-02` 与正文长期不一致（本 Story 更新正文时头部继续滞留旧值）。
+  evidence: 6.1 盲审#12；头部注释在本 Story 之前即已陈旧，非本 Story 引入。settle：顺手修或纳入 Epic 7 运维文档治理。

@@ -331,6 +331,62 @@ def test_write_intent_does_not_touch_session_hash(
     assert client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:3") is not None
 
 
+def test_write_coref_stores_per_turn_json_with_session_ttl(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # Story 6.1：指代消解审计键 per-turn JSON（ensure_ascii=False 口径），
+    # TTL 与会话一致（随写刷新）。
+    payload = {
+        "resolved_message": "house-001 的价格是多少？",
+        "coref": [{"entity_type": "house", "entity_id": "house-001"}],
+    }
+
+    manager.write_coref(SESSION_ID, 1, payload)
+
+    key = f"{KEY_PREFIX}{SESSION_ID}:coref:1"
+    raw = cast("bytes", client.get(key))
+    text = raw.decode()
+    assert json.loads(raw.decode()) == payload
+    assert "价格是多少" in text  # ensure_ascii=False：JSON 原文直出中文
+    assert client.ttl(key) == DEFAULT_TTL_SECONDS
+
+
+def test_write_coref_refreshes_ttl_and_uses_distinct_key_per_turn(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # Story 6.1：同一键重写时 EXPIRE 随写刷新（模拟中途 TTL 被压短）；
+    # 每轮独立键互不影响。
+    manager.write_coref(SESSION_ID, 1, {"resolved_message": "原文一", "coref": []})
+    client.expire(f"{KEY_PREFIX}{SESSION_ID}:coref:1", 60)
+
+    manager.write_coref(SESSION_ID, 2, {"resolved_message": "原文二", "coref": []})
+
+    # 键相互独立：写 turn 2 不刷新 turn 1 的 TTL。
+    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}:coref:1") == 60
+
+    manager.write_coref(SESSION_ID, 1, {"resolved_message": "原文一", "coref": []})
+
+    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}:coref:1") == DEFAULT_TTL_SECONDS
+    first = json.loads(
+        cast("bytes", client.get(f"{KEY_PREFIX}{SESSION_ID}:coref:1")).decode()
+    )
+    second = json.loads(
+        cast("bytes", client.get(f"{KEY_PREFIX}{SESSION_ID}:coref:2")).decode()
+    )
+    assert first["resolved_message"] == "原文一"
+    assert second["resolved_message"] == "原文二"
+
+
+def test_write_coref_does_not_touch_session_hash(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 审计键独立于会话 hash：不得残留/改写 turn 等权威字段。
+    manager.write_coref(SESSION_ID, 3, {"resolved_message": None, "coref": []})
+
+    assert client.hgetall(f"{KEY_PREFIX}{SESSION_ID}") == {}
+    assert client.get(f"{KEY_PREFIX}{SESSION_ID}:coref:3") is not None
+
+
 def test_record_followup_first_occurrence_does_not_increment_session_count(
     manager: SessionManager, client: fakeredis.FakeRedis
 ) -> None:
@@ -565,6 +621,34 @@ def test_main_composition_root_records_followup_to_redis(
     assert fake.hget(key, "followup:PRICE_INQUIRY") == b"2"
     assert fake.hget(key, "followup_count") == b"1"
     assert fake.ttl(key) == DEFAULT_TTL_SECONDS
+
+
+def test_main_composition_root_writes_coref_audit_to_redis(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # Story 6.1 组合根端到端：coreference 过滤器（链首）经组合根注入的
+    # write_coref 落盘 per-turn 审计键（默认透传：resolved_message 为
+    # 原文拷贝、coref 为 []），fakeredis 无 LLM 网络。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+    http = TestClient(main_module.app)
+    payload = {**_valid_payload(), "message": "你好，这套房多少钱？"}
+
+    response = http.post("/v1/messages", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["degraded"] is False
+    raw = fake.get(f"{KEY_PREFIX}{SESSION_ID}:coref:1")
+    assert raw is not None
+    stored = json.loads(cast("bytes", raw).decode())
+    assert stored == {
+        "trace_id": "trace-001",
+        "resolved_message": "你好，这套房多少钱？",
+        "coref": [],
+    }
+    assert fake.ttl(f"{KEY_PREFIX}{SESSION_ID}:coref:1") == DEFAULT_TTL_SECONDS
 
 
 def test_main_composition_root_wires_l1_writers_and_l0_lookup(

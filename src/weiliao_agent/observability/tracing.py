@@ -4,8 +4,9 @@
 - trace_id 由编排器入口权威生成（``new_trace_id``，32 位小写十六进制，
   与 Langfuse trace id 同口径，响应 id 可直接在 Langfuse 检索）；
 - 每消息记录三文本字段：买家原文 / 消解后消息 / 最终下发文本
-  （后两者当前恒等于原文，coref（Story 2）与 LLM 生成（Epic 4）
-  就位后渐进分化）；
+  （Story 6.1：消解后消息已由链首 coreference 过滤器消费——默认
+  透传场景恒等于原文，resolver 命中后与 LLM 生成（Epic 4）就位后
+  渐进分化）；
 - 降级事件、过滤器 span 写入消息 trace；成本追踪经 generation 观测
   记录 token 用量与费用（真实模型调用由 Epic 4 接入本封装）。
 
@@ -41,6 +42,14 @@ ERROR 级并携带 error 归因。
 终态闸门事件（Story 5.3）：已转接会话再收买家消息时入口适配器短路
 （编排器零执行），``record_already_handed_off`` 补挂 WARNING 级事件——
 消息不进入管道、无二次转交指令、回固定安抚文案，全程可审计。
+
+指代消解事件（Story 6.1）：coreference 过滤器（链首）每次执行经
+``record_coref`` 补挂事件——透传与消解命中同事件口径（latency_ms /
+ref_count / audit_written / audit_error / resolver_error）；resolver
+回落透传以 ref_count=0 + resolver_error=True 可观测（与「本就无
+指代」的恒等透传区分，运行侧据 True 持续出现发现消解持续失败）；
+audit_error 区分审计写故障（True，需告警）与设计内跳过（turn 缺失 /
+writer 未注入，False）。记录本身 fail-safe，未配置 Langfuse 时 no-op。
 """
 
 import re
@@ -334,6 +343,48 @@ def record_classification_failure(trace_id: str | None, *, reason: str) -> None:
             metadata={
                 "event": "intent_classification_failure",
                 "reason": reason[:_STATUS_MESSAGE_LIMIT],
+            },
+        )
+
+
+def record_coref(
+    trace_id: str | None,
+    *,
+    latency_ms: float,
+    ref_count: int,
+    audit_written: bool,
+    audit_error: bool,
+    resolver_error: bool,
+) -> None:
+    """指代消解事件（Story 6.1）：延迟/引用数/审计写入结果补挂消息 trace。
+
+    透传与消解命中同事件口径：ref_count=0 覆盖回落透传与恒等消解，
+    ``resolver_error`` 区分二者——True 仅 resolver 调用 / 产出复核
+    抛异常回落（Story 6.2 运行侧据 True 持续出现发现消解持续失败）；
+    False 为恒等透传（本就无指代）。``audit_written=False`` 覆盖未
+    写入的两种情形，``audit_error`` 区分归因：True 仅 writer 抛异常
+    （Redis 写失败，fail-safe 路径，需告警）；False 为设计内跳过
+    （turn 缺失 / writer 未注入）。
+    fail-safe 口径同 ``record_classification``：记录本身再抛异常也
+    吞掉，未配置 Langfuse 时 no-op。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="coref.resolution",
+            metadata={
+                "event": "coref_resolution",
+                "latency_ms": round(latency_ms, 3),
+                "ref_count": ref_count,
+                "audit_written": audit_written,
+                "audit_error": audit_error,
+                "resolver_error": resolver_error,
             },
         )
 

@@ -43,15 +43,17 @@ Story 5.2 已交付：``record_transcript`` / ``read_transcript`` 为会话
 「最近 3 轮对话原文」上下文权威来源（Story 5.2 决策 Q1-A：原文，
 无 LLM 依赖）。
 
-仍待后续交付：``write_coref``（指代消解 Story）及 ``:coref:{turn}``
-键落盘。
+Story 6.1 已交付：``write_coref`` 为指代消解审计单写者（AD-4）——
+per-turn 键 ``weiliao:session:{session_id}:coref:{turn}``（JSON，TTL
+与会话一致），仅作留痕，任何下游禁止反读 Redis 重建 coref。
 """
 
 import json
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import cast
+from typing import Any, cast
 
 import redis
 
@@ -326,6 +328,27 @@ class SessionManager:
         """
         key = f"{self._key(session_id)}:intent:{turn}"
         self._client.set(key, classification.model_dump_json(), ex=self._ttl_seconds)
+
+    def write_coref(
+        self,
+        session_id: str,
+        turn: int,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """指代消解审计单写者落盘（Story 6.1，AD-4）：per-turn 键 + 会话 TTL。
+
+        ``SET weiliao:session:{session_id}:coref:{turn} {JSON} EX
+        ttl_seconds`` 单 roundtrip（``ensure_ascii=False``，与
+        ``write_intent`` / ``mark_handoff`` 序列化口径一致）；键独立于
+        会话 hash，TTL 与会话一致（30 分钟默认，随写刷新）。审计键仅
+        作留痕：任何下游禁止反读 Redis 重建 coref（spec Boundaries）。
+        写失败不吞异常：调用方（coreference 过滤器）经 try 包裹
+        fail-safe，应答不降级。
+        """
+        key = f"{self._key(session_id)}:coref:{turn}"
+        self._client.set(
+            key, json.dumps(payload, ensure_ascii=False), ex=self._ttl_seconds
+        )
 
     def read_snapshot(self, session_id: str) -> SessionSnapshot | None:
         """只读当前会话快照；key 不存在（已过期）或为缺 turn /

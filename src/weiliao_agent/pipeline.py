@@ -1,8 +1,8 @@
 """管道编排器（Story 1.2 核心交付）。
 
 手写纯 Python 编排（AD-2，无 LangGraph Runtime 依赖）：顺序调用
-intent_router → cache_lookup → llm_generate → risk_review →
-response_assembler，过滤器间仅经信封传递。
+coreference → intent_router → cache_lookup → llm_generate →
+risk_review → response_assembler，过滤器间仅经信封传递。
 
 Story 5.1 转人工短路：信封经 intent_router 挂 ``handoff`` 判定结果后，
 若 ``triggered is True`` 编排器立即跳过剩余过滤器（cache/llm/risk/
@@ -36,6 +36,7 @@ from typing import Protocol
 
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.filters.cache_lookup import CacheLookupFilter
+from weiliao_agent.filters.coreference import CoreferenceFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
@@ -104,6 +105,10 @@ class PipelineOrchestrator:
             filters
             if filters is not None
             else [
+                # Story 6.1（AD-11）：指代消解过滤器占据链首——默认
+                # 透传（恒等消解），resolved_message 为 intent_router
+                # 唯一分类输入；编排器逐跳超时/异常兜底不变。
+                CoreferenceFilter(),
                 IntentRouterFilter(),
                 CacheLookupFilter(),
                 LlmGenerateFilter(

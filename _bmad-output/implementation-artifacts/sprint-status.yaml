@@ -1,5 +1,5 @@
 # generated: 2026-10-31
-# last_updated: 2026-11-02
+# last_updated: 2026-11-10
 # project: test
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-10-31
-last_updated: 2026-11-09
+last_updated: 2026-11-10
 project: test
 project_key: NOKEY
 tracking_system: file-system
@@ -73,10 +73,21 @@ development_status:
   4-4-后置风控双审核: review
   4-5-OpenAI-故障降级与步进恢复: review
   4-6-模型路由与成本护栏: review
+  4-7-空草稿拦截与兜底承接: backlog
   epic-4-retrospective: optional
   epic-5: in-progress
   5-1-硬触发条件判定: review
   5-2-Kafka-转人工单向指令: review
   5-3-转人工原子终态与买家安抚通知: review
   5-4-AI-身份披露标识: review
+  5-5-转人工后会话响应路径关闭: backlog
   epic-5-retrospective: optional
+  epic-6: in-progress
+  6-1-指代消解过滤器接口与管道接入: review
+  6-2-房源指代归一化默认实现: backlog
+  6-3-下游消费接入与追问判定-retrofit: backlog
+  epic-6-retrospective: optional
+  epic-7: backlog
+  7-1-运维文档与配置交付: backlog
+  7-2-超时风暴压测与执行器生命周期重审: backlog
+  epic-7-retrospective: optional

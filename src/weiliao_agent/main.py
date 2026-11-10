@@ -109,6 +109,7 @@ from weiliao_agent.cache.l0_client import L0CacheClient
 from weiliao_agent.cache.l1_cache import L1CacheClient
 from weiliao_agent.classifiers import create_classifier
 from weiliao_agent.filters.cache_lookup import CacheLookupFilter
+from weiliao_agent.filters.coreference import CoreferenceFilter
 from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.llm_generate import LlmGenerateFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
@@ -553,6 +554,11 @@ async def _lifespan(app: object) -> AsyncIterator[None]:
 app = create_app(
     PipelineOrchestrator(
         filters=[
+            # Story 6.1（AD-11）：指代消解过滤器占据链首——默认透传
+            # （恒等消解，resolved_message = 原文拷贝），真实消解归
+            # Story 6.2 / OQ-5 选型后组合根注入 resolver；审计回调为
+            # AD-4 单写者方法引用（同 intent_writer 先例）。
+            CoreferenceFilter(coref_writer=_session_manager.write_coref),
             IntentRouterFilter(
                 classifier=_classifier,
                 intent_writer=_session_manager.write_intent,

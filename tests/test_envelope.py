@@ -32,11 +32,49 @@ def test_happy_path_valid_dict_produces_envelope() -> None:
     assert envelope.intent == "PRICE_INQUIRY"
     assert isinstance(envelope.timestamp, datetime)
     assert envelope.trace_id == "trace-001"
-    # 预留四字段默认 None，不参与本 Story 验收。
+    # 四字段默认 None（Story 6.1：coref 为 None 即「过滤器未执行」）。
     assert envelope.message is None
     assert envelope.resolved_message is None
     assert envelope.coref is None
     assert envelope.media_type is None
+
+
+# ---- Story 6.1：coref 收窄为 list[CorefRef]（HTTP 入口 model_validate 口径） ----
+
+
+def test_coref_accepts_valid_coref_ref_dict_list() -> None:
+    # 生产唯一执行点：合法 CorefRef dict 列表经 model_validate 全量校验。
+    payload = _valid_payload()
+    payload["coref"] = [
+        {"entity_type": "house", "entity_id": "house-001"},
+        {"entity_type": "price"},
+    ]
+
+    envelope = Envelope.model_validate(payload)
+
+    assert envelope.coref is not None
+    assert len(envelope.coref) == 2
+    assert envelope.coref[0].entity_type == "house"
+    assert envelope.coref[0].entity_id == "house-001"
+    assert envelope.coref[1].entity_type == "price"
+    assert envelope.coref[1].entity_id is None
+
+
+@pytest.mark.parametrize(
+    "coref",
+    [
+        ["junk"],  # 非 dict 条目
+        [{"entity_type": "bogus"}],  # 未知实体类型
+        [{"entity_type": "house"}],  # house 缺 entity_id（模型约束）
+    ],
+)
+def test_coref_rejects_invalid_values_fails_closed(coref: object) -> None:
+    # 非法 coref 经入口校验拒绝即 fail-closed（不进入管道）。
+    payload = _valid_payload()
+    payload["coref"] = coref
+
+    with pytest.raises(ValidationError):
+        Envelope.model_validate(payload)
 
 
 @pytest.mark.parametrize("missing_field", ["session_id", "house_id", "timestamp"])

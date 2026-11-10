@@ -3,6 +3,7 @@ stepsCompleted: ["step-01-validate-prerequisites", "step-02-design-epics", "step
 inputDocuments:
   - "_bmad-output/planning/prds/prd-微聊首响Agent-2026-10-21/prd.md"
   - "_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md"
+  - "_bmad-output/implementation-artifacts/deferred-work.md"
 ---
 
 # 微聊首响 Agent - Epic Breakdown
@@ -35,6 +36,12 @@ FR9: AI 身份披露 — 聊天界面在 Agent 响应气泡旁持续展示"AI �
 
 FR10: 会话状态一致性 — 同一 session 的连续消息，无论由哪个服务实例处理，均可读取一致的会话状态；会话状态存储于 Redis，TTL 30 分钟；多实例并发读取同一 session 状态不产生竞态条件（Redis 原子操作或分布式锁）；会话过期后重新发起对话，状态从零初始化，无残留
 
+FR11: 指代消解（Coreference Resolution）— 系统对每条买家文本消息，在意图分类之前执行指代消解，输出消解后消息与引用元数据（引用实体类型、实体 ID）。房源指代（它/这套/那套/上面说的 等）消解准确率 ≥ 95%（人工标注测试集，含指代类样本 ≥ 20%，与 FR-1 测试集同期建设）；消解输出为自包含文本（"它多少钱" → "这套房（house_id: xxx）多少钱"），意图分类（FR-1）、重复追问判定（FR-2）与 LLM 生成（FR-6）只消费消解后消息，不直接读取买家原始文本；消解延迟 P99 < 10ms，FR-1 意图分类延迟预算（P99 < 50ms）口径为含消解的端到端；消解结果写入会话状态（Redis），键：`weiliao:session:{session_id}:coref:{turn}`；无法确定先行词时保留原文进入意图分类，不阻塞、不转人工；非房源实体指代（价格、楼层、位置等）MVP 尽力消解，失败按同一路径降级；先行词锚定会话单一房源（跨会话/跨房源不做，PRD §5）；实现选型（规则模板归一化 / 轻量序列标注模型 / LLM 改写）与 OQ-1 一同第 2 周据语料标注决定（PRD OQ-5），脊柱仅定接口边界（AD-11）
+
+FR12: 转人工后会话响应路径关闭 — 转人工（handoff 状态，权威值存 Redis，经 SessionManager 读取）后，入口/编排器消费 handoff_status 短路同 session 后续消息，不再重建信封走完整 AI 管道，实现"转人工后 Agent 响应路径关闭、避免人机混答"（AD-7 原子终态的强制 enforcement）；需补"转人工后零 AI 回复"端到端测试
+
+FR13: 空串/仅空白草稿处理 — 空串或仅空白草稿按"无草稿"处理，不产出只有前缀无正文的买家应答、不产生前缀双标；口径（2026-11-10 拍板）：由 risk_review/响应组装入口拦截，空草稿不进入携标组装，走模板兜底应答路径；拦截发生在草稿过审之前，不触碰冻结约束"过审草稿除加前缀外不得再被改写"；risk_review 对空草稿的拦截口径与本条一致
+
 ### NonFunctional Requirements
 
 NFR1: 首响端到端延迟 P99 < 3s — 从买家消息到达系统到买家收到响应（SM-1）
@@ -53,6 +60,10 @@ NFR7: 健康检查端点 — `GET /health` 挂在响应组装过滤器，返回 
 
 NFR8: 实例无状态 — 逻辑架构保持实例无状态、任意实例可处理任意消息；L1 仅为优化层不影响正确性
 
+NFR9: 运维文档与配置交付 — 全部新增 env 变量（含 4.4/4.5/4.6 的 WEILIAO_LLM_BREAKER_* 系列）在 runbook/README 有文档说明；`/health` 的 model_routing 快照与 ERROR 级 `model_routing_alert` 告警有 runbook 可查；`.env.example` 不留空值变量（blank=用缺省值或示例填具体值），整体拷贝为 .env 即可启动
+
+NFR10: 超时风暴压测与执行器生命周期重审 — 编排器逐跳超时丢弃的执行线程无取消/复用机制（Story 1.2/4.3 挂账同根）；在 Epic 4 真实过滤器（带副作用）落地后执行超时风暴压测，重审执行器生命周期（共享池/cancel/信封所有权），并评估为被丢弃的生成调用记 token 归因
+
 ### Additional Requirements
 
 - 技术栈锁定（架构 Stack 表）：Python ≥3.11、FastAPI ≥0.115.0、Uvicorn ≥0.32.0、Pydantic ≥2.9.0、LangGraph 1.2.16（仅 LLM 子图）、LangChain-OpenAI ≥1.6.2、redis-py 8.1.0、Langfuse SDK 5.0.4、cachetools 7.2.4、OpenAI gpt-4o / gpt-4o-mini
@@ -70,6 +81,7 @@ NFR8: 实例无状态 — 逻辑架构保持实例无状态、任意实例可处
 - 意图分类器具体选型延期至第 2 周（PRD OQ-1，据语料标注决定）：规则引擎 / gpt-4o-mini zero-shot / 微调小模型；脊柱仅定接口边界（AD-3 单意图路由）
 - 部署拓扑延期（K8s vs 公司 PaaS），逻辑架构须保持实例无状态
 - 既有 my-agent 脚手架（anthropic、a2a-sdk、postgres checkpoint、sse-starlette）为无关原型依赖，不复用、不继承
+- 指代消解过滤器（AD-11）：`filters/coreference` 为管道第一个热路径过滤器（信封标准化之后、意图分类之前），手写纯 Python，毫秒级可控；coref 结果由指代消解过滤器产出、经会话管理模块写入会话状态（状态变更矩阵既定分工）；无法确定先行词时保留原文、不阻塞不转人工
 
 ### UX Design Requirements
 
@@ -87,8 +99,11 @@ FR7: Epic 4 - 双审核机制（风控审核 + 模板兜底）
 FR8: Epic 4 - OpenAI 故障降级（切换 <100ms、步进恢复、可观测）
 FR9: Epic 5 - AI 身份披露（标识展示、转人工切换、话术合规）
 FR10: Epic 1 - 会话状态一致性（Redis、单写者、原子操作、TTL 30min）
+FR11: Epic 6 - 指代消解（管道首位过滤器、准确率 ≥95%、P99 < 10ms、coref 会话状态写入、降级不阻塞）
+FR12: Epic 5 - 转人工后响应路径关闭（handoff_status 短路 + 零 AI 回复端到端测试）
+FR13: Epic 4 - 空草稿拦截（risk_review/组装入口拦截，模板兜底承接）
 
-NFR 映射：NFR1（端到端延迟）贯穿 Epic 2-4 验收；NFR2（可用性）主落在 Epic 4 降级能力；NFR3（转人工延迟）落在 Epic 5；NFR4（LLM 链路延迟预算）落在 Epic 4；NFR5（Kafka 消费延迟）落在 Epic 3；NFR6（全链路可观测）落在 Epic 1 并在各 Epic 验收；NFR7（健康检查）、NFR8（实例无状态）落在 Epic 1。
+NFR 映射：NFR1（端到端延迟）贯穿 Epic 2-4 验收；NFR2（可用性）主落在 Epic 4 降级能力；NFR3（转人工延迟）落在 Epic 5；NFR4（LLM 链路延迟预算）落在 Epic 4；NFR5（Kafka 消费延迟）落在 Epic 3；NFR6（全链路可观测）落在 Epic 1 并在各 Epic 验收；NFR7（健康检查）、NFR8（实例无状态）落在 Epic 1；NFR9（运维文档与配置交付）落在 Epic 7；NFR10（超时风暴压测与执行器重审）落在 Epic 7。
 
 ## Epic List
 
@@ -106,11 +121,19 @@ NFR 映射：NFR1（端到端延迟）贯穿 Epic 2-4 验收；NFR2（可用性�
 
 ### Epic 4: LLM 受控应答与风控兜底
 实现 LangGraph LLM 子图与 OpenAI 客户端（受控生成、事实卡片 grounding、违禁词约束、首 token P99 < 1.5s）；实现后置风控审核（100% 覆盖、不通过切模板兜底、通过率 ≥95% 基线）与 OpenAI 故障降级（429/5xx/超时 >1.8s 自动切换 <100ms、步进恢复、降级可观测）。完成后，买家获得自然、合规、事实准确的 AI 应答，任何故障不中断服务。
-**FRs covered:** FR6, FR7, FR8（另承载 NFR4）
+**FRs covered:** FR6, FR7, FR8, FR13（另承载 NFR4；新增 Story 4.7 空草稿拦截）
 
 ### Epic 5: 转人工升级与 AI 身份合规
 实现硬触发转人工全流程（红线意图 / 图片语音 / 追问 ≥3 次 / 负面词汇 → Kafka 转交指令先送、买家安抚通知后达，P99 < 5s，失败重试 3 次 + 死信队列）；实现 AI 身份披露标识（Agent 响应 100% 携带、转人工后切换为经纪人身份、生成话术不得冒充经纪人）。完成后，红线会话即时触达经纪人工作台，买家全程知情。
-**FRs covered:** FR3, FR9（另承载 NFR3）
+**FRs covered:** FR3, FR9, FR12（另承载 NFR3；新增 Story 5.5 转人工后响应路径关闭）
+
+### Epic 6: 买家消息指代消解
+实现管道首位指代消解过滤器（`filters/coreference`，信封标准化之后、意图分类之前，手写纯 Python）：将买家消息中的房源指代（它/这套/那套/上面说的 等）归一化为自包含消解后消息与引用元数据，消解结果写入会话状态（`weiliao:session:{session_id}:coref:{turn}`）；无法确定先行词时保留原文降级，不阻塞、不转人工。完成后，意图分类、重复追问判定与 LLM 生成均无需回溯对话历史即可正确工作。实施注记：FR-2 追问判定口径为"基于消解后消息"，Story 2-3 已实现部分需配套 retrofit 接入点改造；实现选型（规则模板 / 序列标注 / LLM 改写）随 OQ-5 第 2 周定，脊柱仅定接口边界。
+**FRs covered:** FR11
+
+### Epic 7: 可运维性与过载韧性
+补齐运维可交付物：全部新增 env 变量（含 WEILIAO_LLM_BREAKER_* 系列）、`/health` 的 model_routing 快照与 ERROR 级 `model_routing_alert` 告警统一写入 runbook/README，`.env.example` 空值治理（blank=缺省值或示例值），整体拷贝即可启动；执行超时风暴压测并重审编排器执行器生命周期（共享池/cancel/信封所有权），评估被丢弃生成调用的 token 归因记账。完成后，运维不读源码即可排障，超时风暴下服务不劣化、无资源膨胀。
+**FRs covered:** NFR9, NFR10
 
 ## Epic 1: 消息管道基座与会话状态
 
@@ -374,6 +397,31 @@ So that 应答质量与调用成本平衡，成本异常增长时有控制手段
 **Then** 路由策略配置化，可灰度调整；模型选择记录 Langfuse trace，可复盘单条消息的模型与费用
 **And** 预算超限时自动收紧路由（提高 mini 模型占比）并触发告警，而非仅记录
 
+### Story 4.7: 空草稿拦截与兜底承接
+
+As a 买家,
+I want 草稿为空或仅空白时收到完整的模板兜底应答,
+So that 我不会收到只有"AI 助手："前缀没有正文的残缺消息，也不会看到双标前缀。
+
+**Acceptance Criteria:**
+
+**Given** 风控审核通过且 draft 为空串（""）
+**When** 响应组装过滤器处理该结果
+**Then** 不执行携标组装，走模板兜底应答路径，买家收到完整模板应答
+**And** Langfuse trace 记录 draft_empty 拦截事件（trace_id 符合 32-hex 可检索）
+
+**Given** draft 为仅空白字符串（空格/换行/制表符组合）
+**When** 响应组装过滤器处理该结果
+**Then** strip 后判空，与空串同等按"无草稿"处理
+
+**Given** draft 非空
+**When** 响应组装
+**Then** 行为与现状逐字节一致（加前缀携标，不再做任何清洗改写，不触碰"过审草稿除加前缀外不得再被改写"冻结约束）
+
+**Given** 空草稿到达 risk_review
+**When** 拦截判定
+**Then** 与响应组装入口口径一致（统一"按无草稿处理"）
+
 ## Epic 5: 转人工升级与 AI 身份合规
 
 实现硬触发条件的转人工全流程（Kafka 单向指令 + 买家安抚通知）、转人工原子终态与 AI 身份披露，保证红线会话即时触达经纪人工作台且买家全程知情。
@@ -433,3 +481,145 @@ So that 我的知情权和平台合规要求得到保障。
 **Then** Agent 响应 100% 携带"AI 助手"标识（FR-9），经经纪人工作台聊天界面承载
 **And** 转人工后标识消失，切换为经纪人姓名/头像，无残留
 **And** "AI 助手"标识的展示与切换逻辑可通过 Langfuse trace 对应的会话记录验证
+
+### Story 5.5: 转人工后会话响应路径关闭
+
+As a 买家/经纪人,
+I want 转人工后同一会话的后续消息不再产生任何 AI 应答,
+So that 不会出现人机混答，经纪人接管后对话由人继续。
+
+**Acceptance Criteria:**
+
+**Given** session 已 mark_handoff（handoff 状态落盘 Redis）
+**When** 同 session 新消息到达入口/编排器
+**Then** 编排器经 SessionManager 读取 handoff_status（权威值在 Redis）短路该消息，不重建信封走完整 AI 管道
+
+**Given** 短路发生
+**When** 观察买家侧下发
+**Then** 零 AI 回复：无 LLM 生成、无模板兜底应答下发
+
+**Given** handoff 状态不存在或会话已过期（TTL 30 分钟）
+**When** 新消息到达
+**Then** 状态从零初始化，走正常 AI 管道
+
+**Given** 转人工分支自身流程（Kafka 转交指令 + 买家安抚通知，Story 5.2/5.3）
+**When** Story 5.5 改动后
+**Then** 该路径行为不变（本次改动不触碰指令与安抚发送链路）
+
+**And** "转人工后零 AI 回复"端到端测试用例存在且通过
+**And** L1 进程内 handoff 状态快照仅作优化层读取，不影响正确性（NFR8）
+
+## Epic 6: 买家消息指代消解
+
+实现管道首位指代消解过滤器（`filters/coreference`，信封标准化之后、意图分类之前，手写纯 Python）：将买家消息中的房源指代归一化为自包含消解后消息与引用元数据，消解结果写入会话状态；无法确定先行词时保留原文降级，不阻塞、不转人工。完成后，意图分类、重复追问判定与 LLM 生成均无需回溯对话历史即可正确工作。
+
+### Story 6.1: 指代消解过滤器接口与管道接入
+
+As a 系统,
+I want coreference 过滤器以既定接口边界接入管道首位,
+So that 后续实现选型（OQ-5）可插拔替换，且接入不阻塞现有链路。
+
+**Acceptance Criteria:**
+
+**Given** 任意买家消息进入管道
+**When** 通过过滤器链
+**Then** coreference 在信封标准化之后、intent_router 之前执行，手写纯 Python，毫秒级可控（AD-2、AD-11）
+
+**Given** 实现选型未决（OQ-5，规则模板 / 序列标注 / LLM 改写，第 2 周据语料标注决定）
+**When** 默认实现运行
+**Then** 原文透传 + 归一化钩子，输出消解后消息与引用元数据结构（引用实体类型、实体 ID），接口边界即脊柱锁定范围
+
+**Given** 消解执行完成
+**When** 写会话状态
+**Then** 键 `weiliao:session:{session_id}:coref:{turn}`，由会话管理模块写入（单写者 AD-4）
+
+**And** 透传场景下该过滤器自身延迟 P99 < 10ms 预算内
+
+### Story 6.2: 房源指代归一化默认实现
+
+As a 买家,
+I want "它/这套/那套/上面说的"被归一化为显式房源引用,
+So that 我的追问始终围绕同一套房子被系统正确理解。
+
+**Acceptance Criteria:**
+
+**Given** 消息含房源指代且会话状态已确定 house_id（会话绑定单一房源）
+**When** 执行消解
+**Then** 输出自包含消解后文本（"它多少钱" → "这套房（house_id: xxx）多少钱"）
+
+**Given** 人工标注测试集（指代类样本 ≥ 20%，与 FR-1 测试集同期建设）
+**When** 评估消解质量
+**Then** 房源指代消解准确率 ≥ 95%（FR-11）
+
+**Given** 无法确定先行词
+**When** 执行消解
+**Then** 保留原文进入意图分类，不阻塞、不转人工（由分类置信度与 UNKNOWN 既有路径承接）
+
+**Given** 非房源实体指代（价格、楼层、位置等）
+**When** 执行消解
+**Then** MVP 尽力消解，失败按上一条路径降级
+
+### Story 6.3: 下游消费接入与追问判定 retrofit
+
+As a 系统,
+I want 意图分类、追问判定与 LLM 生成只消费消解后消息,
+So that 指代与同义改写叠加的场景被正确识别为同一意图，全链路无需回溯对话历史。
+
+**Acceptance Criteria:**
+
+**Given** coreference 过滤器已接入管道（Story 6.1）
+**When** 意图分类（2.x）与 LLM 生成（4.3）取输入
+**Then** 只消费消解后消息，不直接读取买家原始文本（FR-11）
+
+**Given** Story 2-3 追问判定已实现
+**When** 配套 retrofit 接入点
+**Then** 追问判定基于消解后消息，"它多少钱"与"这套房多少钱"计为同一意图（FR-2 口径）
+
+**And** FR-1 延迟口径验收：意图分类 P99 < 50ms 为含消解的端到端
+**And** PRD 小王场景（"它采光怎么样"）端到端链路验证通过
+
+## Epic 7: 可运维性与过载韧性
+
+补齐运维可交付物（env 变量、model_routing 快照与告警的 runbook/README，`.env.example` 空值治理），并执行超时风暴压测、重审编排器执行器生命周期，使运维不读源码即可排障、超时风暴下服务不劣化不膨胀。
+
+### Story 7.1: 运维文档与配置交付
+
+As a 运维工程师,
+I want 环境变量与告警有 runbook 可查、示例配置可直接启动,
+So that 排障不读源码，交接与部署不靠口口相传。
+
+**Acceptance Criteria:**
+
+**Given** 全部新增 env 变量（含 4.4/4.5/4.6 的 WEILIAO_LLM_BREAKER_* 系列）
+**When** 查阅 README/runbook
+**Then** 每个变量有说明、缺省值与调参影响（NFR9）
+
+**Given** `/health` 的 model_routing 快照与 ERROR 级 `model_routing_alert` 告警
+**When** 告警触发
+**Then** runbook 中有对应处置步骤可查
+
+**Given** 干净 checkout 的仓库
+**When** `cp .env.example .env` 后启动
+**Then** 服务直接启动成功（无空值导致的启动失败）
+
+### Story 7.2: 超时风暴压测与执行器生命周期重审
+
+As a 系统运营者,
+I want 超时风暴下执行线程不积累、慢调用可取消,
+So that 个别慢请求被丢弃后服务不劣化、资源不膨胀、浪费的 token 有归因。
+
+**Acceptance Criteria:**
+
+**Given** 可控慢过滤器（llm_generate 以 stub 控制慢速），Epic 4 真实过滤器已落地
+**When** 执行超时风暴压测
+**Then** 执行线程不积累，P99 不劣化超预算（NFR10）
+
+**Given** 压测结果
+**When** 重审执行器生命周期
+**Then** 共享池/cancel 机制/信封所有权（frozen 评估）有明确决策记录并落地
+
+**Given** 被超时丢弃的生成调用
+**When** 评估归因方案
+**Then** token 记账落地，或记录"不做"的决策理由
+
+**And** deferred-work 中 1.2/4.3 执行器相关挂账条目关闭

@@ -35,16 +35,21 @@
   内单一评估模块产出——未评估为 None、评估未触发为 ``triggered=False``
   （区分「没评估」与「评估了没命中」）；编排器只认 ``triggered is True``
   短路下游（cache/llm/risk/assembler 零执行）走转人工出口分支；
-- ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
- 预留字段，默认 None；``media_type`` 自 Story 5.1 起由硬触发评估消费
-  （None / "text" 视为文本，其余一律判触发），其余仍不消费。
+- ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 默认 None；
+  ``message`` 为买家原文，已由 coreference 过滤器透传消费（拷贝至
+  ``resolved_message``），intent_router 经 AD-11 回落口径读原文；
+  ``resolved_message`` / ``coref`` 为 Story 6.1 收窄后的指代消解挂点
+  （AD-11）——coreference 过滤器（链首）唯一写入，信封为唯一真相源；
+  ``coref`` 为 None 保留「过滤器未执行」语义；``media_type`` 自
+  Story 5.1 起由硬触发评估消费（None / "text" 视为文本，其余一律判
+  触发）。
 """
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from weiliao_agent.models.coref import CorefRef
 from weiliao_agent.models.fact_card import FactCard
 from weiliao_agent.models.intent import IntentTag
 
@@ -93,11 +98,15 @@ class Envelope(BaseModel):
     # 评估模块写入；未评估为 None、评估未触发为 triggered=False（区分
     # 「没评估」与「评估了没命中」），下游短路只认 triggered is True。
     handoff: HandoffAssessment | None = None
-    # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
-    # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
+    # 以下字段口径：message 为买家原文（coreference 透传其拷贝至
+    # resolved_message，intent_router AD-11 回落读原文）；resolved_
+    # message / coref 为 Story 6.1 收窄后的指代消解挂点（AD-11，权威
+    # 定义 models.coref.CorefRef）——coreference 过滤器唯一写入（默认
+    # 透传：resolved_message 为原文拷贝、coref 为 []）；coref 为 None
+    # 即「过滤器未执行」。media_type 仍为架构预留字段。
     message: str | None = None
     resolved_message: str | None = None
-    coref: list[Any] | None = None
+    coref: list[CorefRef] | None = None
     media_type: str | None = None
 
     @field_validator("timestamp")
