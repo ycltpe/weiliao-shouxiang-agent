@@ -84,7 +84,7 @@ development_status:
   epic-5-retrospective: optional
   epic-6: in-progress
   6-1-指代消解过滤器接口与管道接入: review
-  6-2-房源指代归一化默认实现: backlog
+  6-2-房源指代归一化默认实现: review
   6-3-下游消费接入与追问判定-retrofit: backlog
   epic-6-retrospective: optional
   epic-7: backlog

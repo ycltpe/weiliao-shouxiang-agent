@@ -20,6 +20,7 @@ import redis
 from conftest import _FakeLangfuse
 from pydantic import ValidationError
 
+from weiliao_agent.coref import RuleBasedCorefResolver
 from weiliao_agent.filters.coreference import CoreferenceFilter
 from weiliao_agent.models.coref import CorefRef
 from weiliao_agent.models.envelope import Envelope
@@ -370,3 +371,32 @@ def test_coreference_filter_is_chain_head_before_intent_router() -> None:
         "risk_review",
         "response_assembler",
     )
+
+
+# ---- Story 6.2 集成：真实 resolver 注入过滤器（钩子接线验证） ----
+
+
+def test_real_rule_based_resolver_xiaowang_scenario_end_to_end(
+    manager: SessionManager, redis_client: fakeredis.FakeRedis
+) -> None:
+    # 小王场景全链路：真实 RuleBasedCorefResolver 注入过滤器——买家
+    # 原文 "它采光怎么样" 产出消解后文本 + 单条 house 引用，审计
+    # payload 形状与信封 coref 一致（钩子与默认实现接线验证）。
+    filter_ = CoreferenceFilter(
+        resolver=RuleBasedCorefResolver(), coref_writer=manager.write_coref
+    )
+    envelope = _envelope("它采光怎么样")
+
+    result = filter_.process(envelope)
+
+    expected_resolved = "这套房（house_id: house-001）采光怎么样"
+    assert result.resolved_message == expected_resolved
+    assert result.coref == [CorefRef(entity_type="house", entity_id=HOUSE_A)]
+    raw = cast("bytes", redis_client.get(_audit_key()))
+    stored = json.loads(raw.decode())
+    assert stored == {
+        "trace_id": TRACE_ID,
+        "resolved_message": expected_resolved,
+        "coref": [{"entity_type": "house", "entity_id": HOUSE_A}],
+    }
+    assert redis_client.ttl(_audit_key()) == DEFAULT_TTL_SECONDS

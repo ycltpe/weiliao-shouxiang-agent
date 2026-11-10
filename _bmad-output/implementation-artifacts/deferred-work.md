@@ -104,3 +104,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
   summary: sprint-status.yaml 头部注释的 `# last_updated: 2026-11-02` 与正文长期不一致（本 Story 更新正文时头部继续滞留旧值）。
   evidence: 6.1 盲审#12；头部注释在本 Story 之前即已陈旧，非本 Story 引入。settle：顺手修或纳入 Epic 7 运维文档治理。
+
+## Deferred from: spec-6-2-house-coreference-normalization-default-impl (2026-11-10)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-2-house-coreference-normalization-default-impl.md`
+  summary: 人工标注消解语料未就绪，FR-11 ≥95% 房源指代消解准确率的真实验收门 deferred（spec 明令不虚构人工标注语料冒充验收门）。
+  evidence: 本 Story 交付 `tests/eval_coref_resolver.py` 评测 harness（内置合成种子集冒烟 + 指代类占比 ≥20% 完整性校验），CSV 语料模式与 ≥95% 验收门已就位。settle：语料与 FR-1 测试集同期建设后，以标注 CSV（列 `text,has_house_coref`，可选 `expected_resolved`）复跑 `uv run python tests/eval_coref_resolver.py eval.csv` 执行真实验收门。

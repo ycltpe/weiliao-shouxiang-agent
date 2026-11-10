@@ -626,9 +626,10 @@ def test_main_composition_root_records_followup_to_redis(
 def test_main_composition_root_writes_coref_audit_to_redis(
     monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
 ) -> None:
-    # Story 6.1 组合根端到端：coreference 过滤器（链首）经组合根注入的
-    # write_coref 落盘 per-turn 审计键（默认透传：resolved_message 为
-    # 原文拷贝、coref 为 []），fakeredis 无 LLM 网络。
+    # Story 6.1 组合根端到端 + Story 6.2 更新：coreference 过滤器（链首）
+    # 经组合根注入的 write_coref 落盘 per-turn 审计键；组合根现已注入
+    # 规则模板 resolver（Story 6.2），"这套房"归一化为显式引用并产单条
+    # house CorefRef，审计 payload 形状（三键 JSON + TTL）不变。
     fake = fakeredis.FakeRedis()
     monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
     monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
@@ -645,8 +646,8 @@ def test_main_composition_root_writes_coref_audit_to_redis(
     stored = json.loads(cast("bytes", raw).decode())
     assert stored == {
         "trace_id": "trace-001",
-        "resolved_message": "你好，这套房多少钱？",
-        "coref": [],
+        "resolved_message": "你好，这套房（house_id: house-001）多少钱？",
+        "coref": [{"entity_type": "house", "entity_id": "house-001"}],
     }
     assert fake.ttl(f"{KEY_PREFIX}{SESSION_ID}:coref:1") == DEFAULT_TTL_SECONDS
 
