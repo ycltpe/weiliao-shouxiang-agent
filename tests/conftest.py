@@ -35,3 +35,12 @@ def fake_langfuse() -> Iterator[_FakeLangfuse]:
     tracing.set_langfuse_client(client)
     yield client
     tracing.set_langfuse_client(previous)
+
+
+def draft_empty_events(fake_langfuse: _FakeLangfuse) -> list[dict[str, Any]]:
+    """过滤出 draft_empty 拦截事件（Story 4.7）。
+
+    事件名锚点 ``response.draft_empty_event`` 的唯一定义处：测试断言统一
+    经本 helper 取事件，重命名/改taxonomy时单点改动，不会逐文件漂移。
+    """
+    return [e for e in fake_langfuse.events if e["name"] == "response.draft_empty_event"]

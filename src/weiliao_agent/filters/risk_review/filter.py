@@ -4,11 +4,13 @@
 response_assembler`` 的第四跳：消费 4.3 grounding 校验通过的 LLM 草稿
 （信封 ``generated_reply``），调风控中台审核客户端放行或作废：
 
-- 草稿非 None：调中台审核，通过则草稿保留信封（买家可见组装发生在
+- 草稿非 None 且非空：调中台审核，通过则草稿保留信封（买家可见组装发生在
   编排器最终返回点，本过滤器不产出买家可见文本）；不通过/超时/异常/
   未配置 endpoint 一律 ``model_copy`` 清回 None + 模板兜底（编排器口径），
   审核拒绝属设计内行为：``degraded`` 保持 False，质量信号走 trace
   事件与通过率指标；
+- 草稿空串/纯空白（Story 4.7 拦截）：按无草稿同等处理——不调中台、不计
+  通过率分母，清回 None 并记 draft_empty 事件，与审核不通过清稿口径一致；
 - 草稿为 None（红线意图/非文本/生成失败/校验未过）：原样透传，不调
   中台、不计通过率分母；
 - 全路径 fail-safe：客户端逃逸异常也归一为「不通过」，绝不向上抛
@@ -17,7 +19,7 @@ response_assembler`` 的第四跳：消费 4.3 grounding 校验通过的 LLM 草
 
 from threading import Lock
 
-from weiliao_agent.filters.base import Filter
+from weiliao_agent.filters.base import Filter, is_blank_draft
 from weiliao_agent.filters.risk_review.client import RiskReviewClient, RiskReviewVerdict
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.observability import metrics, tracing
@@ -54,6 +56,12 @@ class RiskReviewFilter(Filter):
         if draft is None:
             # 无草稿：不调中台、不计通过率分母，信封原样透传。
             return envelope
+        if is_blank_draft(draft):
+            # 空草稿拦截（Story 4.7）：与无草稿同等处理——不调中台、不计
+            # 通过率分母，草稿作废清回 None（口径同审核不通过），买家应答由
+            # 下游组装器走模板兜底；trace 记 draft_empty 事件（stage 归因）。
+            tracing.record_draft_empty_event(envelope.trace_id, stage="risk_review")
+            return envelope.model_copy(update={"generated_reply": None})
         verdict = self._review(draft, envelope)
         collector = metrics.get_risk_review_metrics()
         collector.record(verdict.outcome)

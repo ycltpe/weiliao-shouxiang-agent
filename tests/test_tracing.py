@@ -449,6 +449,43 @@ def test_record_model_routing_event_is_fail_safe(monkeypatch: pytest.MonkeyPatch
     tracing.record_model_routing_event("ab" * 16, outcome="forced_mini")  # 不抛即通过
 
 
+# ---- Story 4.7：record_draft_empty_event 本体直测（事件名/级别/stage 归因）----
+
+
+@pytest.mark.parametrize("stage", ["risk_review", "response_assembler"])
+def test_record_draft_empty_event_writes_default_level_with_stage(
+    fake_langfuse: _FakeLangfuse, stage: str
+) -> None:
+    tracing.record_draft_empty_event("ab" * 16, stage=stage)
+
+    (event,) = fake_langfuse.events
+    assert event["name"] == "response.draft_empty_event"
+    assert event["level"] == "DEFAULT"  # 设计内拦截：ERROR 只留真实故障
+    assert event["metadata"]["event"] == "draft_empty_event"
+    assert event["metadata"]["stage"] == stage
+    assert event["trace_context"]["trace_id"] == "ab" * 16
+
+
+def test_record_draft_empty_event_skips_missing_or_invalid_trace_id(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    tracing.record_draft_empty_event(None, stage="risk_review")
+    tracing.record_draft_empty_event("not-a-trace-id", stage="response_assembler")
+
+    assert fake_langfuse.events == []
+
+
+def test_record_draft_empty_event_is_fail_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 记录本身再抛也吞掉，绝不令拦截路径崩溃（兜底照常）。
+    class _RaisingClient:
+        def create_event(self, **kwargs: Any) -> None:
+            msg = "sdk create_event boom"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(tracing, "_client", _RaisingClient())
+    tracing.record_draft_empty_event("ab" * 16, stage="risk_review")  # 不抛即通过
+
+
 # ---- ai.disclosure 事件（Story 5.4，AD-10 可审计锚点） ----
 
 

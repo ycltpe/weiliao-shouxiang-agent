@@ -9,9 +9,10 @@ envelope.assembled_reply（权威挂点），编排器最终返回点只读消�
 （4.4 冻结语义）。纯同步、无副作用。
 """
 
-from weiliao_agent.filters.base import Filter
+from weiliao_agent.filters.base import Filter, is_blank_draft
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.observability import tracing
 
 
 class ResponseAssemblerFilter(Filter):
@@ -21,7 +22,14 @@ class ResponseAssemblerFilter(Filter):
 
     def process(self, envelope: Envelope) -> Envelope:
         draft = envelope.generated_reply
-        if draft is None:
+        blank = is_blank_draft(draft)
+        if blank:
+            # 空草稿拦截（Story 4.7）：无买家可见正文，按无草稿同等处理；
+            # 不做清洗/strip 回用（判空只用于分支选择，触 4.4 冻结约束解读
+            # 风险）；trace 记 draft_empty 事件（stage 归因）。
+            tracing.record_draft_empty_event(envelope.trace_id, stage="response_assembler")
+        if draft is None or blank:
+            # render_fallback 内部已带前缀，透传不二次加注。
             assembled = render_fallback(envelope.intent)
         elif draft.startswith(AI_DISCLOSURE_PREFIX):
             assembled = draft  # 草稿已携标：跳过加前缀，防双标

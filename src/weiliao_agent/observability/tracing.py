@@ -79,6 +79,10 @@ HouseSyncOperation = Literal["consumed", "stale_alert", "corrupted", "failure"]
 # Literal 权威定义（同 HouseSyncOperation 先例），拼错即静态报错。
 HandoffCommandOperation = Literal["sent", "failed", "dlq"]
 
+# 空草稿拦截事件 stage 词表（Story 4.7）：两值 Literal 权威定义，拼错即
+# 静态报错；stage 归因区分先到的 risk_review 与组装入口 response_assembler。
+DraftEmptyStage = Literal["risk_review", "response_assembler"]
+
 # 惰性单例缓存（get_client 内部按 public_key 单例）；测试可经
 # ``set_langfuse_client`` 注入替身或重置回 None 走惰性初始化。
 _client: Langfuse | None = None
@@ -836,6 +840,35 @@ def record_model_routing_event(
                 "event": "model_routing_event",
                 "outcome": outcome,
                 "intent": intent,
+            },
+        )
+
+
+def record_draft_empty_event(trace_id: str | None, *, stage: DraftEmptyStage) -> None:
+    """空草稿拦截事件（Story 4.7）：draft_empty 拦截全程可检索锚点。
+
+    空串/纯空白草稿（LLM 产出无正文）在 risk_review 与 response_assembler
+    两处入口被拦截，按「无草稿」走模板兜底（render_fallback），买家收到
+    完整模板应答；拦截属设计内行为，``degraded`` 语义不动，故本事件一律
+    DEFAULT 级（同 4.5 熔断 skip 口径，不制造噪音洪流）。``stage`` 归因
+    区分先到的 risk_review（清回 None，标准管道仅此一处记录）与组装入口
+    response_assembler（覆盖绕过 risk_review 的调用/测试场景）。
+    fail-safe 口径同 ``record_model_routing_event``：记录本身再抛异常也吞掉。
+    """
+    if not _recordable(trace_id):
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
+    with suppress(Exception):
+        client.create_event(
+            trace_context=TraceContext(trace_id=trace_id),
+            name="response.draft_empty_event",
+            level="DEFAULT",
+            metadata={
+                "event": "draft_empty_event",
+                "stage": stage,
             },
         )
 

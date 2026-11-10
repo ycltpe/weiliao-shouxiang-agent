@@ -1,15 +1,18 @@
-"""后置风控审核过滤器单测（Story 4.4，AC 第 1/2/3 条 + I/O 矩阵）。
+"""后置风控审核过滤器单测（Story 4.4，AC 第 1/2/3 条 + I/O 矩阵；
+Story 4.7 空草稿拦截扩）。
 
 替身客户端（恒放行 / 剧本归一 / 抛错）覆盖矩阵全分支：草稿过审保留、
 拒绝/超时/异常清草稿回模板兜底、无草稿不调中台不计分母原样透传、
-客户端逃逸异常绝对 fail-safe；trace 事件（outcome/latency_ms/reason/
-级别）与通过率指标计数经共享替身断言。全部无网络。
+客户端逃逸异常绝对 fail-safe；空串/纯空白草稿按无草稿拦截（不调中台、
+不计分母、清回 None、记 draft_empty 事件，标准管道单事件）；trace 事件
+（outcome/latency_ms/reason/级别）与通过率指标计数经共享替身断言。全部无网络。
 """
 
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from conftest import draft_empty_events
 
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.risk_review import RiskReviewFilter, RiskReviewVerdict
@@ -122,6 +125,50 @@ def test_no_draft_passthrough_without_calling_client() -> None:
     assert snapshot["total"] == 0  # 不计通过率分母
 
 
+@pytest.mark.parametrize("blank", ["", " ", "  \n\t ", "\t\n  "])
+def test_blank_draft_intercepted_without_calling_client(
+    blank: str, fake_langfuse: Any
+) -> None:
+    # 空草稿拦截：不调中台、不计通过率分母、清回 None、记 draft_empty 事件
+    # （stage=risk_review）；与审核不通过清稿口径一致（model_copy 新信封）。
+    client = _StubClient(RiskReviewVerdict(passed=True, outcome="passed", latency_ms=1.0))
+    envelope = _envelope(generated_reply=blank)
+
+    result = RiskReviewFilter(client=client).process(envelope)  # type: ignore[arg-type]
+
+    assert result is not envelope
+    assert result.generated_reply is None  # 草稿作废清回 None
+    assert envelope.generated_reply == blank  # 原信封不被就地改写
+    assert client.calls == []  # 不调中台
+    snapshot = metrics_module.get_risk_review_metrics().snapshot()
+    assert snapshot["total"] == 0  # 不计通过率分母
+    events = draft_empty_events(fake_langfuse)
+    assert len(events) == 1
+    assert events[0]["level"] == "DEFAULT"
+    assert events[0]["metadata"]["event"] == "draft_empty_event"
+    assert events[0]["metadata"]["stage"] == "risk_review"
+
+
+def test_none_draft_records_no_draft_empty_event(fake_langfuse: Any) -> None:
+    # None 不算拦截：零新增行为、不记 draft_empty 事件。
+    client = _StubClient(RiskReviewVerdict(passed=True, outcome="passed", latency_ms=1.0))
+
+    RiskReviewFilter(client=client).process(_envelope(generated_reply=None))  # type: ignore[arg-type]
+
+    assert draft_empty_events(fake_langfuse) == []
+
+
+def test_blank_draft_event_record_failure_does_not_break_intercept(fake_langfuse: Any) -> None:
+    # fail-safe：事件记录自身再抛也吞掉，拦截（清回 None）照常。
+    fake_langfuse.raise_on_event = True
+    client = _StubClient(RiskReviewVerdict(passed=True, outcome="passed", latency_ms=1.0))
+
+    result = RiskReviewFilter(client=client).process(_envelope(generated_reply=""))  # type: ignore[arg-type]
+
+    assert result.generated_reply is None
+    assert client.calls == []
+
+
 def test_client_escape_normalized_to_not_passed() -> None:
     client = _StubClient(error=RuntimeError("client boom"))
     envelope = _envelope()
@@ -211,3 +258,23 @@ def test_full_pipeline_rejected_draft_falls_back_to_template(fake_langfuse: Any)
     assert events[0]["level"] == "ERROR"
     assert events[0]["metadata"]["outcome"] == "rejected"
     assert events[0]["metadata"]["reason"] == "违禁表述"
+
+
+def test_full_pipeline_blank_draft_single_event_and_template_fallback(fake_langfuse: Any) -> None:
+    """AC 4 端到端：空草稿 risk_review 拦截后组装器不再二次记录——全程仅一条
+    draft_empty 事件；买家收到完整模板兜底应答（含前缀），degraded=False。"""
+    client = _StubClient(RiskReviewVerdict(passed=True, outcome="passed", latency_ms=1.0))
+    orchestrator = PipelineOrchestrator(
+        filters=[RiskReviewFilter(client=client), ResponseAssemblerFilter()]  # type: ignore[list-item]
+    )
+
+    result = orchestrator.run(_envelope(generated_reply="  \n "))
+
+    assert result.degraded is False
+    assert result.failed_filter is None
+    assert result.reply == render_fallback("PRICE_INQUIRY")
+    assert client.calls == []  # 中台零调用
+    assert metrics_module.get_risk_review_metrics().snapshot()["total"] == 0  # 零分母
+    events = draft_empty_events(fake_langfuse)
+    assert len(events) == 1  # 标准管道该消息全程仅一条 draft_empty 事件
+    assert events[0]["metadata"]["stage"] == "risk_review"

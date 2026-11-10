@@ -9,6 +9,17 @@ from abc import ABC, abstractmethod
 from weiliao_agent.models.envelope import Envelope
 
 
+def is_blank_draft(draft: str | None) -> bool:
+    """共享草稿判空口径（Story 4.7，两处拦截的唯一出处）。
+
+    ``strip()`` 后为空串即判空（空串/纯空白草稿无买家可见正文）；``None``
+    不判空——None 是「无草稿」常态（未生成/红线/熔断/审核不通过），与
+    空草稿拦截是不同语义，不算拦截、不记 draft_empty 事件。本函数仅用于
+    分支选择，调用方不得拿判空结果做清洗/改写后回用。
+    """
+    return draft is not None and not draft.strip()
+
+
 class Filter(ABC):
     """过滤器抽象基类：单一职责、可替换、可独立测试。"""
 
