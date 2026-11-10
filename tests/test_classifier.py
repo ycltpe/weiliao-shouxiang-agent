@@ -37,6 +37,9 @@ def _envelope(turn: int | None = 1, message: str = "你好，这套房多少钱�
             "timestamp": "2026-10-31T10:00:00+08:00",
             "trace_id": TRACE_ID,
             "message": message,
+            # Story 6.3 夹具口径：决策输入唯一来源为 resolved_message
+            # （standalone 装配显式携带，透传场景逐字节等于原文）。
+            "resolved_message": message,
         }
     )
 

@@ -1,8 +1,10 @@
 """受控生成过滤器（Story 4.3，影子接入决策 A）。
 
 管道固定链 cache_lookup 之后、risk_review 之前的 LLM 生成落点：输入
-归一（``resolved_message`` 为 None 时回落 ``message``；指代消解属
-FR-11 前置，本 Story 不实现）→ 红线意图（NEGOTIATION / LOAN_POLICY /
+归一（Story 6.3 终态：``resolved_message`` 为唯一生成输入，``None``/
+空白跳过生成、不产生草稿，买家原文 ``message`` 在任何路径零读取，
+FR-6 纯消解输入——链首 coreference 过滤器 fail-safe 恒产出
+resolved_message）→ 红线意图（NEGOTIATION / LOAN_POLICY /
 COMPLAINT，红线优先于 LLM 链路）与 ``media_type`` 非 text、空消息跳过
 → 调生成子图（trace 埋点在子图内，Story 4.2 既有）→ 确定性 grounding
 校验（``llm.grounding.verify_grounding``，fail-closed）→ 通过则草稿
@@ -70,11 +72,8 @@ class LlmGenerateFilter(Filter):
             return envelope
         message = envelope.resolved_message
         if message is None or not message.strip():
-            # 指代消解过滤器（FR-11）未就位（或消解结果为空串/纯空白）：
-            # 回落买家原始消息。
-            message = envelope.message
-        if message is None or not message.strip():
-            # 空/空白消息：跳过生成，信封原样透传，不触达模型。
+            # 消解结果缺失/空白（FR-11 终态口径）：跳过生成、不产生
+            # 草稿，信封原样透传、不触达模型；买家原文不做决策性读取。
             return envelope
         breaker = self._breaker
         if breaker is not None and not self._consult_breaker(breaker, envelope):

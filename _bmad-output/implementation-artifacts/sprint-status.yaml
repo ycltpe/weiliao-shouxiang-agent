@@ -82,10 +82,10 @@ development_status:
   5-4-AI-身份披露标识: review
   5-5-转人工后会话响应路径关闭: backlog
   epic-5-retrospective: optional
-  epic-6: in-progress
+  epic-6: done
   6-1-指代消解过滤器接口与管道接入: review
   6-2-房源指代归一化默认实现: review
-  6-3-下游消费接入与追问判定-retrofit: backlog
+  6-3-下游消费接入与追问判定-retrofit: done
   epic-6-retrospective: optional
   epic-7: backlog
   7-1-运维文档与配置交付: backlog

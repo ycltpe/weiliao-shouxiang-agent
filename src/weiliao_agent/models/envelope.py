@@ -37,7 +37,8 @@
   短路下游（cache/llm/risk/assembler 零执行）走转人工出口分支；
 - ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 默认 None；
   ``message`` 为买家原文，已由 coreference 过滤器透传消费（拷贝至
-  ``resolved_message``），intent_router 经 AD-11 回落口径读原文；
+  ``resolved_message``），Story 6.3 起 intent_router / llm_generate
+  决策输入唯一来源为 ``resolved_message``，原文仅留痕性消费；
   ``resolved_message`` / ``coref`` 为 Story 6.1 收窄后的指代消解挂点
   （AD-11）——coreference 过滤器（链首）唯一写入，信封为唯一真相源；
   ``coref`` 为 None 保留「过滤器未执行」语义；``media_type`` 自
@@ -99,11 +100,13 @@ class Envelope(BaseModel):
     # 「没评估」与「评估了没命中」），下游短路只认 triggered is True。
     handoff: HandoffAssessment | None = None
     # 以下字段口径：message 为买家原文（coreference 透传其拷贝至
-    # resolved_message，intent_router AD-11 回落读原文）；resolved_
-    # message / coref 为 Story 6.1 收窄后的指代消解挂点（AD-11，权威
-    # 定义 models.coref.CorefRef）——coreference 过滤器唯一写入（默认
-    # 透传：resolved_message 为原文拷贝、coref 为 []）；coref 为 None
-    # 即「过滤器未执行」。media_type 仍为架构预留字段。
+    # resolved_message；Story 6.3 起决策输入唯一来源为 resolved_
+    # message，原文仅留痕性消费——pipeline trace / http 转写 /
+    # handoff 载荷）；resolved_message / coref 为 Story 6.1 收窄后
+    # 的指代消解挂点（AD-11，权威定义 models.coref.CorefRef）——
+    # coreference 过滤器唯一写入（默认透传：resolved_message 为原文
+    # 拷贝、coref 为 []）；coref 为 None 即「过滤器未执行」。media_
+    # type 仍为架构预留字段。
     message: str | None = None
     resolved_message: str | None = None
     coref: list[CorefRef] | None = None

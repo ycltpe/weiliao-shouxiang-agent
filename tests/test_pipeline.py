@@ -8,14 +8,20 @@ HAPPY_PATH / FILTER_RAISES / DEADLINE_EXCEEDED / INVALID_INPUT，
 import time
 from typing import Any
 
+import fakeredis
 from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
+from weiliao_agent.coref.rule_based import RuleBasedCorefResolver
 from weiliao_agent.filters.base import Filter
+from weiliao_agent.filters.coreference import CoreferenceFilter
+from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_fallback
 from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.models.intent import IntentClassification
 from weiliao_agent.pipeline import PipelineOrchestrator
+from weiliao_agent.session import SessionManager
 
 
 def _valid_payload(intent: str | None = "PRICE_INQUIRY") -> dict[str, Any]:
@@ -271,3 +277,119 @@ def test_fallback_template_selection_keys() -> None:
 
     # intent 缺失或不在 9 类枚举内：一律通用兜底。
     assert render_fallback(None) == render_fallback("NOT_AN_INTENT")
+
+
+# ---------------------------------------------------------------------------
+# Story 6.3 管道级端到端：真实 CoreferenceFilter（规则 resolver）+ stub
+# 分类器 + fakeredis SessionManager 装配 orchestrator——PRD 小王场景与
+# FR-2 指代对的端到端验收面。
+# ---------------------------------------------------------------------------
+
+
+class _StubClassifier:
+    """固定标签的 stub 分类器（记录收到的输入文本）。"""
+
+    def __init__(self, tag: str, received: list[str]) -> None:
+        self._tag = tag
+        self._received = received
+
+    def classify(self, message: str, context: Any) -> IntentClassification:
+        self._received.append(message)
+        return IntentClassification(tag=self._tag, confidence=0.9)  # type: ignore[arg-type]
+
+
+class _EnvelopeRecorder(Filter):
+    """链尾前的信封捕获替身：记录流经的最后一个信封。"""
+
+    name = "recorder"
+
+    def __init__(self, seen: list[Envelope]) -> None:
+        self._seen = seen
+
+    def process(self, envelope: Envelope) -> Envelope:
+        self._seen.append(envelope)
+        return envelope
+
+
+def _coref_orchestrator(
+    received: list[str],
+) -> tuple[PipelineOrchestrator, list[Envelope], fakeredis.FakeRedis]:
+    redis_client = fakeredis.FakeRedis()
+    manager = SessionManager(redis_client)
+    seen: list[Envelope] = []
+    orchestrator = PipelineOrchestrator(
+        filters=[
+            CoreferenceFilter(
+                resolver=RuleBasedCorefResolver(),
+                coref_writer=manager.write_coref,
+            ),
+            IntentRouterFilter(
+                classifier=_StubClassifier("PRICE_INQUIRY", received),
+                followup_recorder=manager.record_followup,
+            ),
+            _EnvelopeRecorder(seen),
+            ResponseAssemblerFilter(),
+        ]
+    )
+    return orchestrator, seen, redis_client
+
+
+def _message_payload(turn: int, message: str) -> dict[str, Any]:
+    return {
+        "session_id": "sess-001",
+        "house_id": "house-001",
+        "turn": turn,
+        "timestamp": "2026-11-10T10:00:00+08:00",
+        "trace_id": "ab" * 16,
+        "message": message,
+    }
+
+
+def test_xiaowang_scenario_pipeline_end_to_end() -> None:
+    # PRD 小王场景管道级验收：买家原文 "它采光怎么样" 经真实规则
+    # resolver 产出含 house 显式引用的消解文本，stub 分类器只见
+    # resolved（原文零接触），应答组装成功。
+    received: list[str] = []
+    orchestrator, seen, redis_client = _coref_orchestrator(received)
+    envelope = Envelope.model_validate(_message_payload(1, "它采光怎么样"))
+
+    result = orchestrator.run(envelope)
+
+    expected_resolved = "这套房（house_id: house-001）采光怎么样"
+    assert result.degraded is False
+    assert result.failed_filter is None
+    assert result.reply.startswith(AI_DISCLOSURE_PREFIX)
+    # 分类器决策输入逐字节等于 resolved_message（原文零读取）。
+    assert received == [expected_resolved]
+    assert seen[0].resolved_message == expected_resolved
+    assert seen[0].intent == "PRICE_INQUIRY"
+    assert seen[0].coref is not None
+    assert [(ref.entity_type, ref.entity_id) for ref in seen[0].coref] == [
+        ("house", "house-001")
+    ]
+    # 追问锚定 Redis 权威值：per-(tag, anchor)=1（首次非追问）。
+    key = "weiliao:session:sess-001"
+    assert redis_client.hget(key, "followup:PRICE_INQUIRY:house:house-001") == b"1"
+
+
+def test_fr2_coreferent_pair_second_turn_is_followup_end_to_end() -> None:
+    # FR-2 指代对端到端：轮1"它多少钱"（anchor=house-001）后轮2
+    # "这套房多少钱"（同锚），分类 tag 相同——轮2 is_followup=True，
+    # Redis followup:{TAG}:{anchor}=2：两消息计为同一意图。
+    received: list[str] = []
+    orchestrator, seen, redis_client = _coref_orchestrator(received)
+    turn1 = Envelope.model_validate(_message_payload(1, "它多少钱"))
+    turn2 = Envelope.model_validate(
+        {**_message_payload(2, "这套房多少钱"), "timestamp": "2026-11-10T10:01:00+08:00"}
+    )
+
+    first = orchestrator.run(turn1)
+    second = orchestrator.run(turn2)
+
+    assert first.degraded is False
+    assert second.degraded is False
+    assert seen[0].is_followup is False  # 轮1：首次出现
+    assert seen[1].is_followup is True  # 轮2：同锚同 tag 二现 → 追问命中
+    key = "weiliao:session:sess-001"
+    assert redis_client.hget(key, "followup:PRICE_INQUIRY:house:house-001") == b"2"
+    assert redis_client.hget(key, "followup_count") == b"1"

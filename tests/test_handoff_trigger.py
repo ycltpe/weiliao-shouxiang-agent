@@ -226,6 +226,9 @@ def _envelope(**overrides: Any) -> Envelope:
         "message": "你好",
     }
     payload.update(overrides)
+    # Story 6.3：分类器与硬触发评估共用 resolved_message 输入——
+    # message 覆写时 resolved 默认跟随（除非用例显式覆写 resolved）。
+    payload.setdefault("resolved_message", payload["message"])
     return Envelope.model_validate(payload)
 
 
@@ -317,7 +320,7 @@ def test_router_miss_records_trace_but_does_not_mark(fake_langfuse: Any) -> None
 
 
 def test_router_followup_count_at_threshold_triggers(fake_langfuse: Any) -> None:
-    def recorder(session_id: str, tag: str) -> tuple[int, int]:
+    def recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int]:
         return 3, 5
 
     result = _router("PRICE_INQUIRY", recorder=recorder).process(_envelope())
@@ -331,7 +334,7 @@ def test_router_recorder_failure_followup_not_triggered_but_redline_assessed(
 ) -> None:
     # Redis 故障 fail-safe（沿用 2.3 语义）：追问条件不触发，但其余
     # 条件照常判定——红线意图在 Redis 故障时绝不得漏放。
-    def failing_recorder(session_id: str, tag: str) -> tuple[int, int]:
+    def failing_recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int]:
         msg = "redis down"
         raise RuntimeError(msg)
 

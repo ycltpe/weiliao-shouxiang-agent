@@ -22,11 +22,18 @@ Story 2.2 已交付：``write_intent`` 将分类结果写入 per-turn 键
 口径不变。
 
 Story 2.3 已交付：``record_followup`` 经 Lua 单 roundtrip 原子维护
-per-intent 追问计数（会话 hash 字段 ``followup:{TAG}``）与会话追问
-总数 ``followup_count``（仅追问命中——per-intent ≥2——时自增），并
-随脚本刷新 EXPIRE；返回 ``(per_intent_count, followup_count)`` 双计数。
+追问计数（会话 hash 字段，Story 6.3 起为 ``followup:{TAG}:{anchor}``
+锚定键）与会话追问总数 ``followup_count``（仅追问命中——per-(tag,
+anchor) ≥2——时自增），并随脚本刷新 EXPIRE；返回
+``(per_intent_count, followup_count)`` 双计数。
 追问判定的权威值只存 Redis（AD-4），UNKNOWN 不参与计数（调用方
 口径）。
+
+Story 6.3 已交付：追问计数键由 per-tag 扩为 per-(tag, anchor)——
+Lua 计数字段 ``followup:{TAG}:{anchor}``（anchor 为调用方从信封
+coref 机械导出的锚点字符串，空 coref 为哨兵值），原子性 / TTL 刷新
+/ 双计数返回语义不变；同 tag 不同锚点各自独立计数（FR-2 锚定口径），
+无 coref 消息等价于旧 per-tag 语义（向后兼容）。
 
 Story 5.1 已交付：``mark_handoff`` 经 Lua 单 roundtrip 原子置位
 ``handoff_status``（``"none"`` → ``"triggered"``）并把命中条件清单
@@ -231,15 +238,21 @@ class SessionManager:
         )
         return int(cast("int | str | bytes", count))
 
-    def record_followup(self, session_id: str, tag: IntentTag) -> tuple[int, int]:
-        """追问识别原子记录（Story 2.3，AD-4）：per-intent 计数 + 会话总数。
+    def record_followup(
+        self, session_id: str, tag: IntentTag, anchor: str
+    ) -> tuple[int, int]:
+        """追问识别原子记录（Story 2.3，AD-4；Story 6.3 锚定）：per-(tag,
+        anchor) 计数 + 会话总数。
 
-        Lua 单 roundtrip：``HINCRBY followup:{TAG}`` 维护 per-intent 计数；
-        仅当 per-intent ≥2（追问命中）时自增会话 ``followup_count``——
-        否则恒等于 turn 序号，「≥3」会在第 3 条普通消息误触发；EXPIRE
-        随脚本刷新，TTL 与会话一致。返回 ``(per_intent_count,
-        session_followup_count)`` 双计数，调用方据 per-intent ≥2 判定
-        ``is_followup``、据会话总数 ≥3 产出 hard trigger 信号。
+        Lua 单 roundtrip：``HINCRBY followup:{TAG}:{anchor}`` 维护
+        per-(tag, anchor) 计数（anchor 由调用方从信封 coref 机械导出，
+        空 coref 走哨兵值；本模块不解读 anchor 语义，只做计数键拼接）；
+        仅当 per-(tag, anchor) ≥2（追问命中）时自增会话
+        ``followup_count``——否则恒等于 turn 序号，「≥3」会在第 3 条
+        普通消息误触发；EXPIRE 随脚本刷新，TTL 与会话一致。返回
+        ``(per_intent_count, session_followup_count)`` 双计数，调用方
+        据 per-(tag, anchor) ≥2 判定 ``is_followup``、据会话总数 ≥3
+        产出 hard trigger 信号。
 
         调用方口径（intent_router）：仅分类成功、turn 非 None 且 tag 非
         UNKNOWN 时调用；UNKNOWN 与本模块 1.3 的 ``increment_followup``
@@ -247,7 +260,7 @@ class SessionManager:
         """
         raw = self._record_followup_script(
             keys=[self._key(session_id)],
-            args=[f"followup:{tag}", self._ttl_seconds],
+            args=[f"followup:{tag}:{anchor}", self._ttl_seconds],
         )
         per_intent, session_count = cast(
             "tuple[object, object]", tuple(cast("list[object]", raw))

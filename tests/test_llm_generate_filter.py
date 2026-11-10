@@ -1,11 +1,12 @@
 """受控生成过滤器单测（Story 4.3，影子接入 I/O 矩阵全分支）。
 
 替身子图（真实 ``LlmGenerationSubgraph`` + 替身 chat，不触达 OpenAI）
-覆盖：卡片就绪正常生成、L0 miss 照常生成、resolved_message 回落
-message、红线意图/非文本/空消息跳过、生成异常吞掉记 trace、grounding
-校验未过丢草稿记 trace；另有完整管道走查（草稿挂信封、买家可见应答
-仍是模板兜底、degraded=False）与 OpenAI 不可用（模块级入口异常）
-fail-safe 走查。全部无网络。
+覆盖：卡片就绪正常生成、L0 miss 照常生成、纯 resolved_message 生成
+输入（Story 6.3：原文零接触、缺失/空白跳过）、红线意图/非文本/空
+消息跳过、生成异常吞掉记 trace、grounding 校验未过丢草稿记 trace；
+另有完整管道走查（草稿挂信封、买家可见应答仍是模板兜底、
+degraded=False）与 OpenAI 不可用（模块级入口异常）fail-safe 走查。
+全部无网络。
 
 Story 4.5 扩展：熔断器注入矩阵——open 期间跳过（零子图调用、信封
 透传、DEFAULT 级 skip 事件）、OpenAI 故障跳闸（ERROR 级 tripped 事件）
@@ -97,6 +98,8 @@ def _envelope(**overrides: Any) -> Envelope:
         "trace_id": TRACE_ID,
         "intent": "PRICE_INQUIRY",
         "message": "这套房子现在什么价位？",
+        # Story 6.3 夹具口径：standalone 装配显式携带消解后消息。
+        "resolved_message": "这套房子现在什么价位？",
     }
     values.update(overrides)
     return Envelope.model_validate(values)
@@ -162,11 +165,14 @@ def test_draft_still_produced_when_fact_card_missing() -> None:
     assert result.generated_reply == DRAFT
 
 
-def test_resolved_message_takes_priority_and_falls_back_to_message() -> None:
+def test_generation_consumes_only_resolved_message() -> None:
+    # Story 6.3 纯消解输入：resolved 非空白即唯一生成输入（逐字节），
+    # 原文字段在场也不读取；resolved 缺失/空白跳过生成（零模型调用），
+    # 即使原文有值。
     chat = _StubChat()
     subgraph = _subgraph(chat)
 
-    # 优先级：resolved_message 非空白时直接消费，不看 message。
+    # resolved 在场：prompt 逐字节消费 resolved，原文零接触。
     resolved = _envelope(
         resolved_message="消解后的自包含消息",
         message="原始的含指代消息",
@@ -176,19 +182,18 @@ def test_resolved_message_takes_priority_and_falls_back_to_message() -> None:
     assert "消解后的自包含消息" in str(chat.seen_messages[-1][-1].content)
     assert "原始的含指代消息" not in str(chat.seen_messages[-1][-1].content)
 
-    # 回落：resolved_message 为 None 或空白串时回落 message。
+    # resolved 缺失：跳过生成，原文不被读取（FR-6 纯消解输入）。
     fallback = _envelope(resolved_message=None)
     LlmGenerateFilter(subgraph=subgraph).process(fallback)
-    assert chat.calls == 2
-    assert "这套房子现在什么价位？" in str(chat.seen_messages[-1][-1].content)
+    assert chat.calls == 1  # 零新增模型调用
 
+    # resolved 纯空白：同样跳过生成。
     blank_resolved = _envelope(
         resolved_message="   ",
-        message="空白消解结果回落到这条",
+        message="空白消解结果不回落到这条",
     )
     LlmGenerateFilter(subgraph=subgraph).process(blank_resolved)
-    assert chat.calls == 3
-    assert "空白消解结果回落到这条" in str(chat.seen_messages[-1][-1].content)
+    assert chat.calls == 1  # 零新增模型调用
 
 
 @pytest.mark.parametrize(

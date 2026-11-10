@@ -54,6 +54,17 @@ Redis 故障时追问条件不触发，但红线 / 媒体 / 负面条件照常�
 追问序号 0 照常评估——媒体与负面词条件不依赖分类器输出，高风险
 消息绝不在分类失败时漏入 cache/LLM。判定结果由编排器消费
 （``triggered is True`` 短路下游走转人工出口分支）。
+
+Story 6.3：链首 coreference 过滤器（真实 resolver，Story 6.1/6.2）
+就位后 ``resolved_message`` 在生产链上必然有值：本过滤器决策输入
+收窄为纯 ``resolved_message``——``None``/空白走既有 fail-closed
+UNKNOWN 路径（分类器零调用），买家原文（``envelope.message``）在
+任何决策路径零读取（FR-1/FR-11 终态口径）。追问计数键同步扩为
+per-(tag, anchor)：anchor 由信封 ``coref`` 列表机械导出（排序拼接
+``(entity_type, entity_id)``，空列表 → 哨兵值），随 tag 传入
+recorder——意图标签仍为追问判定唯一依据，coref 只做计数键锚定、
+绝不参与文本相似度比对（FR-2 口径）。硬触发评估与分类器共用同一
+输入变量，收窄后文本口径自动一致，无需独立改动。
 """
 
 import time
@@ -66,6 +77,7 @@ from weiliao_agent.handoff.trigger import (
     CONDITION_ASSESSMENT_ERROR,
     HardTriggerAssessor,
 )
+from weiliao_agent.models.coref import CorefRef
 from weiliao_agent.models.envelope import Envelope, HandoffAssessment
 from weiliao_agent.models.intent import IntentClassification, IntentTag
 from weiliao_agent.observability import tracing
@@ -94,7 +106,7 @@ class IntentRouterFilter(Filter):
         self,
         classifier: IntentClassifier | None = None,
         intent_writer: Callable[[str, int, IntentClassification], None] | None = None,
-        followup_recorder: Callable[[str, IntentTag], tuple[int, int]] | None = None,
+        followup_recorder: Callable[[str, IntentTag, str], tuple[int, int]] | None = None,
         recent_intent_writer: Callable[[str, IntentTag], None] | None = None,
         followup_snapshot_writer: Callable[[str, int], None] | None = None,
         handoff_assessor: HardTriggerAssessor | None = None,
@@ -114,16 +126,13 @@ class IntentRouterFilter(Filter):
             if envelope.intent is None:
                 return envelope.model_copy(update={"intent": "UNKNOWN"})
             return envelope
-        # 消解后消息（resolved_message）就位后即为分类器唯一输入（AD-11）；
-        # 指代消解过滤器交付前，退化为买家原文（message）。
-        message = (
-            envelope.resolved_message
-            if envelope.resolved_message is not None
-            else envelope.message
-        )
-        if not message:
-            # 分类器契约要求非空消息文本：None 与空串一律 fail-closed
-            # UNKNOWN，不调用分类器。
+        # 决策输入唯一来源为消解后消息（AD-11，Story 6.3 终态口径）：
+        # 链首 coreference 过滤器 fail-safe 恒产出 resolved_message
+        # （透传场景逐字节等于原文），买家原文在任何决策路径零读取。
+        message = envelope.resolved_message
+        if message is None or not message.strip():
+            # 分类器契约要求非空消息文本：None、空串与纯空白一律
+            # fail-closed UNKNOWN，不调用分类器（Story 6.3 空白口径）。
             unknown = envelope.model_copy(update={"intent": "UNKNOWN"})
             # 硬触发评估不依赖分类器输出（媒体条件照常判定）：空消息
             # 路径以 UNKNOWN / 追问序号 0 评估，追问条件天然不触发。
@@ -192,12 +201,16 @@ class IntentRouterFilter(Filter):
     def _record_followup(self, envelope: Envelope, tag: IntentTag) -> tuple[bool, int]:
         """追问识别落点（Story 2.3）：原子计数、信封标记、trace 挂点。
 
-        返回 ``(是否追问命中, per_intent 计数)``——追问命中为
-        per-intent ≥2（is_followup 口径）；per_intent 计数供 Story 5.1
-        硬触发追问条件消费（达阈值判定归 AD-12 评估模块，勿复用
-        is_followup）。前置条件不满足（turn 为 None、未注入 recorder、
-        tag 为 UNKNOWN）一律跳过：不调 recorder、不累积计数、计数返回
-        0（追问条件不触发）、信封 ``is_followup`` 保持默认 False。
+        返回 ``(是否追问命中, per_(tag, anchor) 计数)``——追问命中为
+        per-(tag, anchor) ≥2（is_followup 口径）；per_intent 计数供
+        Story 5.1 硬触发追问条件消费（达阈值判定归 AD-12 评估模块，
+        勿复用 is_followup）。anchor 为 FR-2 锚定计数键：由信封
+        ``coref`` 机械导出（排序拼接 ``(entity_type, entity_id)``，
+        空列表/None → 哨兵值），不读 Redis 审计键、不回溯历史——
+        锚定的唯一真相源是信封。前置条件不满足（turn 为 None、未注入
+        recorder、tag 为 UNKNOWN）一律跳过：不调 recorder、不累积计数、
+        计数返回 0（追问条件不触发）、信封 ``is_followup`` 保持默认
+        False。
         recorder 异常 fail-safe 收敛在本方法内，不外抛。
         """
         if (
@@ -206,9 +219,10 @@ class IntentRouterFilter(Filter):
             or tag == "UNKNOWN"
         ):
             return False, 0
+        anchor = _followup_anchor(envelope.coref)
         try:
             per_intent_count, session_followup_count = self._followup_recorder(
-                envelope.session_id, tag
+                envelope.session_id, tag, anchor
             )
         except Exception:
             # 记录失败 fail-safe：应答不降级、信封保留分类结果、
@@ -228,7 +242,7 @@ class IntentRouterFilter(Filter):
         tracing.record_followup(
             envelope.trace_id,
             tag=tag,
-            per_intent_count=per_intent_count,
+            per_tag_anchor_count=per_intent_count,
             session_followup_count=session_followup_count,
             is_followup=is_followup,
         )
@@ -301,6 +315,27 @@ class IntentRouterFilter(Filter):
                 # trace 记专用失败事件（绝不二次影响买家应答）。
                 tracing.record_handoff_mark_failed(envelope.trace_id)
         return envelope.model_copy(update={"handoff": assessment})
+
+
+# 空 coref 哨兵锚（Story 6.3）：等价于旧 per-tag 键语义演进，向后兼容。
+_NO_COREF_ANCHOR = "none"
+
+
+def _followup_anchor(coref: list[CorefRef] | None) -> str:
+    """FR-2 锚定导出：信封 coref 列表机械映射为计数锚点字符串。
+
+    通用口径为 ``(entity_type, entity_id)`` 序列（MVP 仅 house 类型
+    产实体锚点；非 house 类型 entity_id 可为 None，序列化为空段），
+    按 ``(entity_type, entity_id)`` 排序后以 ``|`` 拼接——同一引用
+    集合恒导出同一锚点，与列表顺序无关。空列表/None（无指代消息
+    或过滤器未执行）走哨兵值，计数行为与既有 per-tag 口径一致。
+    """
+    if not coref:
+        return _NO_COREF_ANCHOR
+    refs = sorted(coref, key=lambda ref: (ref.entity_type, ref.entity_id or ""))
+    return "|".join(
+        f"{ref.entity_type}:{ref.entity_id or ''}" for ref in refs
+    )
 
 
 def _failure_reason(exc: Exception) -> str:

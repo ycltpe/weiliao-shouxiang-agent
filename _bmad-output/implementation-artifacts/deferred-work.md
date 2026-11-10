@@ -101,6 +101,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
   summary: coreference 过滤器自身延迟 P99 < 10ms 预算无任何自动化验证路径（仓库无压测设施，唯一延迟断言是符号非负检查）。
   evidence: 6.1 验证缺口层 filed disposition defer。P99 是压测属性，端到端延迟验收（含消解口径的 FR-1 P99 < 50ms）归 Story 6.3/FR-1 验收范围。
+  status: closed-2026-11-10，重路由至 Story 7.2 压测设施，见 spec-6-3 deferred 条目（FR-1 含消解端到端 P99 < 50ms 一并实测）。
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-coreference-filter-interface-pipeline-integration.md`
   summary: sprint-status.yaml 头部注释的 `# last_updated: 2026-11-02` 与正文长期不一致（本 Story 更新正文时头部继续滞留旧值）。
   evidence: 6.1 盲审#12；头部注释在本 Story 之前即已陈旧，非本 Story 引入。settle：顺手修或纳入 Epic 7 运维文档治理。
@@ -110,3 +111,13 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-house-coreference-normalization-default-impl.md`
   summary: 人工标注消解语料未就绪，FR-11 ≥95% 房源指代消解准确率的真实验收门 deferred（spec 明令不虚构人工标注语料冒充验收门）。
   evidence: 本 Story 交付 `tests/eval_coref_resolver.py` 评测 harness（内置合成种子集冒烟 + 指代类占比 ≥20% 完整性校验），CSV 语料模式与 ≥95% 验收门已就位。settle：语料与 FR-1 测试集同期建设后，以标注 CSV（列 `text,has_house_coref`，可选 `expected_resolved`）复跑 `uv run python tests/eval_coref_resolver.py eval.csv` 执行真实验收门。
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-2-house-coreference-normalization-default-impl.md`
+  summary: resolver 延迟 P99 < 10ms 预算无自动化验证路径（仓库无压测设施，6.1#15 同根同裁决）。
+  evidence: 6.2 盲审#4，此前仅录于 spec-6-2 frontmatter deferred 列表，未落本台账——补录并关闭。resolver 为单趟正则扫描、微秒级，性能风险可忽略；分类器 45ms 硬超时守卫 + `latency_ms` 埋点已就位。
+  status: closed-2026-11-10，重路由至 Story 7.2 压测设施，见 spec-6-3 deferred 条目（FR-1 含消解端到端 P99 < 50ms 一并实测）。
+
+## Deferred from: spec-6-3-downstream-consumption-followup-retrofit (2026-11-10)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-3-downstream-consumption-followup-retrofit.md`
+  summary: FR-1「含消解端到端意图分类 P99 < 50ms」实测 deferred——仓库无压测设施，无法产出真实 P99 测量，不虚构数据冒充验收门（关闭 6.1#15 / 6.2 盲#4 同根挂账，重路由至 Story 7.2 压测设施）。
+  evidence: 6.1 过滤器自身 P99 < 10ms、6.2 resolver 微秒级单趟规则扫描均已 defer 同根条目；分类器 45ms 硬超时守卫 + `latency_ms` 埋点已就位，唯一延迟断言为符号非负检查。settle：Story 7.2 压测故事落地后，以含 coreference → intent_router 全链的压测执行 FR-1 P99 < 50ms 实测验收。

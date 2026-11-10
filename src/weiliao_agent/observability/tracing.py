@@ -26,8 +26,8 @@ preset 值（分类尚未发生），分类结果只能经 ``record_classificati
 context 传播（spec Never 约束）。
 
 追问识别事件（Story 2.3）：分类成功后 intent_router 经注入的会话单写者
-回调记录 (session, intent) 计数，``record_followup`` 补挂追问事件
-（tag / per_intent_count / session_followup_count / is_followup）；
+回调记录 (session, tag, anchor) 计数，``record_followup`` 补挂追问事件
+（tag / per_tag_anchor_count / session_followup_count / is_followup）；
 会话追问总数达 3 时 ``record_followup_hard_trigger`` 产出 hard trigger
 信号事件（命中条件=追问≥3，判定与转人工归 Epic 5 的 AD-12 模块）。
 记录失败经 ``record_classification_failure``（reason=
@@ -393,11 +393,12 @@ def record_followup(
     trace_id: str | None,
     *,
     tag: str,
-    per_intent_count: int,
+    per_tag_anchor_count: int,
     session_followup_count: int,
     is_followup: bool,
 ) -> None:
-    """追问记录事件（Story 2.3）：per-intent / 会话总数 / 标记补挂消息 trace。
+    """追问记录事件（Story 2.3；Story 6.3 锚定键名）：per-(tag, anchor) /
+    会话总数 / 标记补挂消息 trace。
 
     fail-safe 口径同 ``record_classification``：记录本身再抛异常也吞掉。
     """
@@ -414,7 +415,7 @@ def record_followup(
             metadata={
                 "event": "intent_followup",
                 "tag": tag,
-                "per_intent_count": per_intent_count,
+                "per_tag_anchor_count": per_tag_anchor_count,
                 "session_followup_count": session_followup_count,
                 "is_followup": is_followup,
             },

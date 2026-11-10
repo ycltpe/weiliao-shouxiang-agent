@@ -392,11 +392,11 @@ def test_record_followup_first_occurrence_does_not_increment_session_count(
 ) -> None:
     manager.begin_turn(SESSION_ID, TS_1)
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
     assert (per_intent, session_count) == (1, 0)  # 首次出现非追问，总数不自增
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert client.hget(key, "followup:PRICE_INQUIRY") == b"1"
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"1"
     assert client.hget(key, "followup_count") == b"0"
     assert client.ttl(key) == DEFAULT_TTL_SECONDS  # EXPIRE 随脚本刷新
 
@@ -405,13 +405,13 @@ def test_record_followup_second_occurrence_marks_followup(
     manager: SessionManager, client: fakeredis.FakeRedis
 ) -> None:
     manager.begin_turn(SESSION_ID, TS_1)
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
     assert (per_intent, session_count) == (2, 1)  # 追问 #1：per-intent ≥2 命中
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
     assert client.hget(key, "followup_count") == b"1"
 
 
@@ -420,10 +420,10 @@ def test_record_followup_same_tag_reaches_threshold_at_fourth_message(
 ) -> None:
     # 语义钉死：追问 #3 = 同意图第 4 次消息（≥3 信号触发时刻）。
     manager.begin_turn(SESSION_ID, TS_1)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (1, 0)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (2, 1)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (3, 2)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (4, 3)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (1, 0)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (2, 1)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (3, 2)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (4, 3)
     assert client.hget(f"{KEY_PREFIX}{SESSION_ID}", "followup_count") == b"3"
 
 
@@ -432,17 +432,17 @@ def test_record_followup_counts_across_intents(
 ) -> None:
     # 「≥3 无论意图类型」：跨意图累计第 3 次追问命中（各意图第 2 次）。
     manager.begin_turn(SESSION_ID, TS_1)
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
-    manager.record_followup(SESSION_ID, "AVAILABILITY")
-    manager.record_followup(SESSION_ID, "LOCATION")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+    manager.record_followup(SESSION_ID, "AVAILABILITY", "none")
+    manager.record_followup(SESSION_ID, "LOCATION", "none")
 
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (2, 1)
-    assert manager.record_followup(SESSION_ID, "AVAILABILITY") == (2, 2)
-    assert manager.record_followup(SESSION_ID, "LOCATION") == (2, 3)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (2, 1)
+    assert manager.record_followup(SESSION_ID, "AVAILABILITY", "none") == (2, 2)
+    assert manager.record_followup(SESSION_ID, "LOCATION", "none") == (2, 3)
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
-    assert client.hget(key, "followup:AVAILABILITY") == b"2"
-    assert client.hget(key, "followup:LOCATION") == b"2"
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
+    assert client.hget(key, "followup:AVAILABILITY:none") == b"2"
+    assert client.hget(key, "followup:LOCATION:none") == b"2"
     assert client.hget(key, "followup_count") == b"3"
 
 
@@ -450,16 +450,16 @@ def test_record_followup_isolates_per_intent_counters(
     manager: SessionManager, client: fakeredis.FakeRedis
 ) -> None:
     manager.begin_turn(SESSION_ID, TS_1)
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING")
+    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING", "none")
 
     # GREETING 首次出现：per-intent 独立计数，会话总数只计 PRICE_INQUIRY 的命中。
     assert (per_intent, session_count) == (1, 1)
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert client.hget(key, "followup:GREETING") == b"1"
-    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert client.hget(key, "followup:GREETING:none") == b"1"
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
 
 
 def test_record_followup_refreshes_ttl(
@@ -468,7 +468,7 @@ def test_record_followup_refreshes_ttl(
     manager.begin_turn(SESSION_ID, TS_1)
     client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 模拟中途 TTL 被压短
 
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
     assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
 
@@ -478,15 +478,15 @@ def test_record_followup_before_begin_turn_preserves_counts(
 ) -> None:
     # record_followup 先执行（hash 已存在但无 turn 字段）：begin_turn
     # 不得误判为新会话而把 per-intent / followup_count 清零。
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
-    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
     snapshot = manager.begin_turn(SESSION_ID, TS_1)
 
     assert snapshot.turn == 1
     assert snapshot.followup_count == 1
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
 
 
 def test_concurrent_record_followup_counts_exactly(
@@ -498,7 +498,7 @@ def test_concurrent_record_followup_counts_exactly(
     with ThreadPoolExecutor(max_workers=threads) as pool:
         results = list(
             pool.map(
-                lambda _i: manager.record_followup(SESSION_ID, "PRICE_INQUIRY"),
+                lambda _i: manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none"),
                 range(threads),
             )
         )
@@ -507,7 +507,115 @@ def test_concurrent_record_followup_counts_exactly(
     assert per_intents == list(range(1, threads + 1))
     assert all(r[1] == r[0] - 1 for r in results)  # 会话总数 = per-intent - 1
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert client.hget(key, "followup:PRICE_INQUIRY") == str(threads).encode()
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == str(threads).encode()
+    assert client.hget(key, "followup_count") == str(threads - 1).encode()
+
+
+# ---------------------------------------------------------------------------
+# Story 6.3 锚定键 fakeredis 矩阵：per-(tag, anchor) 隔离、异锚不互相
+# 累计、哨兵锚向后兼容、TTL 刷新与并发精确（锚定口径下原样绿）。
+# ---------------------------------------------------------------------------
+
+
+def test_record_followup_same_anchor_counts_to_two(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # FR-2 指代对 Redis 层：同 (tag, anchor) 二现 → per-(tag, anchor)=2。
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+
+    per_intent, session_count = manager.record_followup(
+        SESSION_ID, "PRICE_INQUIRY", "house:h1"
+    )
+
+    assert (per_intent, session_count) == (2, 1)
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY:house:h1") == b"2"
+    assert client.hget(key, "followup_count") == b"1"
+
+
+def test_record_followup_different_anchors_do_not_accumulate(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 异锚同 tag：h1 已二现（追问命中一次），h2 首次出现独立计数——
+    # 互不计为追问，会话总数只计 h1 的命中。
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+
+    per_intent, session_count = manager.record_followup(
+        SESSION_ID, "PRICE_INQUIRY", "house:h2"
+    )
+
+    assert (per_intent, session_count) == (1, 1)  # h2 首次：非追问
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY:house:h1") == b"2"
+    assert client.hget(key, "followup:PRICE_INQUIRY:house:h2") == b"1"
+
+
+def test_record_followup_sentinel_anchor_matches_legacy_per_tag_shape(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 哨兵锚（空 coref 消息的导出口径）：键形态 followup:TAG:none——
+    # 语义等价于旧 per-tag 计数演进，无第二条判定路径。
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "GREETING", "none")
+
+    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING", "none")
+
+    assert (per_intent, session_count) == (2, 1)
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:GREETING:none") == b"2"
+
+
+def test_record_followup_anchor_key_does_not_collide_with_sentinel(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 锚定键与哨兵键严格隔离：同名 tag 下 house:h1 与 none 各自累计。
+    manager.begin_turn(SESSION_ID, TS_1)
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+
+    anchored, _ = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+    sentinel, _ = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+
+    assert (anchored, sentinel) == (2, 2)  # 两键各计各的，互不影响
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY:house:h1") == b"2"
+    assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
+    assert client.hget(key, "followup_count") == b"2"
+
+
+def test_record_followup_anchor_refreshes_ttl(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    manager.begin_turn(SESSION_ID, TS_1)
+    client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 模拟中途 TTL 被压短
+
+    manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+
+    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
+
+
+def test_concurrent_record_followup_same_anchor_counts_exactly(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # 锚定口径下并发精确不丢不重（Lua 单 roundtrip 原子性不变）。
+    manager.begin_turn(SESSION_ID, TS_1)
+    threads = 50
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        results = list(
+            pool.map(
+                lambda _i: manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1"),
+                range(threads),
+            )
+        )
+
+    per_intents = sorted(r[0] for r in results)
+    assert per_intents == list(range(1, threads + 1))
+    assert all(r[1] == r[0] - 1 for r in results)
+    key = f"{KEY_PREFIX}{SESSION_ID}"
+    assert client.hget(key, "followup:PRICE_INQUIRY:house:h1") == str(threads).encode()
     assert client.hget(key, "followup_count") == str(threads - 1).encode()
 
 
@@ -595,8 +703,10 @@ def test_main_composition_root_writes_intent_to_redis(
 def test_main_composition_root_records_followup_to_redis(
     monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
 ) -> None:
-    # 默认链路端到端（Story 2.3 验收）：同一 session 同一意图第 2 条消息
-    # 经组合根注入的 record_followup 落盘——followup:TAG=2、followup_count=1。
+    # 默认链路端到端（Story 2.3 验收；Story 6.3 锚定键）：同一 session
+    # 同一意图第 2 条消息经组合根注入的 record_followup 落盘——
+    # 消息含"这套房"指代，组合根规则 resolver 产出 house 锚
+    # followup:TAG:house:house-001=2、followup_count=1。
     fake = fakeredis.FakeRedis()
     monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
     monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
@@ -618,7 +728,7 @@ def test_main_composition_root_records_followup_to_redis(
     assert first.status_code == 200
     assert second.status_code == 200
     key = f"{KEY_PREFIX}{SESSION_ID}"
-    assert fake.hget(key, "followup:PRICE_INQUIRY") == b"2"
+    assert fake.hget(key, "followup:PRICE_INQUIRY:house:house-001") == b"2"
     assert fake.hget(key, "followup_count") == b"1"
     assert fake.ttl(key) == DEFAULT_TTL_SECONDS
 
