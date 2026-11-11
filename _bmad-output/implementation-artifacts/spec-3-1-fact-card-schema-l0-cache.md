@@ -8,7 +8,7 @@ route: 'dispatch'
 review_loop_iteration: 3
 context:
   - '_bmad-output/implementation-artifacts/epic-3-context.md'
-  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
+  - '_bmad-output/planning-artifacts/architecture/architecture-weiliao-shouxiang-agent-2026-10-22/ARCHITECTURE-SPINE.md'
 ---
 
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">

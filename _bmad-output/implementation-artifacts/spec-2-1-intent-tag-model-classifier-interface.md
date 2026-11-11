@@ -8,7 +8,7 @@ baseline_commit: '2db3d35a405109a4132b5a7037ff77b206d85333'
 review_loop_iteration: 0
 context:
   - '_bmad-output/implementation-artifacts/epic-2-context.md'
-  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
+  - '_bmad-output/planning-artifacts/architecture/architecture-weiliao-shouxiang-agent-2026-10-22/ARCHITECTURE-SPINE.md'
 deferred:
   - summary: >-
       分类器异常失败路径（except Exception → UNKNOWN）完全静默，无日志/Langfuse 事件

@@ -4,7 +4,7 @@
 # ///
 """Tests for lint_spine.py. Run: uv run --with pytest pytest scripts/tests/test_lint_spine.py
 
-The spine under test: a clean spine lints empty; the linter catches exactly the
+The spine under weiliao-shouxiang-agent: a clean spine lints empty; the linter catches exactly the
 mechanical defects a prompt is unreliable at — literal placeholders, AD-n id breakage,
 AD-n blocks missing required fields, and unpinned Stack versions.
 """

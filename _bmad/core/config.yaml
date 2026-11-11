@@ -4,7 +4,7 @@
 # Date: 2026-10-31T08:25:49.670Z
 
 user_name: Yechen
-project_name: test
+project_name: weiliao-shouxiang-agent
 communication_language: 中文
 document_output_language: 中文
 output_folder: "{project-root}/_bmad-output"

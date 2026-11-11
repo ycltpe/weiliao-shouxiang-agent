@@ -19,7 +19,7 @@ import pick_methods  # noqa: E402
 
 CSV = """num,category,method_name,description,output_pattern
 1,risk,Pre-mortem Analysis,Imagine future failure then work backwards,failure → causes → prevention
-2,risk,Assumption Audit,List and stress-test every assumption,list → rate → stress-test
+2,risk,Assumption Audit,List and stress-weiliao-shouxiang-agent every assumption,list → rate → stress-weiliao-shouxiang-agent
 3,core,First Principles Analysis,Rebuild from fundamental truths,assumptions → truths → new approach
 4,core,Socratic Questioning,Targeted questions reveal hidden assumptions,questions → revelations → understanding
 5,creative,SCAMPER Method,Seven creativity lenses,S→C→A→M→P→E→R
@@ -169,7 +169,7 @@ def test_cli_list_category_and_all(lib, capsys):
 def test_cli_show_found_and_missing(lib, capsys):
     code, out, err = run(["show", "Assumption Audit", "Ghost"], lib, capsys)
     assert code == 0
-    assert "stress-test" in out
+    assert "stress-weiliao-shouxiang-agent" in out
     assert "not found: Ghost" in err
     code, _, _ = run(["show", "Ghost"], lib, capsys)
     assert code == 1

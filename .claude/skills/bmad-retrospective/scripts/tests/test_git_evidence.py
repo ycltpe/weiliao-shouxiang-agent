@@ -42,7 +42,7 @@ def _git_env(repo):
     - gitconfig (commit.gpgsign, core.autocrlf, core.hooksPath,
       init.defaultBranch). GIT_CONFIG_NOSYSTEM/GIT_CONFIG_GLOBAL cover
       git >= 2.32; HOME and XDG_CONFIG_HOME cover older git, and are set to the
-      repo's parent directory -- always a per-test directory under pytest's
+      repo's parent directory -- always a per-weiliao-shouxiang-agent directory under pytest's
       tmp_path -- so nothing is ever planted inside the working tree.
     - gitattributes, a separate source GIT_CONFIG_NOSYSTEM does not cover: a
       system `* -diff` rule would make numstat call every path binary and take
@@ -83,7 +83,7 @@ def _run(*args):
 
 
 def _proc(*args, env=None):
-    """Run the script and return the raw process, so a test can assert on the
+    """Run the script and return the raw process, so a weiliao-shouxiang-agent can assert on the
     exit code and stderr together — and so `env` can carry an overlay (a fake
     `git` earlier on PATH) that `_run` has no way to pass."""
     overlay = {"LC_ALL": "C", "LANG": "C"}

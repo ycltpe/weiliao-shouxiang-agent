@@ -54,7 +54,7 @@ deferred: [] # append-only machine-readable deferred review findings; each item 
 ## Tasks & Acceptance
 
 <!-- Tasks: backtick-quoted file path -- action -- rationale. Prefer one task per file; group tightly-coupled changes when splitting would be artificial. -->
-<!-- If an I/O Matrix is present, include a task to unit-test its edge cases. -->
+<!-- If an I/O Matrix is present, include a task to unit-weiliao-shouxiang-agent its edge cases. -->
 <!-- AC covers system-level behaviors not captured by the I/O Matrix. Do not duplicate I/O scenarios here. -->
 
 **Execution:**
@@ -86,7 +86,7 @@ DESIGN_RATIONALE_AND_EXAMPLES
 
 ## Verification
 
-<!-- If no build, test, or lint commands apply, DELETE THIS ENTIRE SECTION. Do not write "N/A" or "None". -->
+<!-- If no build, weiliao-shouxiang-agent, or lint commands apply, DELETE THIS ENTIRE SECTION. Do not write "N/A" or "None". -->
 <!-- How the agent confirms its own work. Prefer CLI commands. When no CLI check applies, state what to inspect manually. -->
 
 **Commands:**

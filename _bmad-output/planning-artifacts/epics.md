@@ -2,7 +2,7 @@
 stepsCompleted: ["step-01-validate-prerequisites", "step-02-design-epics", "step-03-create-stories", "step-04-final-validation"]
 inputDocuments:
   - "_bmad-output/planning/prds/prd-微聊首响Agent-2026-10-21/prd.md"
-  - "_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md"
+  - "_bmad-output/planning-artifacts/architecture/architecture-weiliao-shouxiang-agent-2026-10-22/ARCHITECTURE-SPINE.md"
   - "_bmad-output/implementation-artifacts/deferred-work.md"
 ---
 

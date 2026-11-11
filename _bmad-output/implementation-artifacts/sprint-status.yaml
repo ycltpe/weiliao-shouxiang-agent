@@ -1,6 +1,6 @@
 # generated: 2026-10-31
 # last_updated: 2026-11-10
-# project: test
+# project: weiliao-shouxiang-agent
 # project_key: NOKEY
 # tracking_system: file-system
 # story_location: {project-root}/_bmad-output/implementation-artifacts
@@ -42,7 +42,7 @@
 
 generated: 2026-10-31
 last_updated: 2026-11-10
-project: test
+project: weiliao-shouxiang-agent
 project_key: NOKEY
 tracking_system: file-system
 story_location: "{project-root}/_bmad-output/implementation-artifacts"

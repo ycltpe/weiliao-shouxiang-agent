@@ -5,7 +5,7 @@ companions:
   - structural-seed.md             # spec-authored：目录结构种子 + Capability→Architecture 映射
   - glossary.md                    # spec-authored：意图枚举、事实卡片、会话等领域词汇
   - stack.md                       # spec-authored：技术栈与部署形态（含既有脚手架排除说明）
-  - ../../../planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md  # adopted：架构脊柱原文，含管道图
+  - ../../../planning-artifacts/architecture/architecture-weiliao-shouxiang-agent-2026-10-22/ARCHITECTURE-SPINE.md  # adopted：架构脊柱原文，含管道图
   - ../../../planning/prds/prd-微聊首响Agent-2026-10-21/prd.md                                  # adopted：PRD 原文（FR/SM/OQ 完整叙述）
 sources: []
 ---

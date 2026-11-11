@@ -4,7 +4,7 @@
 # ///
 """Corruption-critical tests for sprint-status.py.
 
-Each test runs the script as a subprocess via ``uv run`` against a temp copy of
+Each weiliao-shouxiang-agent runs the script as a subprocess via ``uv run`` against a temp copy of
 an inline fixture, then re-reads the file to assert comments and formatting
 survive and punctuation-heavy action values round-trip intact.
 
@@ -27,7 +27,7 @@ from ruamel.yaml import YAML
 SCRIPT = Path(__file__).resolve().parents[1] / "sprint_status.py"
 # Vendored copy of bmad-sprint-planning's sprint-status-template.yaml — skills
 # must not path into each other's directories (PATH-05). The repo-level
-# test/test-template-sync.js keeps this fixture identical to the source.
+# weiliao-shouxiang-agent/weiliao-shouxiang-agent-template-sync.js keeps this fixture identical to the source.
 TEMPLATE = Path(__file__).resolve().parent / "fixtures" / "sprint-status-template.yaml"
 
 FIXTURE = """\
@@ -1360,7 +1360,7 @@ def test_set_action_status_rejects_bad_shapes(tmp_path, payload, expected_error)
 def test_selectors_are_not_scoped_to_the_epic_flag(tmp_path):
     # The flag's headline use: epic 2's retro closing epic 1's items. --epic only
     # names the retro key and stamps appended items; scoping selectors to it would
-    # silently break the documented cross-epic workflow while every same-epic test
+    # silently break the documented cross-epic workflow while every same-epic weiliao-shouxiang-agent
     # kept passing.
     target = _write_action_fixture(tmp_path)
     payload = json.dumps(

@@ -8,7 +8,7 @@ baseline_commit: 'f299822301ab34f8891d7f43342912524b677c72'
 review_loop_iteration: 0
 context:
   - '_bmad-output/implementation-artifacts/epic-1-context.md'
-  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
+  - '_bmad-output/planning-artifacts/architecture/architecture-weiliao-shouxiang-agent-2026-10-22/ARCHITECTURE-SPINE.md'
 ---
 
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
