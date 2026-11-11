@@ -16,7 +16,7 @@
 ## Requirements & Constraints
 
 - L0 缓存 key 结构：`weiliao:l0:{intent}:{house_id}:{status}:{price_bucket}`（段间以 `:` 分隔），TTL 5 分钟；Redis 值一律 JSON 序列化。
-- L0 缓存整体命中率 ≥80%（压测验证）。命中率统计口径：L1 与 L0 命中均计入分子，基数为全部首次消息，重复追问不计入分母。
+- L0 缓存整体命中率 ≥80%（压测验证）。命中率统计口径：L0 命中计入分子（`l1_hit` 为 AD-5 下永不兑现的预留并入位、恒 0——L1 严禁存事实卡片，L1 命中概念上不存在）；分母为全部首次消息中含 intent 的消息（intent 缺失的 fail-closed 消息不计入），重复追问不计入分母。（2026-11-11 评审裁决 D1/D3 对齐三份文档口径：原文「L1 与 L0 命中均计入分子，基数为全部首次消息」与 AD-5 矛盾处已修订。）
 - 事实卡片为单一 Pydantic 模型，字段：house_id、status（active/sold/offline）、price_bucket（10 万分桶）、school（可选）、dialogue_summary（最近 3 轮）、fact_version（int，随 Kafka 事件单调递增）、as_of（timestamp）。
 - 缓存失效语义为逻辑作废（标记删除）而非物理删除；房源状态变更时主动失效。
 - Kafka `house.sync.trigger` 房源事件是事实卡片的唯一写入路径：服务不直写数据库，Redis 缓存由事件消费者更新/失效；消费延迟 ≤500ms，超期未消费的事件按失效处理并触发告警。

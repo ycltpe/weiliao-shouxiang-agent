@@ -14,14 +14,15 @@ Fail-safe（冻结区）：解析失败、Redis 故障、Kafka 断连、提交�
 stderr 日志。Redis 客户端为同步 redis-py，经 ``asyncio.to_thread`` 卸载。
 
 版本冲突口径：L0 ``set`` 返回 False 有两种成因——守卫拒写（重放/乱序/
-墓碑）或 Redis 故障。消费者两段诊断区分：``get`` 读到版本不低于事件
+墓碑）或 Redis 故障。消费者三段诊断区分：``get`` 读到版本不低于事件
 版本的事实卡片即守卫拒写（offset 正常提交、冲突计入 consumed 事件
-metadata）；``get`` 返回 None 时以 ``invalidate`` 作健康探针（墓碑守卫
-拒写下现存墓碑版本必 ≥ 事件版本，探针幂等不重：生效版本取最大者），
-探针失败即 Redis 故障（不提交 offset、记 failure）；探针成功而重试 set
-仍被拒即确认守卫拒写（提交 offset）。探针副作用与作废事件同语义：
-已有墓碑时仅刷新其 TTL，无现存墓碑时立新墓碑（版本即事件版本）——
-fail-safe 优先级（「永不错误返回旧卡片」）不受损。
+metadata）；``get`` 返回 None 时以 **只读墓碑探针**
+（``L0CacheClient.tombstone_version``，无副作用、不新建墓碑——副作用式
+``invalidate`` 探针在瞬断恢复场景会新立版本恰等于事件版本的墓碑、反噬
+重试写入并静默丢事实，2026-11-11 评审 P1 修复）裁决墓碑守卫：现存墓碑
+版本 ≥ 事件版本即守卫拒写确认（提交 offset、其余 intent 同判定短路）；
+探针未遮蔽则 set False 只能是 Redis 故障/瞬断——重试 set 兜住瞬断恢复
+的补写窗口，重试仍失败走 failure 不提交（事件可重放）。
 
 消费者为独立 asyncio task（组合根 lifespan 托管），与 API 请求路径
 零共享状态；启动门控 ``WEILIAO_KAFKA_BROKERS`` 非空（main.py）。
@@ -237,9 +238,10 @@ class HouseSyncConsumer:
     ) -> None:
         """upsert：FactCard 写全部 intent；守卫拒写提交、Redis 故障不提交。
 
-        set 返回 False 的两段诊断（守卫拒写 vs Redis 故障）见模块
-        docstring：get 裁决索引守卫，invalidate 健康探针 + set 重试裁决
-        墓碑守卫（探针成功后的重试同时兜住 Redis 瞬断恢复的补写窗口）。
+        set 返回 False 的三段诊断（索引守卫 / 墓碑守卫 / Redis 故障）
+        见模块 docstring：get 裁决索引守卫；只读墓碑探针裁决墓碑守卫
+        （无副作用）；探针未遮蔽即 Redis 故障/瞬断——重试 set 兜住
+        瞬断恢复的补写窗口。
         """
         card = event.to_fact_card()
         version_conflict = False
@@ -259,32 +261,32 @@ class HouseSyncConsumer:
                 version_conflict = True
                 continue
             # set False 且 get 为 None：墓碑守卫拒写或 Redis 故障——
-            # invalidate 健康探针区分（墓碑守卫下现存墓碑版本必 ≥ 事件
-            # 版本，探针幂等不重；Redis 故障下探针同样失败）。
-            probed = await asyncio.to_thread(
-                self._l0.invalidate,
-                event.house_id,
-                event.fact_version,
-                trace_id=trace_id,
+            # 只读墓碑探针区分（不新建墓碑：瞬断恢复场景新立墓碑会
+            # 反噬重试写入，2026-11-11 评审 P1 修复）。
+            tomb = await asyncio.to_thread(
+                self._l0.tombstone_version, event.house_id
             )
-            if not probed:
-                self._record_failure(
-                    "l0_set_failed",
-                    trace_id=trace_id,
-                    intent=intent,
-                    house_id=event.house_id,
-                    fact_version=event.fact_version,
-                )
-                return  # Redis 故障：不提交 offset，事件可重放
-            # 探针成功（Redis 健康）而 set 仍被拒：确认守卫拒写。
+            if tomb is not None and tomb >= event.fact_version:
+                # 现存墓碑遮蔽本事件版本：守卫拒写确认。其余 intent
+                # 同判定，短路。
+                version_conflict = True
+                break
+            # 探针未遮蔽：set False 只能是 Redis 故障/瞬断——重试 set
+            # 兜住瞬断恢复的补写窗口；仍失败即 Redis 故障（不提交）。
             retried = await asyncio.to_thread(
                 self._l0.set, intent, card, trace_id=trace_id
             )
             if retried:
                 probe_retry = True
                 continue
-            version_conflict = True
-            break  # 探针已立墓碑 ≥ 事件版本：其余 intent 必同判定，短路
+            self._record_failure(
+                "l0_set_failed",
+                trace_id=trace_id,
+                intent=intent,
+                house_id=event.house_id,
+                fact_version=event.fact_version,
+            )
+            return  # Redis 故障：不提交 offset，事件可重放
         if probe_retry:
             metadata["probe_retry"] = True
         metadata["version_conflict"] = version_conflict
@@ -344,6 +346,11 @@ class HouseSyncConsumer:
                 fact_version=event.fact_version,
             )
             return
+        # stale 标记与 AC 权威延迟（写完成时刻）先落 metadata 再发
+        # 告警事件：alert 是唯一下游可过滤的告警落点，不得携带入口
+        # 时刻延迟、不得缺 stale 标记（2026-11-11 评审补丁）。
+        metadata["stale"] = True
+        self._refresh_latency(event, metadata)
         tracing.record_house_sync_event(trace_id, operation="stale_alert", metadata=metadata)
         logger.error(
             "house_sync_stale_alert event_id=%s house_id=%s fact_version=%s latency_ms=%.1f",
@@ -352,8 +359,6 @@ class HouseSyncConsumer:
             event.fact_version,
             cast("float", metadata["latency_ms"]),
         )
-        metadata["stale"] = True
-        self._refresh_latency(event, metadata)
         tracing.record_house_sync_event(trace_id, operation="consumed", metadata=metadata)
         await self._commit_safely(message, trace_id)
 

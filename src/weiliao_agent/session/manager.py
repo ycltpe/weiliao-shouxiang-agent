@@ -79,6 +79,7 @@ TRANSCRIPT_KEEP_TURNS = 10
 
 _LUA_BEGIN_TURN = """
 local key = KEYS[1]
+local transcript_key = KEYS[2]
 local last_message_at = ARGV[1]
 local ttl_seconds = tonumber(ARGV[2])
 -- 新会话判定以 turn 字段是否存在为准（不能用 turn==1：increment_followup
@@ -93,6 +94,10 @@ if redis.call('HEXISTS', key, 'handoff_status') == 0 then
 end
 redis.call('HSET', key, 'last_message_at', last_message_at)
 redis.call('EXPIRE', key, ttl_seconds)
+-- 转写 list TTL 与会话 hash 对齐（Epic 5 code review 补丁）：会话
+-- 存活期内「最近 3 轮」上下文必须可得——原实现下转写 key 从上轮
+-- 记录时刻独立倒计时，空闲近 TTL 后触发转人工会静默丢历史。
+redis.call('EXPIRE', transcript_key, ttl_seconds)
 local followup_count = tonumber(redis.call('HGET', key, 'followup_count'))
 local handoff_status = redis.call('HGET', key, 'handoff_status')
 local handoff_conditions = redis.call('HGET', key, 'handoff_conditions')
@@ -109,9 +114,11 @@ return count
 
 _LUA_RECORD_FOLLOWUP = """
 local key = KEYS[1]
-local tag_field = ARGV[1]
-local ttl_seconds = tonumber(ARGV[2])
-local per_intent = redis.call('HINCRBY', key, tag_field, 1)
+local per_anchor_field = ARGV[1]
+local per_tag_field = ARGV[2]
+local ttl_seconds = tonumber(ARGV[3])
+local per_intent = redis.call('HINCRBY', key, per_anchor_field, 1)
+local per_tag = redis.call('HINCRBY', key, per_tag_field, 1)
 local session_count = 0
 if per_intent >= 2 then
   -- 追问命中（同意图第 2 次起）才自增会话追问总数；否则只读出现值，
@@ -124,7 +131,7 @@ else
   end
 end
 redis.call('EXPIRE', key, ttl_seconds)
-return {per_intent, session_count}
+return {per_intent, session_count, per_tag}
 """
 
 _LUA_MARK_HANDOFF = """
@@ -190,6 +197,9 @@ class SessionManager:
         *,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
     ) -> None:
+        if ttl_seconds <= 0:
+            msg = f"ttl_seconds must be positive, got {ttl_seconds}"
+            raise ValueError(msg)
         self._client = client
         self._ttl_seconds = ttl_seconds
         self._begin_turn_script = client.register_script(_LUA_BEGIN_TURN)
@@ -204,8 +214,14 @@ class SessionManager:
         原子单 roundtrip；并发调用同 session 时各得唯一 turn。会话 TTL
         已过期时从零初始化（turn=1），无残留字段。
         """
+        # code review 补丁：timestamp 必须 tz-aware（与 Envelope 层同一
+        # 口径）——非 HTTP 入口的调用方直接传 naive datetime 在此 loud
+        # failure，而非读回无偏移时间戳后跨跳比较崩溃。
+        if timestamp.tzinfo is None or timestamp.tzinfo.utcoffset(timestamp) is None:
+            msg = "timestamp must be timezone-aware"
+            raise ValueError(msg)
         raw = self._begin_turn_script(
-            keys=[self._key(session_id)],
+            keys=[self._key(session_id), self._transcript_key(session_id)],
             args=[timestamp.isoformat(), self._ttl_seconds],
         )
         turn, followup_count, handoff_status, handoff_conditions = cast(
@@ -240,9 +256,9 @@ class SessionManager:
 
     def record_followup(
         self, session_id: str, tag: IntentTag, anchor: str
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """追问识别原子记录（Story 2.3，AD-4；Story 6.3 锚定）：per-(tag,
-        anchor) 计数 + 会话总数。
+        anchor) 计数 + 会话总数 + per-tag 聚合计数。
 
         Lua 单 roundtrip：``HINCRBY followup:{TAG}:{anchor}`` 维护
         per-(tag, anchor) 计数（anchor 由调用方从信封 coref 机械导出，
@@ -250,9 +266,14 @@ class SessionManager:
         仅当 per-(tag, anchor) ≥2（追问命中）时自增会话
         ``followup_count``——否则恒等于 turn 序号，「≥3」会在第 3 条
         普通消息误触发；EXPIRE 随脚本刷新，TTL 与会话一致。返回
-        ``(per_intent_count, session_followup_count)`` 双计数，调用方
-        据 per-(tag, anchor) ≥2 判定 ``is_followup``、据会话总数 ≥3
-        产出 hard trigger 信号。
+        ``(per_anchor_count, session_followup_count, per_tag_count)``
+        三计数：调用方据 per-(tag, anchor) ≥2 判定 ``is_followup``
+        （Story 6.3 FR-2 锚定口径）；per-tag 聚合（``followup_tag:{TAG}``
+        字段，同 hash 同 TTL，跨 anchor 累计）供 Epic 5 硬触发阈值判定
+        ——2026-11-11 code review 裁决 B：「同一意图 ≥3」冻结口径，
+        per-(tag, anchor) 细键会把交替锚定消息的计数稀释到永远不达
+        阈值；会话总数 ≥3 仍经 ``record_followup_hard_trigger`` 信号
+        产出（Story 2.3 语义不变）。
 
         调用方口径（intent_router）：仅分类成功、turn 非 None 且 tag 非
         UNKNOWN 时调用；UNKNOWN 与本模块 1.3 的 ``increment_followup``
@@ -260,14 +281,20 @@ class SessionManager:
         """
         raw = self._record_followup_script(
             keys=[self._key(session_id)],
-            args=[f"followup:{tag}:{anchor}", self._ttl_seconds],
+            args=[
+                f"followup:{tag}:{anchor}",
+                f"followup_tag:{tag}",
+                self._ttl_seconds,
+            ],
         )
-        per_intent, session_count = cast(
-            "tuple[object, object]", tuple(cast("list[object]", raw))
+        per_anchor, session_count, per_tag = cast(
+            "tuple[object, object, object]",
+            tuple(cast("list[object]", raw)),
         )
         return (
-            int(cast("int | str | bytes", per_intent)),
+            int(cast("int | str | bytes", per_anchor)),
             int(cast("int | str | bytes", session_count)),
+            int(cast("int | str | bytes", per_tag)),
         )
 
     def mark_handoff(self, session_id: str, conditions: list[str]) -> None:
@@ -374,15 +401,21 @@ class SessionManager:
         raw_last_message_at = fields.get("last_message_at")
         if raw_turn is None or raw_last_message_at is None:
             return None
-        return SessionSnapshot(
-            turn=int(raw_turn),
-            followup_count=int(fields.get("followup_count", "0")),
-            handoff_status=fields.get("handoff_status", "none"),
-            handoff_conditions=self._parse_conditions(
-                fields.get("handoff_conditions")
-            ),
-            last_message_at=datetime.fromisoformat(raw_last_message_at),
-        )
+        try:
+            return SessionSnapshot(
+                turn=int(raw_turn),
+                followup_count=int(fields.get("followup_count", "0")),
+                handoff_status=fields.get("handoff_status", "none"),
+                handoff_conditions=self._parse_conditions(
+                    fields.get("handoff_conditions")
+                ),
+                last_message_at=datetime.fromisoformat(raw_last_message_at),
+            )
+        except (ValueError, TypeError):
+            # 防御非本模块写入的脏数据（code review 补丁）：字段存在但
+            # 值损坏（turn 非数字 / last_message_at 非法 ISO）与「字段
+            # 缺失」同一口径——返回 None，由调用方从零初始化兜底。
+            return None
 
     def read_handoff_status(self, session_id: str) -> str | None:
         """只读 ``handoff_status`` 权威值（Story 5.5 编排器终态闸门）：

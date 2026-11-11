@@ -31,6 +31,8 @@ None=不熔断，保持既有测试与惰性默认路径语义）。请求前 ``
 处理），绝不让请求路径因熔断逻辑抛错。
 """
 
+from contextlib import suppress
+
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.llm import LlmGenerationError
 from weiliao_agent.llm import generate as _module_generate
@@ -76,7 +78,12 @@ class LlmGenerateFilter(Filter):
             # 草稿，信封原样透传、不触达模型；买家原文不做决策性读取。
             return envelope
         breaker = self._breaker
-        if breaker is not None and not self._consult_breaker(breaker, envelope):
+        # 熔断分键（code review Epic 4 补丁）：预览本次将使用的模型 alias，
+        # 咨询/信号均按 alias 分键——mini 瞬态故障不连坐主模型健康路径。
+        planned_model = self._planned_model(envelope) if breaker is not None else None
+        if breaker is not None and not self._consult_breaker(
+            breaker, envelope, planned_model
+        ):
             # 熔断拒绝：open/half-open 未放量，不调子图、零 I/O、透传。
             return envelope
         try:
@@ -91,12 +98,14 @@ class LlmGenerateFilter(Filter):
                 reason=reason,
             )
             if breaker is not None:
-                self._signal_breaker_failure(breaker, envelope, reason)
+                # 故障归因优先取 client 回填的实际 alias，退回预览键位。
+                failure_model = getattr(exc, "model", None) or planned_model
+                self._signal_breaker_failure(breaker, envelope, reason, failure_model)
             return envelope
         if breaker is not None:
             # 成功信号口径：子图未抛 OpenAI 故障即算成功（grounding
             # 校验属内容问题，中性，不阻断恢复推进）。
-            self._signal_breaker_success(breaker, envelope)
+            self._signal_breaker_success(breaker, envelope, planned_model)
         problem = verify_grounding(text)
         if problem is not None:
             # fail-closed：违禁表述/标注泄漏/链接命中即丢弃草稿。
@@ -123,7 +132,21 @@ class LlmGenerateFilter(Filter):
             trace_id=envelope.trace_id,
         )
 
-    def _consult_breaker(self, breaker: LlmCircuitBreaker, envelope: Envelope) -> bool:
+    def _planned_model(self, envelope: Envelope) -> str | None:
+        """预览本次生成将使用的模型 alias（熔断分键键位）。
+
+        fail-safe：无子图/预览异常一律回 None（缺省键，即修复前全局
+        单状态口径），熔断逻辑绝不反过来阻断请求。
+        """
+        if self._subgraph is None:
+            return None
+        with suppress(Exception):
+            return self._subgraph.peek_model(envelope.intent)
+        return None
+
+    def _consult_breaker(
+        self, breaker: LlmCircuitBreaker, envelope: Envelope, model: str | None
+    ) -> bool:
         """熔断咨询：False 即跳过生成（不调子图、信封原样透传）。
 
         咨询自身 fail-safe：breaker 异常吞掉并按放行处理（熔断器是
@@ -131,7 +154,7 @@ class LlmGenerateFilter(Filter):
         拒绝路径记 DEFAULT 级 skip 事件（open 期跳过记 ERROR 会成噪音）。
         """
         try:
-            admitted = breaker.before_request()
+            admitted = breaker.before_request(model)
         except Exception:
             return True
         if admitted:
@@ -140,11 +163,15 @@ class LlmGenerateFilter(Filter):
         return False
 
     def _signal_breaker_failure(
-        self, breaker: LlmCircuitBreaker, envelope: Envelope, reason: str
+        self,
+        breaker: LlmCircuitBreaker,
+        envelope: Envelope,
+        reason: str,
+        model: str | None,
     ) -> None:
         """故障信号 fail-safe：仅故障词表跳闸时记 ERROR 级 tripped 事件。"""
         try:
-            tripped = breaker.on_failure(reason)
+            tripped = breaker.on_failure(reason, model)
         except Exception:
             return
         if tripped:
@@ -153,11 +180,11 @@ class LlmGenerateFilter(Filter):
             )
 
     def _signal_breaker_success(
-        self, breaker: LlmCircuitBreaker, envelope: Envelope
+        self, breaker: LlmCircuitBreaker, envelope: Envelope, model: str | None
     ) -> None:
         """成功信号 fail-safe：推进恢复至 100% 闭合时记 recovered 事件。"""
         try:
-            recovered = breaker.on_success()
+            recovered = breaker.on_success(model)
         except Exception:
             return
         if recovered:

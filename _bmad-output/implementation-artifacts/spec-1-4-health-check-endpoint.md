@@ -21,6 +21,11 @@ context:
 
 </frozen-after-approval>
 
+### Review Findings
+
+- [x] [Review][Decision] 就绪探针判据是否收紧 — 已决（2026-11-10）：维持现状（符合 AC 字面口径，Redis 故障不摘除实例的设计不变）[src/weiliao_agent/health/probe.py:38]
+- [x] [Review][Defer] 测试直接导入生产组合根模块存在顺序耦合（test_health 收集期 import main 建真实 Redis 客户端；test_session 以 monkeypatch+reload 替换，两文件互不感知，xdist 下可能泄漏） — deferred, pre-existing [tests/test_health.py, tests/test_session.py]
+
 ## Implementation Notes
 
 - 就绪判定落点：`health/` 包新增探针函数，只读检查编排器过滤器链含 `response_assembler`（架构约定"挂在响应组装过滤器"的字面实现）。`PipelineOrchestrator` 补只读访问器（如 `filter_names` 属性）供探针消费；不改编排逻辑。

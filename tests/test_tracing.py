@@ -69,6 +69,9 @@ class _FakeLangfuse:
         self.observations: list[dict[str, Any]] = []
         self.entered_spans: list[_FakeObservationCM] = []
         self.events: list[dict[str, Any]] = []
+        # code review 补丁：替身补 update_current_span，使 record_delivery
+        # 的根 span metadata 同步路径在测试中被真实执行并断言。
+        self.span_updates: list[dict[str, Any]] = []
 
     def start_as_current_observation(self, **kwargs: Any) -> _FakeObservationCM:
         self.observations.append(kwargs)
@@ -79,6 +82,9 @@ class _FakeLangfuse:
 
     def create_event(self, **kwargs: Any) -> None:
         self.events.append(kwargs)
+
+    def update_current_span(self, **kwargs: Any) -> None:
+        self.span_updates.append(kwargs)
 
 
 @pytest.fixture
@@ -199,6 +205,9 @@ def test_every_filter_records_span_and_delivery_on_trace(
     assert deliveries[0]["output"] == result.reply
     assert deliveries[0]["metadata"]["delivered_text"] == result.reply
     assert deliveries[0]["metadata"]["degraded"] is False
+    # code review 补丁：最终下发文本同步写入根 span metadata（SM-5/SM-6
+    # 消费者口径），且与交付事件一致。
+    assert fake_langfuse.span_updates[-1]["metadata"]["delivered_text"] == result.reply
 
 
 def test_filter_exception_records_degradation_with_attribution(
@@ -400,25 +409,43 @@ def test_redis_down_fallback_generates_trace_id_when_payload_omits_it() -> None:
     body = response.json()
     assert body["degraded"] is True
     assert body["trace_id"]  # 非空，兜底路径新生成
-    assert _TRACE_ID_HEX.fullmatch(body["trace_id"]) is None  # 与编排器口径无关，仅非空即可
+    # code review 补丁：兜底 trace_id 与编排器同口径（32-hex），
+    # 错误应答可按响应 id 在 Langfuse 检索。
+    assert _TRACE_ID_HEX.fullmatch(body["trace_id"])
 
 
 # ---- Story 4.6：record_model_routing_event 本体直测（事件名/级别/fail-safe）----
 
 
-def test_record_model_routing_event_forced_mini_is_error_level(
+def test_record_model_routing_event_forced_mini_is_default_level(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
+    # code review Epic 4 补丁：forced_mini 每请求一条 ERROR 会成噪音
+    # 洪流（同熔断 skip 口径），收紧迁移瞬间的 tightened 才是 ERROR 锚点。
     tracing.record_model_routing_event(
         "ab" * 16, outcome="forced_mini", intent="PRICE_INQUIRY"
     )
 
     (event,) = fake_langfuse.events
     assert event["name"] == "llm.model_routing_event"
-    assert event["level"] == "ERROR"  # 成本异常信号：级别写反会静默丢失
+    assert event["level"] == "DEFAULT"
     assert event["metadata"]["event"] == "model_routing_event"
     assert event["metadata"]["outcome"] == "forced_mini"
     assert event["metadata"]["intent"] == "PRICE_INQUIRY"
+
+
+def test_record_model_routing_event_tightened_is_error_level(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # 进入收紧的迁移瞬间是成本异常信号锚点：级别写反会静默丢失。
+    tracing.record_model_routing_event(
+        "ab" * 16, outcome="tightened", intent="PRICE_INQUIRY"
+    )
+
+    (event,) = fake_langfuse.events
+    assert event["name"] == "llm.model_routing_event"
+    assert event["level"] == "ERROR"
+    assert event["metadata"]["outcome"] == "tightened"
 
 
 @pytest.mark.parametrize("outcome", ["primary", "mini", "recovered"])

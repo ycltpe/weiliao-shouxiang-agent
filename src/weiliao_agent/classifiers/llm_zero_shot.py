@@ -4,12 +4,15 @@ ChatOpenAI 结构化输出（单一标签 + 自评置信度），满足 AD-3「�
 置信度」契约；实现实例无分类状态，可安全复用 2.1 的线程池执行模型
 （组合根单例注入过滤器，过滤器跑在编排器线程池内）。
 
-硬超时守卫（spec Design Notes）：客户端级 timeout 设在预算内
-（默认 45ms，经构造参数/环境配置注入），并以调用侧
+硬超时守卫（spec Design Notes；2026-11-10 评审决策放宽预算）：客户端级
+timeout 设在预算内（默认 800ms，构造参数 >
+``WEILIAO_INTENT_TIMEOUT_SECONDS`` 环境变量 > 默认），并以调用侧
 ``future.result(timeout)`` 双保险——超时/网络错误/结构化输出校验
 失败一律抛 ``IntentClassificationError``（自报 ``reason`` 供过滤器
 trace 归因），由过滤器 fail-closed 为 UNKNOWN，不给规则兜底（保持
-单一来源，避免双实现口径漂移）。
+单一来源，避免双实现口径漂移）。45ms 原始预算与真实 LLM 网络 RTT
+物理不相容（epic 级评审 high 决策项），P99 < 50ms 分类延迟 NFR 记为
+不可达缺口，真实 P99 经 ``latency_ms`` 埋点 + 压测设施实测。
 
 置信度口径：取 LLM 结构化输出的自评分数；模型不自评（confidence 缺省）
 时以固定口径 0.8 回填——不回填 1.0，为 Story 2.3 追问归并保留信号
@@ -33,15 +36,18 @@ from weiliao_agent.models.intent import IntentClassification, IntentTag
 # 脊柱 Stack 表迁移路径见 Deferred）；可被构造参数/环境变量覆盖。
 DEFAULT_MODEL_ALIAS = "gpt-4o-mini"
 
-# 分类延迟硬预算：P99 < 50ms 端到端口径（含前置指代消解）的实现内守卫，
-# 不依赖编排器 deadline 兜底。
-DEFAULT_TIMEOUT_SECONDS = 0.045
+# 分类硬超时默认预算（秒）。2026-11-10 评审决策：45ms 与真实 LLM 网络
+# RTT 物理不相容（确定性超时全损），放宽至 800ms——仍在全链路 P99 < 3s
+# / AD-9 LLM 1.8s 预算内；P99 < 50ms 分类延迟 NFR 记为不可达缺口，
+# 经 WEILIAO_INTENT_TIMEOUT_SECONDS 可调。
+DEFAULT_TIMEOUT_SECONDS = 0.8
 
 # 模型不自评置信度时的固定回填值（spec Design Notes，不回填 1.0）。
 FALLBACK_CONFIDENCE = 0.8
 
 # 超时的 LLM 调用无法中止（执行线程待其自行结束），并发上限防御
-# 超时风暴下的线程膨胀；调用侧守卫先行返回，不傻等。
+# 超时风暴下的线程膨胀；调用侧守卫先行返回，不傻等，并对未启动任务
+# future.cancel()（评审补丁：防无界队列积压与恢复后僵尸洪峰）。
 _MAX_WORKERS = 8
 
 
@@ -81,13 +87,23 @@ class LlmZeroShotClassifier:
         self,
         model: str | None = None,
         *,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         structured_model: Any = None,
     ) -> None:
         self._model = model or os.environ.get(
             "WEILIAO_INTENT_MODEL", DEFAULT_MODEL_ALIAS
         )
-        self._timeout_seconds = timeout_seconds
+        env_timeout = os.environ.get("WEILIAO_INTENT_TIMEOUT_SECONDS")
+        resolved = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else float(env_timeout)
+            if env_timeout
+            else DEFAULT_TIMEOUT_SECONDS
+        )
+        if resolved <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {resolved}")
+        self._timeout_seconds = resolved
         self._structured_model = structured_model
         self._executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
 
@@ -97,7 +113,9 @@ class LlmZeroShotClassifier:
         try:
             return future.result(timeout=self._timeout_seconds)
         except FutureTimeoutError:
-            # 硬预算耗尽：执行线程无法中止，待其自行结束（不傻等）。
+            # 硬预算耗尽：执行线程无法中止，待其自行结束（不傻等）；
+            # cancel 对排队中（未启动）任务有效，防队列积压。
+            future.cancel()
             msg = f"llm classification exceeded {self._timeout_seconds * 1000:.0f}ms"
             raise IntentClassificationError("timeout", msg) from None
         except IntentClassificationError:
@@ -138,7 +156,7 @@ class LlmZeroShotClassifier:
 def _prompt(message: str, context: Mapping[str, Any]) -> list[Any]:
     """zero-shot prompt：9 类标签清单 + 会话上下文 + 单标签/置信度口径。
 
-    保持短小（延迟预算 45ms）：标签清单为唯一权威枚举说明，示例省略——
+    保持短小（响应越短延迟越低）：标签清单为唯一权威枚举说明，示例省略——
     结构化输出 schema 本身即约束。
     """
     tags = (

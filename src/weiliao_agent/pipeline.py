@@ -303,7 +303,14 @@ class PipelineOrchestrator:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     # 剩余预算耗尽：立即兜底，不傻等。
-                    return self._degraded(envelope, trace_id, slow_filter=filter_.name)
+                    # code review 补丁：slow_filter 与逃逸路径同一兜底口径
+                    # （未覆写 name 时回退类名），超时归因不丢失。
+                    return self._degraded(
+                        envelope,
+                        trace_id,
+                        slow_filter=getattr(filter_, "name", None)
+                        or type(filter_).__name__,
+                    )
                 future = self._executor.submit(filter_.process, envelope)
                 try:
                     # span 在主线程侧包 future.result()：过滤器跑在执行
@@ -316,7 +323,12 @@ class PipelineOrchestrator:
                         # 100% 无生成回答；走转人工出口分支回固定文案。
                         return self._handoff_result(envelope)
                 except FutureTimeoutError:
-                    return self._degraded(envelope, trace_id, slow_filter=filter_.name)
+                    return self._degraded(
+                        envelope,
+                        trace_id,
+                        slow_filter=getattr(filter_, "name", None)
+                        or type(filter_).__name__,
+                    )
                 except Exception:
                     return self._degraded(envelope, trace_id, failed_filter=filter_.name)
         except Exception:
@@ -356,10 +368,17 @@ class PipelineOrchestrator:
         发送完成（或重试耗尽归一 DLQ）后才返回安抚文案；发送器为 None
         跳过发送。发送器自身 fail-safe，本分支再包一层防御：任何逃逸
         异常不得改变应答（绝不降级为模板兜底）。
+        载荷当前轮 agent_reply 与买家实收逐字节一致（Epic 5 code
+        review 补丁）：传带 AI 披露前缀的文案——与同 payload 历史轮
+        （转写落盘，均带前缀）及 5.2 决策 Q1-A「买家所见逐字原文」
+        口径对齐。
         """
         if self._handoff_sender is not None:
             try:
-                self._handoff_sender.send_command(envelope, reply=HANDOFF_REPLY_TEXT)
+                self._handoff_sender.send_command(
+                    envelope,
+                    reply=f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}",
+                )
             except Exception:
                 # 防御层（发送器契约已承诺不抛）：指令发送失败绝不影响
                 # 买家应答，出口文案语义逐字节不变。

@@ -55,6 +55,9 @@ warn_unused_ignores = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: 真实外部依赖（Redis 容器等）集成测试，缺省环境 skip",
+]
 
 [tool.pytest-asyncio]
 asyncio_default_test_loop_scope = "function"

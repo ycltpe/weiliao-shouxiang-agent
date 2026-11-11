@@ -330,6 +330,9 @@ def test_router_budget_exceeded_forces_mini_and_traces_events(
     assert events == [
         {"outcome": "primary", "intent": "PRICE_INQUIRY"},
         {"outcome": "forced_mini", "intent": "AVAILABILITY"},
+        # code review Epic 4 补丁：进入收紧的迁移瞬间补记 tightened 事件
+        # （ERROR 级成本异常锚点，仿 recovered 迁移口径）。
+        {"outcome": "tightened", "intent": "AVAILABILITY"},
     ]
 
 
@@ -355,6 +358,7 @@ def test_router_recovers_after_window_slide_and_traces_recovered(
     assert events == [
         {"outcome": "primary", "intent": "PRICE_INQUIRY"},
         {"outcome": "forced_mini", "intent": "AVAILABILITY"},
+        {"outcome": "tightened", "intent": "AVAILABILITY"},
         {"outcome": "mini", "intent": "GREETING"},
         {"outcome": "recovered", "intent": "GREETING"},
     ]

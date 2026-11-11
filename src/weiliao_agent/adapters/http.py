@@ -27,7 +27,6 @@ fail-closed：与 ``begin_turn`` 失败同一兜底口径（degraded 模板兜�
 """
 
 import logging
-import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -68,7 +67,7 @@ def _fallback_result(
     ``ai.disclosure``（disclosed=True）事件——记录 fail-safe，不改变
     应答语义；trace_id 不可挂 Langfuse（非 32-hex）时事件静默跳过。
     """
-    resolved_trace_id = trace_id if trace_id is not None else str(uuid.uuid4())
+    resolved_trace_id = trace_id if trace_id is not None else tracing.new_trace_id()
     tracing.record_ai_disclosure(resolved_trace_id, disclosed=True)
     return PipelineResult(
         reply=render_fallback(intent),
@@ -177,6 +176,27 @@ def create_app(
         except ValidationError:
             # 无效输入 fail-closed：兜底应答 + 新生成 trace_id，不返回 5xx。
             return _fallback_result().to_dict()
+        # Epic 5 code review 补丁：管道内部挂点字段为服务端自有——
+        # 客户端伪造 ``handoff.triggered`` / ``media_type`` 可在评估
+        # 执行前短路转人工出口，以自选条件向工作台发伪造指令；
+        # ``assembled_reply`` / ``generated_reply`` / ``fact_card`` /
+        # ``resolved_message`` / ``coref`` / ``is_followup`` 同理（下游
+        # 缺跳或消费方可被预设值污染）。入口统一复位（与 turn 同口径），
+        # 直至接入适配器真正标注媒体类型。intent 为既有 payload 契约
+        #（降级路径按 payload intent 渲染兜底模板），不在复位范围。
+        envelope = envelope.model_copy(
+            update={
+                "turn": None,
+                "is_followup": False,
+                "fact_card": None,
+                "generated_reply": None,
+                "assembled_reply": None,
+                "handoff": None,
+                "resolved_message": None,
+                "coref": None,
+                "media_type": None,
+            }
+        )
         if session_manager_ is not None:
             try:
                 snapshot = session_manager_.begin_turn(envelope.session_id, envelope.timestamp)

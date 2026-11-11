@@ -6,6 +6,7 @@ Story 4.5 追加熔断器快照与快照非零回读；Story 4.6 追加模型路
 链不完整 → 503（非 200 即满足 AC，负载均衡据此刻摘除实例）。
 """
 
+import pytest
 from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
@@ -122,12 +123,84 @@ def test_health_incomplete_chain_returns_503() -> None:
     assert response.json() == {"status": "not_ready"}
 
 
+def test_health_cache_metrics_full_shape_and_wiring() -> None:
+    # Story 3.4 评审补丁：/health 命中率读数旧只验证零态三键——
+    # l0_miss/l1_hit/bypassed 形状与「过滤器计数→快照」贯通无守护
+    # （组合根若换成独立 collector 实例，两端单测各自绿、读数恒零
+    # 静默失灵）。
+    collector = metrics_module.reset_cache_metrics()
+    try:
+        collector.record_lookup(hit=True)
+        collector.record_lookup(hit=True)
+        collector.record_lookup(hit=False)
+        collector.record_bypass()
+        client = TestClient(create_app())
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["cache_metrics"] == {
+            "l0_hit": 2,
+            "l0_miss": 1,
+            "l1_hit": 0,
+            "bypassed": 1,
+            "lookups": 3,
+            "hits": 2,
+            "hit_rate": pytest.approx(2 / 3),
+        }
+    finally:
+        # 共享单例：中途断言失败也不得把计数泄漏给后续用例。
+        metrics_module.reset_cache_metrics()
+
+
 class _RaisingOrchestrator:
     """探针消费即抛错的畸形编排器替身。"""
 
     @property
     def filter_names(self) -> tuple[str, ...]:
         raise RuntimeError("probe boom")
+
+
+_PAYLOAD_NAMES = (
+    "cache_metrics_payload",
+    "risk_review_metrics_payload",
+    "llm_breaker_payload",
+    "model_routing_payload",
+)
+
+
+@pytest.mark.parametrize("failing_name", _PAYLOAD_NAMES)
+def test_health_snapshot_failure_only_drops_own_payload(
+    monkeypatch: pytest.MonkeyPatch, failing_name: str
+) -> None:
+    # code review Epic 4 补丁：任一快照取数失败只丢自己那份，端点仍 200
+    # 且其余快照齐全（fail-safe 承诺无验证锚点，防重构静默删除包装）。
+    def _boom() -> dict[str, object]:
+        raise RuntimeError("snapshot source down")
+
+    monkeypatch.setattr(
+        f"weiliao_agent.adapters.http.{failing_name}", _boom, raising=True
+    )
+    metrics_module.reset_cache_metrics()
+    metrics_module.reset_risk_review_metrics()
+    metrics_module.reset_llm_breaker_metrics()
+    metrics_module.reset_model_routing_metrics()
+    client = TestClient(create_app())
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    key_by_name = {
+        "cache_metrics_payload": "cache_metrics",
+        "risk_review_metrics_payload": "risk_review_metrics",
+        "llm_breaker_payload": "llm_breaker",
+        "model_routing_payload": "model_routing",
+    }
+    failing_key = key_by_name[failing_name]
+    assert set(key_by_name.values()) - {failing_key} <= set(body)
+    assert failing_key not in body
 
 
 def test_health_probe_error_returns_503() -> None:

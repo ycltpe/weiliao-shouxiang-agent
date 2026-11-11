@@ -1,0 +1,3925 @@
+diff --git a/.env.example b/.env.example
+index d4c09f6..4f6dedb 100644
+--- a/.env.example
++++ b/.env.example
+@@ -6,3 +6,6 @@ LLM_API_KEY=
+ 
+ # 服务地址
+ LLM_BASE_URL=
++
++# 会话状态 Redis（Story 1.3，会话状态唯一写入者；默认 redis://127.0.0.1:6379/0）
++WEILIAO_REDIS_URL=
+diff --git a/README.md b/README.md
+index 46de9f6..07482eb 100644
+--- a/README.md
++++ b/README.md
+@@ -1,14 +1,37 @@
+-# my-agent
++# weiliao-agent
+ 
+-一个基于 FastAPI 的 Agent 服务，支持 A2A（Agent2Agent）协议接入，内置多轮会话管理。
++微聊首响 Agent —— 管道-过滤器架构的首响应答服务（开发中）。
+ 
+-## 功能
++## 架构
+ 
+-- 通过 HTTP POST `/api/v1/chat` 与 Agent 对话
+-- 可选的 `session_id` 维持多轮会话上下文
+-- 通过 DELETE `/api/v1/sessions/{session_id}` 清空会话历史
+-- 健康检查接口 `/api/v1/health`
+-- **A2A 协议支持**：JSON-RPC 端点 `POST /a2a`，AgentCard 暴露在 `GET /.well-known/agent-card.json`
++买家消息经标准化信封（Envelope）流经处理管道，每个过滤器仅消费上游信封、
++产出下游信封，过滤器之间禁止私有耦合。当前代码库已完成项目骨架与信封模型
++（Story 1.1），过滤器链、会话管理、健康检查与追踪脚手架等能力将在后续 Story 实现。
++
++## 目录结构（Structural Seed）
++
++```
++src/weiliao_agent/
++  adapters/        # Kafka consumer/producer、外部服务适配
++  filters/         # 热路径过滤器：coreference、intent_router、cache_lookup、risk_review、response_assembler
++  llm/             # LangGraph 子图、OpenAI client、prompt 管理
++  session/         # 会话状态管理（单写者，含 handoff 状态）
++  cache/           # L0 Redis 客户端、L1 cachetools 封装
++  models/          # Pydantic 模型：信封、事实卡片、意图标签（Literal）
++  workers/         # Kafka 消费者：房源事件同步、转人工指令
++  observability/   # Langfuse trace、监控指标、成本追踪
++  health/          # 健康检查端点（挂在响应组装过滤器）
++```
++
++## 信封模型
++
++`models/envelope.py` 中的 `Envelope` 是管道全链路唯一通信模型，核心字段：
++`session_id`、`house_id`、`turn`、`intent`、`timestamp`、`trace_id`；另预留
++`message`、`resolved_message`、`coref`、`media_type` 四字段（暂未消费）。
++
++任意来源的 dict 必须经 `Envelope.model_validate` 校验后方可进入管道；缺失必填
++字段（`session_id` / `house_id` / `timestamp` / `trace_id`）或类型错误一律
++fail-closed，抛出 `pydantic.ValidationError`，由调用方兜底。
+ 
+ ## 环境变量
+ 
+@@ -18,68 +41,21 @@
+ LLM_MODEL_ID=your_model_id
+ LLM_API_KEY=your_api_key_here
+ LLM_BASE_URL=https://your-gateway/v1
++
++# 会话状态 Redis（Story 1.3，会话状态唯一写入者）
++WEILIAO_REDIS_URL=redis://127.0.0.1:6379/0
+ ```
+ 
+ ## 开发
+ 
+ ```bash
+-# 安装依赖
++# 安装依赖（含 dev 工具）
+ uv sync --all-extras
+ 
+-# 运行服务（同时暴露 /api/v1 与 /a2a）
+-uv run my-agent
+-
+-# 只运行 A2A 协议服务（默认端口 8001）
+-uv run my-agent-a2a
+-
+ # 运行测试
+ uv run pytest
+ 
+-# 代码检查与格式化
+-uv run ruff check .
+-uv run ruff format .
++# 代码检查
++uv run ruff check src tests
+ uv run mypy src
+ ```
+-
+-## A2A 协议说明
+-
+-本服务基于 [a2a-sdk](https://github.com/google/A2A) 实现 A2A 协议 1.0：
+-
+-- `GET /.well-known/agent-card.json`：AgentCard 描述文件
+-- `POST /a2a`：JSON-RPC 2.0 消息入口（`SendMessage` / `GetTask` 等方法）
+-- 会话上下文：首次调用后在响应的 `contextId` 字段获取上下文 ID，后续请求在 `message.contextId` 中携带即可维持多轮会话
+-- 请求需携带协议版本头：`A2A-Version: 1.0`
+-
+-### A2A 调用示例
+-
+-```bash
+-# 1. 查看 AgentCard
+-curl http://127.0.0.1:8000/.well-known/agent-card.json
+-
+-# 2. 发送消息（首轮）
+-curl -X POST http://127.0.0.1:8000/a2a/ \
+-  -H "Content-Type: application/json" \
+-  -H "A2A-Version: 1.0" \
+-  -d '{
+-    "jsonrpc": "2.0",
+-    "id": "1",
+-    "method": "SendMessage",
+-    "params": {
+-      "message": {
+-        "role": "ROLE_USER",
+-        "parts": [{"text": "你好"}],
+-        "messageId": "msg-1"
+-      }
+-    }
+-  }'
+-
+-# 3. 携带 contextId 继续对话（从上一轮响应的 contextId 字段获取）
+-```
+-
+-## API 示例
+-
+-```bash
+-curl -X POST http://127.0.0.1:8000/api/v1/chat \
+-  -H "Content-Type: application/json" \
+-  -d '{"message": "你好", "session_id": "demo"}'
+-```
+diff --git a/_bmad-output/implementation-artifacts/deferred-work.md b/_bmad-output/implementation-artifacts/deferred-work.md
+new file mode 100644
+index 0000000..1f90311
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/deferred-work.md
+@@ -0,0 +1,37 @@
++# Deferred Work
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-1-project-skeleton-envelope.md`
++  summary: 信封 `timestamp` 是否要求带时区（拒绝 naive datetime）未在 Story 1.1 spec 中规定
++  evidence: 评审发现 `Envelope` 接受无时区 timestamp（若属实则 medium：跨跳时间比较崩溃/事件乱序）；spec 各层均未涉及时区策略。 settle：由消费 timestamp 的后续 Story spec（如 1.3 会话管理 / 1.5 Langfuse 追踪）明确时区契约后补校验器。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-1-project-skeleton-envelope.md`
++  summary: 信封字符串标识符（session_id/house_id/trace_id）是否要求非空未在 Story 1.1 spec 中规定
++  evidence: 评审发现空字符串可通过校验（若属实则 medium：会话/路由查找失效）；spec 未规定非空约束。settle：由后续 Story spec 明确标识符规则后补 `min_length` 校验。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md`
++  summary: 每请求新建 ThreadPoolExecutor，超时丢弃的执行线程无取消/复用机制，超时风暴下线程可能积累（severity 未核验）
++  evidence: 占位过滤器生产环境均为微秒级透传、不可能触发超时，线程积累场景当前不可达；若真实过滤器（Epic 4）落地后为真预计 medium（P99 劣化/资源膨胀）。settle：Epic 4 接入带副作用的真实过滤器后做超时风暴压测，重审执行器生命周期（共享池/cancel/信封所有权）。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md`
++  summary: 信封模型未设 frozen，超时丢弃的线程若在原地变更信封可能污染编排器持有的引用
++  evidence: Envelope 无 frozen 是 Story 1.1 既有状态（pre-existing），非本 Story 引入；危害需"带副作用过滤器 + 超时丢弃"组合，当前占位过滤器只读或整信封替换（model_copy），不可达。随 Epic 4 真实过滤器落地与上条同批重审。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md`
++  summary: spec 声明的验证命令 `uv run ruff check .` 全仓执行报 302 个存量告警，按字面跑验收会失败
++  evidence: 全部位于 vendored `.agents/skills/`、`.claude/skills/` 脚本树与 `docs/`，pre-existing，与本 Story 代码无关（`ruff check src tests` 干净）。settle：统一 ruff 排除配置（extend-exclude）或收敛存量告警。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-session-state-single-writer.md`
++  summary: 会话状态并发原子性（turn 唯一/计数精确）仅在全局串行的 fakeredis 下验证，非原子实现（如 Python 侧 read-modify-write）同样能通过现有并发测试
++  evidence: verification-gap 层已读 fakeredis 2.40 源码确证其 server 级全局锁使命令完全串行，无法暴露真实 Redis 下的竞态；本 Story 边界明确"不部署/运维 Redis"，无真实 Redis 可用。settle：部署形态落地后补真实 Redis 集成测试（容器化 redis + 并发压测断言 turn 唯一）；当前依赖结构性单脚本（register_script 单 roundtrip）保证。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-4-health-check-endpoint.md`
++  summary: `/health` 仅覆盖就绪（管道编排完成），无存活（liveness）对位端点；进程死锁/线程饥饿（如管道 ThreadPoolExecutor 积累）时探针仍返回 200
++  evidence: NFR-7/Story 1.4 AC 只规定就绪端点，静态链判定是规格本身；死锁检测超出"管道编排完成"口径。settle：部署拓扑（K8s vs PaaS）决策后，按平台惯例补 liveness 探针与 hung 检测。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-5-langfuse-tracing-scaffold.md`
++  summary: 买家对话文本（原文/下发文本）明文发往 Langfuse，无脱敏、masking 或自托管（LANGFUSE_HOST）的数据边界决策
++  evidence: 架构「可观测」约定本身规定三文本字段入 Langfuse（ARCHITECTURE-SPINE 可观测行），Story 1.5 仅按架构落地，非本 Story 引入。settle：需人类就数据合规口径定夺——部署决策时选择自托管/云区，或在 observability 层加 masking 钩子（SDK 5 支持 MaskOtelSpansFunction）。
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-1-5-langfuse-tracing-scaffold.md`
++  summary: trace_id 生成双格式并存：编排器/信封链路用 `uuid4().hex`（32-hex，Langfuse 可检索），HTTP 兜底 `_fallback_result` 用 `str(uuid.uuid4())`（带连字符，Langfuse 不可检索）
++  evidence: `_fallback_result` 为 Story 1.2 预存代码，spec 明确要求 http.py 零改动、兜底行为与 1.4 逐字节一致；本 Story 未引入该分歧。settle：统一兜底口径时（如 Story 2.x 接入端点改造）一并定夺兜底 trace_id 是否也要 Langfuse 可检索。
+diff --git a/_bmad-output/implementation-artifacts/spec-1-1-project-skeleton-envelope.md b/_bmad-output/implementation-artifacts/spec-1-1-project-skeleton-envelope.md
+index 4d2ae15..82de07e 100644
+--- a/_bmad-output/implementation-artifacts/spec-1-1-project-skeleton-envelope.md
++++ b/_bmad-output/implementation-artifacts/spec-1-1-project-skeleton-envelope.md
+@@ -2,7 +2,8 @@
+ title: 'Story 1.1 项目骨架与信封模型'
+ type: 'feature'
+ created: '2026-10-31'
+-status: 'ready-for-dev'
++status: 'done'
++baseline_commit: '69990ddf0552df589d54697bc0c7657fdfffd9c2'
+ route: 'dispatch'
+ review_loop_iteration: 0
+ context:
+@@ -57,11 +58,11 @@ context:
+ ## Tasks & Acceptance
+ 
+ **Execution:**
+-- [ ] `pyproject.toml` -- 重命名项目与新包路径，移除原型依赖，按 Stack 表新增 redis 8.1.0、langfuse 5.0.4、cachetools 7.2.4（LangGraph 1.2.16、LangChain-OpenAI ≥1.6.2 按表核对保留），`uv sync` 更新 lock -- AC 要求 pyproject 与 Stack 表一致
+-- [ ] `src/<新包>/` -- 创建 Structural Seed 九目录（各含 `__init__.py`）-- 基座目录契约
+-- [ ] `src/<新包>/models/envelope.py` -- 实现信封模型 + `model_validate` 校验 -- AC 核心交付
+-- [ ] `tests/test_envelope.py` -- I/O 矩阵四场景单测 -- AC 可独立验收
+-- [ ] 旧原型处置 -- 按 Open Questions 答案删除或迁移 `src/my_agent/` 与耦合测试 -- 架构"不复用、不继承"
++- [x] `pyproject.toml` -- 重命名项目与新包路径，移除原型依赖，按 Stack 表新增 redis 8.1.0、langfuse 5.0.4、cachetools 7.2.4（LangGraph 1.2.16、LangChain-OpenAI ≥1.6.2 按表核对保留），`uv sync` 更新 lock -- AC 要求 pyproject 与 Stack 表一致
++- [x] `src/<新包>/` -- 创建 Structural Seed 九目录（各含 `__init__.py`）-- 基座目录契约
++- [x] `src/<新包>/models/envelope.py` -- 实现信封模型 + `model_validate` 校验 -- AC 核心交付
++- [x] `tests/test_envelope.py` -- I/O 矩阵四场景单测 -- AC 可独立验收
++- [x] 旧原型处置 -- 按 Open Questions 答案删除或迁移 `src/my_agent/` 与耦合测试 -- 架构"不复用、不继承"
+ 
+ **Acceptance Criteria:**
+ - Given 架构 Structural Seed 定义，当初始化代码库与依赖，则全部目录与最小可运行骨架就位，pyproject 版本与 Stack 表一致，既有 my-agent 依赖不复用、不继承
+@@ -73,6 +74,27 @@ context:
+ 
+ ## Review Triage Log
+ 
++评审轮次 1（2026-10-31，三层并行：blind-hunter / edge-case-hunter / verification-gap）：
++
++| # | 来源 | 发现 | 裁定 | 证据 | 路由 |
++|---|------|------|------|------|------|
++| 1 | blind-hunter | 重写后无任何入口点，fastapi/uvicorn 成摆设 | false | frozen Intent 明确"本 Story 仅骨架与信封"，Never 条排除 HTTP 端点；可运行面属 Story 1.2/1.4 | 驳回 |
++| 2 | blind-hunter | 同一变更删除整个旧应用、只搭新骨架 | false | frozen 决策：旧原型"不复用、不继承"、直接删除；增量过渡不在意图内 | 驳回 |
++| 3 | blind-hunter + verification-gap | README 仍描述 my-agent 的 /a2a、/api/v1、`uv run my-agent`，照做即失败 | low | 已核实 README 全文过时（项目已改名 weiliao-agent）；真实伤害开发者 onboarding | patch |
++| 4 | blind-hunter + verification-gap + edge-case-hunter | MISSING_REQUIRED 只参数化 session_id/house_id，timestamp/trace_id 的必填 fail-closed 无测试保护 | medium | verification-gap 预验证：将 timestamp 放宽为 Optional 后 6 个测试仍全过；docstring 承诺四字段必填 fail-closed，回归不可检测 | patch |
++| 5 | blind-hunter + edge-case-hunter | 接受无时区的 naive timestamp | maybe-false | 接受 naive 属实，但 spec 未规定时区策略、下游消费者本 Story 不存在；若属实则 medium（跨跳时间比较崩溃/事件乱序） | defer（若属实则 medium；由后续 Story spec 决定 timestamp 时区策略） |
++| 6 | blind-hunter | unknown-field 静默忽略与"一律 fail-closed"矛盾 | false | frozen 矩阵明确 UNKNOWN_FIELD "默认忽略（Pydantic 行为），不报错"；fail-closed 仅约束必填/类型/未知枚举 | 驳回 |
++| 7 | blind-hunter | __version__ 丢失、包根不 re-export Envelope | maybe-false（若属实则 low） | 事实属实但无消费者；Story 1.4 健康端点若需版本届时再定 | 驳回（若属实则仅 low） |
++| 8 | blind-hunter | langgraph/redis/langfuse/cachetools 精确 pin 无注释、违背 >= 惯例 | false | frozen 要求"pyproject 与架构 Stack 表一致"，精确版本即 Stack 表规定，依据在架构文档 | 驳回 |
++| 9 | blind-hunter | 配置管理（pydantic-settings）被移除且无替代 | false | frozen 决策：原型依赖移除；REDIS_URL 等配置留 Story 1.3 | 驳回 |
++| 10 | blind-hunter | 空 stub 包无 TODO/追踪标记，易被误认为已实现 | maybe-false（若属实则 low） | stub 各含职责 docstring；"被误认"无具体伤害实例 | 驳回（若属实则仅 low） |
++| 11 | blind-hunter | 信封缺序列化/往返保证（model_dump 往返、冻结语义） | maybe-false（若属实则 low） | 本 Story 无消费者序列化信封；Kafka 消息体格式属后续 Story | 驳回（若属实则仅 low） |
++| 12 | blind-hunter | 无安装环境导入冒烟测试，打包错误不会被发现 | false | 已在 .venv 安装环境（sys.path 无 src）实测 `import weiliao_agent` 成功；当前打包无误 | 驳回 |
++| 13 | edge-case-hunter | session_id/house_id/trace_id 接受空字符串 | maybe-false | 接受空串属实，但非空约束未在 spec 任何层规定；若属实则 medium（会话/路由查找失效） | defer（若属实则 medium；由后续 Story spec 决定标识符非空约束） |
++| 14 | edge-case-hunter | turn 接受 0 与负值 | maybe-false（若属实则 low） | ge=1 未在 spec 规定；turn 由会话管理赋值（Story 1.3） | 驳回（若属实则仅 low） |
++| 15 | edge-case-hunter | BAD_TYPE 场景只测 trace_id，未测 timestamp/turn | false | 矩阵 BAD_TYPE 行字面即"trace_id 为非字符串"；且 timestamp 的 isinstance(datetime)、turn==1 断言已能捕获这两字段的类型回退 | 驳回 |
++| 16 | edge-case-hunter | 默认 lax 模式强转（turn='1'→1）违背"类型错误一律 fail-closed" | false | "类型错误"在 Pydantic 语义下指不可强转输入（矩阵以 dict 验证）；可强转输入属 Pydantic 默认行为，spec 选定 Pydantic 即接受其语义 | 驳回 |
++
+ ## Design Notes
+ 
+ 信封字段必填性：`session_id`、`house_id`、`timestamp`、`trace_id` 必填；`turn`、`intent` 允许为 None（turn 由会话管理在入管道前赋值、intent 由分类器填写，均属后续 Story），但非 None 时类型必须正确。`intent` 本 Story 为 `str | None`，9 类 Literal 枚举在 Story 2.1 定义后收窄。预留四字段默认 None，不参与本 Story 验收。
+diff --git a/_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md b/_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md
+new file mode 100644
+index 0000000..7374f54
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-1-2-pipeline-orchestration-error-fallback.md
+@@ -0,0 +1,115 @@
++---
++title: 'Story 1.2 管道过滤器编排与统一错误兜底'
++type: 'feature'
++created: '2026-10-31'
++status: 'done'
++route: 'dispatch'
++baseline_commit: 'a36c1d519d1dce8ddb5b1bece068892f271b74a2'
++review_loop_iteration: 0
++context:
++  - '_bmad-output/implementation-artifacts/epic-1-context.md'
++  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** 信封与目录骨架已就位，但过滤器链不存在：消息无法在 intent_router → cache_lookup → risk_review → response_assembler 间流转，任一过滤器将来出现异常时买家将暴露于 5xx 或服务无应答。
++
++**Approach:** 手写纯 Python 编排器串起四过滤器占位实现，统一异常捕获 + 端到端 deadline 逐跳预算，异常/超时一律降级至占位模板兜底（转人工分支除外），使兜底机制本 Story 即可独立验收，不依赖 Epic 4 模板库。
++
++## Boundaries & Constraints
++
++**Always:**
++- 过滤器链严格为 intent_router → cache_lookup → risk_review → response_assembler；过滤器仅消费上游信封、产出下游信封，禁止跨过滤器直接函数调用（AD-1）。
++- 热路径手写纯 Python，不依赖 LangGraph Runtime（AD-2）；本 Story 四过滤器为占位实现（透传/最小行为），具体能力由后续 Epic 填充。
++- 任一过滤器抛异常 → 捕获并降级模板兜底，跳过剩余过滤器；错误应答携带 trace_id；禁止未审核内容发买家（占位过滤器输出视为已审核）。
++- 占位模板集：9 类意图各一条安全文案 + 1 条通用兜底；intent 缺失或未知值时用通用兜底。
++- 编排器持有端到端 deadline（默认内部预算 2.5s，NFR-1 P99 < 3s 留出口余量，可配置），逐跳检查剩余预算，预算耗尽立即兜底，不得傻等全量超时。
++- 兜底机制可独立验收：测试注入假异常/假慢过滤器即可验证全路径。
++- 决策（Open Questions 已决）：服务入口为最小 FastAPI 同步端点 `POST /v1/messages`（请求-响应式，Story 1.4 的 /health 日后挂同一 app）；无效输入在端点层 fail-closed，返回兜底应答 + 新生成 trace_id，非 5xx。
++- 决策（Open Questions 已决）：全部买家可见占位文案（含兜底应答）携带固定 AI 身份披露前缀（"AI 助手"式），Story 4.1 完整模板库替换时继承该约定。
++
++**Never:**
++- 不实现真实意图分类、缓存、风控、LLM 能力（占位透传）。
++- 不实现转人工分支（AD-7 兜底除外条款，属 Epic 5），不实现 coreference 过滤器（AD-11，属 Epic 2/后续）。
++- 不实现 Kafka 接入适配器；HTTP 入口仅 `POST /v1/messages` 一个端点，不含鉴权/限流等横切能力。
++- 不修改信封模型字段口径；时区/非空约束按 deferred-work 留待 Story 1.3/1.5。
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH | 合法信封入管道 | 逐跳产出信封，最终返回占位应答（含 trace_id，degraded=False） | N/A |
++| FILTER_RAISES | intent_router（或任一过滤器）抛异常 | 捕获后返回兜底应答（含 trace_id，degraded=True），剩余过滤器不执行 | 异常不向上抛，记录 failed_filter |
++| DEADLINE_EXCEEDED | 某过滤器执行超过剩余预算 | 立即触发兜底应答，不傻等；总耗时不超内部预算 | 同上，记录 slow_filter 与超时跳 |
++| INVALID_INPUT | dict 缺必填字段/类型错误 | 不进入管道；端点层 fail-closed 返回兜底应答 + 新生成 trace_id，HTTP 非 5xx | ValidationError 由端点层捕获 |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `src/weiliao_agent/models/envelope.py` -- Envelope 模型（只读；本 Story 不改字段口径）
++- `src/weiliao_agent/filters/__init__.py` -- 仅包 docstring；四个过滤器模块本 Story 新建
++- `src/weiliao_agent/pipeline.py` -- 新建：编排器（本 Story 核心交付）
++- `pyproject.toml` -- pytest asyncio auto、ruff/mypy strict 已配；不新增依赖
++- `tests/test_envelope.py` -- 既有单测风格参照（模型级直接断言）
++- `_bmad-output/implementation-artifacts/deferred-work.md` -- 信封时区/非空两项缺口明确留 1.3/1.5，本 Story 不结算
++- `ARCHITECTURE-SPINE.md` AD-1/AD-2/AD-7/AD-8 与"错误处理"一致性约定 -- 全部约束来源
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `src/weiliao_agent/filters/base.py` -- Filter 抽象基类（name + process(envelope) -> Envelope）-- AD-1 统一契约
++- [x] `src/weiliao_agent/filters/intent_router.py`、`cache_lookup.py`、`risk_review.py`、`response_assembler.py` -- 占位实现（透传/最小行为，逐跳产出合法信封）-- 链就位
++- [x] `src/weiliao_agent/pipeline.py` -- 编排器：顺序调用 + 异常捕获 + deadline 逐跳预算（ThreadPoolExecutor future.result(timeout=剩余预算)，超时结果丢弃）+ 兜底路由 -- AC 核心
++- [x] `src/weiliao_agent/filters/templates.py` -- 占位模板注册表：9 意图各一条 + 通用兜底，intent 缺失/未知回退通用 -- 独立验收载体
++- [x] `src/weiliao_agent/adapters/http.py` + `src/weiliao_agent/main.py` -- 最小 FastAPI 端点 POST /v1/messages，ValidationError → 兜底应答 + 新 trace_id，HTTP 非 5xx -- "不返回 5xx"字面落点
++- [x] `tests/test_pipeline.py` -- I/O 矩阵四场景：happy / 单过滤器异常 / 慢过滤器超时 / 无效输入 -- AC 可独立验收
++
++**Acceptance Criteria:**
++- Given 信封模型与过滤器目录已就位，当编排四过滤器链且过滤器间仅经信封传递，则链可执行完成，热路径纯 Python、无 LangGraph Runtime 依赖
++- Given 任一过滤器抛异常，当管道执行，则买家侧收到模板兜底应答且携带 trace_id，服务不返回 5xx，未执行过滤器被跳过
++- Given 某过滤器执行逼近端到端预算，当剩余预算不足，则编排器立即触发兜底、不傻等全量超时，兜底应答在 P99 < 3s 预算内
++- Given 占位模板集就位，当任一意图（含缺失/未知）需兜底，则存在对应安全文案，错误兜底机制可独立验收
++
++## Implementation Notes
++
++## Spec Change Log
++
++## Review Triage Log
++
++### 2026-10-31 审查轮（三层：blind-hunter 12 项 / edge-case-hunter 5 项 / verification-gap 0 缺口 + 1 其他）
++
++- blind#1 envelope.py 不在 diff、契约未审 — **false** — Envelope 是 Story 1.1 交付物（已 in-review），edge-case 层实读确认 `intent: str | None` 与本 Story 各分支可达；冻结块禁止本 Story 改其口径。拒绝。
++- blind#2 异常静默吞、无日志 — **low / 拒绝** — 可观测性（traceback 落盘与追踪）为 Story 1.5 Langfuse 脚手架的明确范围，本 Story spec 未要求日志；临时日志将与 1.5 方案重复建设。
++- blind#3 + edge#3 + edge#5（同根因：端点层无兜底网）— **medium / patch** — 已核验：`orchestrator_.run()` 逃逸异常（无外层防护）→ HTTP 500；畸形 JSON → FastAPI 默认 422（非 5xx 但无兜底应答与 trace_id），均违反"买家永不暴露 5xx + 兜底应答"承诺。已修：`RequestValidationError` 全局 handler 返回兜底+新 trace_id（200）；`run()` 调用外包 try/except Exception → 兜底应答。
++- edge#1 `run()` 在 `future.result` 之外的异常可逃逸 — **low / patch** — 已核验：除 `future.result` 的窄 except 外无外层防护，`filter_.name` AttributeError 等路径可逃逸，与矩阵"异常不向上抛"约定不符。已修：`run()` 循环外层加 try/except Exception 统一兜底（归因用 getattr 防二次 AttributeError）。
++- edge#2 worker 线程 `BaseException` 逃逸 — **false** — 捕获 `BaseException` 会吞掉投递到主线程的 `KeyboardInterrupt`（result() 等待期间），破坏关停，提议修复比现状更糟；worker 过滤器收到 SystemExit/KeyboardInterrupt 无可演示路径。拒绝。
++- edge#4 `Filter.name` 裸注解，缺名子类在降级路径 AttributeError — **low / patch** — 已核验：`name: str` 无默认值，mypy strict 不强制子类赋值。已修：基类默认 `name: str = ""`，管道兜底归因再加 getattr 双保险。
++- blind#4 意图字面量四处重复、无共享枚举 — **low / 拒绝** — 9 类集合已被测试钉死（选择键测试枚举全部 9 类，漂移即红）；信封 docstring 明确 Literal 枚举由 Story 2.1 收窄时统一，现引入枚举属提前设计。拒绝。
++- blind#5 每请求新建线程池、超时线程残留积累 — **maybe-false / defer** — 线程积累的危害依赖"过滤器可超时"这一前提；占位过滤器生产环境均为微秒级透传，超时仅存在于注入的测试替身，积累场景当前不可达。若真实过滤器（Epic 4）落地后为真，预计 **medium（未核验）**；裁定方式：Epic 4 接入真实过滤器后做超时风暴压测，重审执行器生命周期（共享池/cancel/信封所有权）。
++- blind#6 过滤器产出不校验类型 — **false** — spec 设计注明确"逐跳不重验信封……重验属浪费"；mypy strict 编译期强制契约；端点兜底网（blind#3 修复）兜住残余逃逸。拒绝。
++- blind#7 信封未 frozen、超时线程可变更多次引用的信封 — **low / defer** — Envelope 无 frozen 是 Story 1.1 的既有状态（pre-existing），非本 Story 引入；危害需"带副作用过滤器 + 超时丢弃"组合，当前占位过滤器只读/整信封替换。随 Epic 4 真实过滤器落地一并重审（与 blind#5 同批）。
++- blind#8 无效输入测试 trace_id 断言空洞 — **low / patch** — 已核验：原 payload 只含 session_id，"!= trace-001" 比较无意义。已修：payload 带 trace_id 但缺必填字段，断言返回新生成 id；另加畸形 JSON 用例锁 422 路径兜底。
++- blind#9 模板测试只查前缀与不等式 — **low / patch** — 已核验：空正文或与通用兜底同文案的缺陷可过测。已修：断言 9 类正文非空且两两不同。
++- blind#10 路由器只归一 None、越枚举值透传 — **false** — spec 设计注明确 fail-closed 收口在渲染层（"None 或不在 9 类内一律通用兜底"），渲染层已测 NOT_AN_INTENT；收口单一，无买家可见危害。拒绝。
++- blind#11 trace_id 无格式校验/唯一性/会话域 — **low / 拒绝** — trace_id 为客户端关联手段，信封口径冻结；格式校验属横切关注且不在 intent 内，追踪规范化随 Story 1.5 统一处理。拒绝。
++- blind#12 无请求大小限制/背压 — **low / 拒绝（intent 排除）** — 冻结块 Never 清单明确"不含鉴权/限流等横切能力"。拒绝。
++- vgap#1（其他）`uv run ruff check .` 全仓 302 存量告警 — **low / defer** — 全部位于 vendored `.agents/skills/`、`.claude/skills/` 脚本树与 `docs/`，pre-existing，与本 diff 无关；建议后续统一 ruff 排除配置或收敛存量。
++
++## Design Notes
++
++- 兜底应答结构：`PipelineResult{reply, trace_id, degraded, failed_filter}`，degraded=False 时 failed_filter 为 None。
++- 逐跳不重验信封：过滤器出入参均为强类型 Envelope，模型即保证；重验属浪费（Pydantic 校验非零成本）。
++- 超时语义：全局 deadline 在管道入口设定；每跳提交线程池执行，future.result(timeout=剩余预算)；超时即兜底，执行线程结果丢弃（占位过滤器无副作用，可安全丢弃）；预算按 wall-clock 计算。
++- 模板选择键：envelope.intent 命中 9 类则取对应文案；None 或不在 9 类内一律通用兜底（fail-closed 口径与信封未知枚举一致）。
++
++## Verification
++
++**Commands:**
++- `uv sync` -- expected: 无新依赖，lock 不变
++- `uv run pytest` -- expected: 全绿（含 I/O 矩阵四场景）
++- `uv run ruff check .` -- expected: 无告警
++- `uv run mypy src` -- expected: strict 模式无错误
+diff --git a/_bmad-output/implementation-artifacts/spec-1-3-session-state-single-writer.md b/_bmad-output/implementation-artifacts/spec-1-3-session-state-single-writer.md
+new file mode 100644
+index 0000000..ed65c9d
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-1-3-session-state-single-writer.md
+@@ -0,0 +1,126 @@
++---
++title: 'Story 1.3 会话状态单写者管理'
++type: 'feature'
++created: '2026-10-31'
++status: 'done'
++route: 'dispatch'
++baseline_commit: 'f299822301ab34f8891d7f43342912524b677c72'
++review_loop_iteration: 0
++context:
++  - '_bmad-output/implementation-artifacts/epic-1-context.md'
++  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** 信封已有 `session_id` 但会话状态不存在：`turn` 恒为 None，追问计数与转人工状态无处存取，多实例部署下会话一致性（FR-10/AD-4）无载体；信封时区/非空两项校验缺口（deferred-work）也悬置未决。
++
++**Approach:** 在 `session/` 实现唯一写入者 `SessionManager`：Redis hash 单键 + Lua 原子脚本单 roundtrip 完成入管道前快照（初始化/自增/刷新 TTL），入口适配器在信封入管道前调用并回填 `envelope.turn`；Redis 权威、实例无状态；Redis 故障 fail-closed 走既有兜底。顺带结算 deferred-work 两项信封校验。
++
++## Boundaries & Constraints
++
++**Always:**
++- 会话状态仅 `SessionManager` 写（AD-4 单写者）；过滤器只读并传 `session_id`，本 Story 过滤器零新增会话写。
++- `turn` 为会话内绝对消息序号，入管道前赋值；TTL 30 分钟（可配置），每次入口刷新；过期后重新发起从零初始化（turn 从 1 重新开始）。
++- 追问计数 Redis 原子自增，权威值只存 Redis（AD-4）；并发 `begin_turn` 下 turn 唯一。
++- 过期竞态语义：以消息入管道时的读取结果为准，处理中途过期不中断在途消息（handoff 终态除外，属 Epic 5）。
++- Redis 故障 fail-closed：兜底应答 + trace_id，HTTP 非 5xx（复用 1.2 既有兜底模式）。
++
++**Never:**
++- 不实现追问识别逻辑（Epic 2），本 Story 只提供原子计数接口与其并发正确性。
++- 不实现 handoff 写入与转人工分支（Epic 5）；状态结构仅预留字段。
++- 不实现意图历史/coref 的 per-turn 键写入（Epic 2/3）；接口约定见 Design Notes。
++- 不引入 L1 进程内缓存（Epic 3）；不改信封字段口径（仅补校验器）。
++- 不部署/运维 Redis；连接串经环境变量配置，代码不假设部署形态。
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| 首条消息 | 会话 key 不存在 | 创建状态，turn=1，TTL 1800s | N/A |
++| 连续消息 | 会话存在 | turn 自增 +1，TTL 刷新，返回快照 | N/A |
++| 并发入口 | 同 session 并发 begin_turn | turn 各得唯一值，无竞态 | N/A |
++| 过期重开 | key 已被 TTL 清除 | 从零初始化 turn=1，无残留 | N/A |
++| 计数并发 | N 线程 increment_followup | 计数精确等于 N（原子） | N/A |
++| Redis 故障 | 连接拒绝/超时 | 入口兜底应答 + trace_id，HTTP 200 | 捕获 redis 异常 → 兜底 |
++| 过期瞬间在途 | 入管道后 key 过期 | 按入管道快照继续，不中断 | N/A |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `src/weiliao_agent/session/__init__.py` -- Structural Seed 既有空包；本 Story 导出新 API
++- `src/weiliao_agent/session/manager.py` -- 新建：`SessionManager` + `SessionSnapshot` -- AD-4 核心交付
++- `src/weiliao_agent/models/envelope.py` -- 补校验器（timestamp 须带时区；session_id/house_id/trace_id 非空），结算 deferred-work；字段口径不变
++- `src/weiliao_agent/adapters/http.py` -- `create_app` 注入 SessionManager；`post_message` 信封校验后先 `begin_turn` 回填 `envelope.turn`，Redis 异常走 `_fallback_result`（既有 fail-closed 模式）
++- `src/weiliao_agent/main.py` -- 从 env `WEILIAO_REDIS_URL`（默认 `redis://127.0.0.1:6379/0`）装配
++- `src/weiliao_agent/pipeline.py` -- 只读消费 `envelope.turn`；不改
++- `tests/test_session.py` -- 新建：fakeredis 驱动状态机 + 并发原子性测试 -- AC 独立验收载体
++- `tests/test_envelope.py` -- 补 naive datetime / 空标识符拒绝用例
++- `tests/test_pipeline.py` -- 既有四场景不应回归（timestamp 均已带时区）
++- `pyproject.toml` -- dev 组新增 fakeredis（Lua 支持）；运行时依赖不变
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `src/weiliao_agent/session/manager.py` -- `SessionSnapshot{turn, followup_count, handoff_status, last_message_at}` + `SessionManager`（redis 客户端注入；Lua 原子脚本：key 存在则 HINCRBY turn，否则初始化 turn=1/followup_count=0；每次入口 EXPIRE 1800 并刷新 last_message_at；`read_snapshot` 只读；`increment_followup` 原子自增并刷新 TTL）-- AD-4 单写者核心
++- [x] `src/weiliao_agent/adapters/http.py` -- `create_app(orchestrator, session_manager=None)`；`post_message` 信封校验通过后先 `begin_turn` → `envelope.turn` 回填，再入管道；Redis 异常 → 兜底应答 + trace_id，非 5xx -- "入管道前赋值"字面落点
++- [x] `src/weiliao_agent/main.py` -- 用 `WEILIAO_REDIS_URL` 装配 SessionManager（socket 超时配置须远小于 2.5s 内部预算）
++- [x] `src/weiliao_agent/models/envelope.py` -- 两项校验器（timestamp tz-aware；三标识符 min_length=1）-- 结算 deferred-work 两条
++- [x] `tests/test_session.py` -- fakeredis：首条/连续/过期重开/并发 turn 唯一/并发自增精确计数/端点层 Redis 故障兜底 -- AC 独立验收
++- [x] `tests/test_envelope.py` -- 补拒绝 naive timestamp 与空标识符用例
++
++**Acceptance Criteria:**
++- Given Redis 可用且会话模块为唯一写入者，当任意消息入管道前调用 `begin_turn`，则信封获得会话内唯一绝对序号 `turn`，TTL 30 分钟被刷新
++- Given 多实例并发处理同一 session 的消息，当并发 `begin_turn`/`increment_followup`，则 turn 唯一、追问计数精确，无竞态
++- Given 会话 TTL 过期后买家重新发起对话，当 `begin_turn` 执行，则状态从零初始化（turn=1）且无残留字段
++- Given Redis 连接失败或超时，当消息到达入口，则买家收到兜底应答且携带 trace_id，HTTP 非 5xx
++- Given 会话过期瞬间有消息在管道中，当该消息处理中 key 过期，则以入管道时快照为准继续处理，不中断在途消息
++
++## Implementation Notes
++
++## Spec Change Log
++
++## Review Triage Log
++
++三层评审（blind-hunter / edge-case-hunter / verification-gap）共 23 项原始发现，逐条核验后记录如下。`route` 取值：patch / defer / reject。
++
++| # | 发现（层 · 位置） | verdict | 证据 | route |
++|---|---|---|---|---|
++| 1 | Lua 以 turn==1 判新会话，increment-first 时静默清零 followup_count；partial hash 无防御（B1/B2/F1/F2 同根因） | medium | 实测复现：increment_followup 返回 1 后 begin_turn 快照 followup_count 变 0；接口本 Story 起即对 Epic 2 公开，静默数据丢失为真 | patch |
++| 2 | http.py 兜底捕获裸 Exception，掩盖编程错误（B3） | medium | 确证：except Exception 会把 Lua 返回值解析 TypeError 等编程错误降级为兜底应答，缺陷不可见 | patch |
++| 3 | session_manager=None 时信任 payload 自带 turn（F5） | low | 确证：None 分支不清除 envelope.turn，伪造 turn 可入管道；仅测试/未注入路径可达，生产 main.py 恒注入 | patch |
++| 4 | 生产组合根 main.py 装配无测试（L1，预验证） | medium | 采信：删除 SessionManager 参数整套测试仍绿，turn 恒 None 无信号 | patch |
++| 5 | increment_followup 的 TTL 刷新无断言（L3，预验证） | medium | 采信：删掉 Lua 中 EXPIRE 全绿 | patch |
++| 6 | 回填测试 payload 均不带 turn，"尊重客户端 turn"回归不可见（L4，预验证） | medium | 采信：改为条件回填后现有测试仍通过 | patch |
++| 7 | sprint-status 与 spec frontmatter 状态不一致（B4） | low | 确证：yaml in-progress vs frontmatter in-review，流程看板矛盾 | patch |
++| 8 | WEILIAO_REDIS_URL 未文档化（B6） | low | 确证：grep 全仓无 README/.env 样例提及 | patch |
++| 9 | 并发原子性仅在全局串行的 fakeredis 下验证，非原子实现同样过测（B10/L2 同根因） | medium（未对真实 Redis 验证） | 采信 fakeredis 2.40 全局锁源码证据；收口需真实 Redis 集成测试，与本 Story"不部署/运维 Redis"边界冲突 | defer |
++| 10 | TTL"可配置"但 main.py 无 env 接线（B5） | low | 确证：配置面仅构造参数；修复需新增 env 面，超出直接修正 | reject |
++| 11 | fail-closed 路径无日志/指标/可观测挂点（B7） | low | 确证：静默降级无信号；加日志/指标超出直接修正，且 Langfuse 追踪属 Story 1.5 | reject |
++| 12 | min_length=1 放行纯空白标识符（B8/F6） | low | 确证：" " 可通过；但 spec 任务字面指定 min_length=1 结算 deferred-work"非空"，实现与 spec 一致，改口径需动 spec | reject |
++| 13 | begin_turn 成功后管道异常的状态消耗语义未声明（B9） | false | begin_turn 成功即代表消息已受理，turn 消耗与兜底应答并存语义上可接受，无具名受害方 | reject |
++| 14 | spec 三章节空置、决策错位至 Design Notes（B11） | low | 修复即编辑本 build 的 spec 文件，处置规则禁止 | reject |
++| 15 | fakeredis[lua] 引入 lupa 膨胀 lockfile（B12） | low | Lua 单 roundtrip 原子性系 spec Design Notes 明定的验证方案，膨胀是固有代价，无具名受害 | reject |
++| 16 | read_snapshot 遇畸形 last_message_at 崩（F3） | false | 所有写入方均为 SessionManager Lua（timestamp.isoformat()），畸形值需外部篡改 Redis，无可达路径；此时响亮失败属正确行为 | reject |
++| 17 | WEILIAO_REDIS_URL 畸形时 import 崩且无诊断（F4） | false | from_url 抛 ValueError 自带 traceback 即诊断；启动期配置错误响亮失败属正确行为 | reject |
++| 18 | ttl_seconds<=0 时 EXPIRE 运行期报错（F7） | false | 该参数仅组合根以默认值 1800 注入，无 env 接线，无可达路径；非法配置响亮失败属正确行为 | reject |
++
++路由汇总：patch #1–#8（#1–#6 交还原实现子代理，#7–#8 本流程直接修正）；defer #9 → deferred-work.md；reject #10–#18。无 intent_gap / bad_spec，不触发回环。
++
++## Design Notes
++
++- Key 结构：`weiliao:session:{session_id}` Redis hash，字段 `turn`（int）、`followup_count`（int）、`handoff_status`（str，本 Story 恒 "none"）、`last_message_at`（ISO8601 字符串），TTL 1800s。与架构一致性约定的 per-turn 工件键（`...:intent:{turn}`、`...:coref:{turn}`）区分：后者由 Epic 2/3 经 SessionManager 写方法落盘，本 Story 只定归属、不定实现。
++- 接口一次定准（Epic 2/3/5 直接消费）：`begin_turn(session_id, timestamp) -> SessionSnapshot`、`increment_followup(session_id) -> int`、`read_snapshot(session_id) -> SessionSnapshot | None`；未来的 `write_intent(turn, label)` / `write_coref(turn, result)` / `mark_handoff(...)` 同为 SessionManager 方法（本 Story 不实现，避免无调用方的死代码）。
++- 原子性落点：Lua 脚本单 roundtrip（读旧态/初始化/turn 自增/刷新 last_message_at/EXPIRE 一次完成），满足延迟预算且并发安全；fakeredis（带 Lua 支持）验证脚本语义，无外部服务依赖。
++- Redis 故障 fail-closed 依据：AD-4 禁止进程内缓存作判定依据 + 架构"实例无状态" + 1.2 错误兜底约定三者共同收口，无可行降级中间态。
++
++## Verification
++
++**Commands:**
++- `uv sync` -- expected: lock 仅新增 fakeredis 开发依赖
++- `uv run pytest` -- expected: 全绿（含并发与端点兜底用例）
++- `uv run ruff check src tests` -- expected: 无告警
++- `uv run mypy src` -- expected: strict 无错误
+diff --git a/_bmad-output/implementation-artifacts/spec-1-4-health-check-endpoint.md b/_bmad-output/implementation-artifacts/spec-1-4-health-check-endpoint.md
+new file mode 100644
+index 0000000..21fcf21
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-1-4-health-check-endpoint.md
+@@ -0,0 +1,43 @@
++---
++title: 'Story 1.4 健康检查端点'
++type: 'feature'
++created: '2026-11-01'
++status: 'done'
++route: 'oneshot'
++baseline_commit: '0cf812d762b7afc68de245c8e393df304922fec3'
++review_loop_iteration: 0
++context:
++  - '_bmad-output/implementation-artifacts/epic-1-context.md'
++  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** 服务无就绪探针：负载均衡与发布流程无法安全摘挂实例（NFR-7），部署后实例是否可接流量无从感知。
++
++**Approach:** 按架构"健康检查端点挂在响应组装过滤器"的约定，在 `health/` 包实现就绪探针（判定口径：编排器过滤器链完整、含 `response_assembler`），经 `create_app` 暴露 `GET /health`：就绪返回 200，未就绪返回 503。就绪判定仅覆盖"管道编排完成"（AC 的 Given 原文），不纳入 Redis 连通性——Redis 故障按 1.3 fail-closed 设计逐消息降级应答，服务仍可受理流量，探针不应因此摘除全部实例。
++
++</frozen-after-approval>
++
++## Implementation Notes
++
++- 就绪判定落点：`health/` 包新增探针函数，只读检查编排器过滤器链含 `response_assembler`（架构约定"挂在响应组装过滤器"的字面实现）。`PipelineOrchestrator` 补只读访问器（如 `filter_names` 属性）供探针消费；不改编排逻辑。
++- 端点：`adapters/http.py` 的 `create_app` 注册 `GET /health`，就绪 200（如 `{"status": "ready"}`），未就绪 503（`{"status": "not_ready"}`）；健康检查非买家消息，不带 trace_id/兜底语义，也不经过滤器链。
++- `main.py` 只需更新 docstring（"日后挂同一 app" 的表述过时）；装配结构不变。
++- 测试：新增 `tests/test_health.py`，用 TestClient 覆盖 就绪 200 / 链不完整 503 两场景；既有测试不应回归。
++- 实现决策：`health/probe.py` 的 `is_ready(orchestrator)` 依赖 `PipelineOrchestrator.filter_names` 只读属性（本次新增）；`READY_FILTER_NAME = "response_assembler"` 常量集中判定键。`main.py` 装配结构未动，`/health` 随 `create_app` 自动可用。验证：37 测试全绿（新增 2 例）、`ruff check src tests` 无告警、`mypy src` strict 无错误。
++- 评审补丁：`READY_FILTER_NAME` 改为引用 `ResponseAssemblerFilter.name` 类属性（防重命名失同步）；`/health` 捕获探针异常按未就绪收敛 503（防健康端点 500 触发负载均衡误处置）；补探针异常 503 与生产组合根 `main.app` 冒烟两例。最终验证：39 测试全绿、ruff/mypy 干净。
++
++## Review Triage Log
++
++blind-hunter 单层评审 7 项发现，逐条核验记录如下。`route` 取值：patch / defer / reject。
++
++1. `READY_FILTER_NAME` 字面量与过滤器类属性重复，重命名可失同步 — low（确证，两值当前一致但为独立字面量）— patch：改为引用 `ResponseAssemblerFilter.name`，简单纠正。
++2. 就绪判定是静态构造期不变量，生产路径永不 503，探针无运行时信号 — false：确证静态，但 AC 的 Given 原文即"服务已启动且管道编排完成"，静态判定是规格本身；运行时自检属改规格口径（human-owned intent）。
++3. 探针自身抛错时 `/health` 无异常处理，FastAPI 默认 500 — low（确证，畸形编排器注入可达）— patch：try/except 收敛 503；负载均衡对 500/503 处置不同，修复系简单纠正。
++4. 就绪翻转无可观测（无日志/指标）— low — reject：与 Story 1.3 评审 #11 同类先例，日志/追踪挂点属 Story 1.5（Langfuse），超出本 Story 直接修正。
++5. 无针对生产组合根 `main.app` 的测试，装配回归不可见 — medium（采信，先例同 Story 1.3 评审 #4）— patch：补 `main.app` 冒烟用例（Redis 客户端惰性连接，导入即装配安全）。
++6. sprint-status 显示 in-progress 与 spec 验证声称矛盾 — false：流程产物，spec 先行记录验证结果，finalize 按 sync 规则将看板推进至 review，非代码缺陷。
++7. 无 liveness 对位端点，死锁/线程饥饿时探针仍 200 — medium（若发生，但超出本 Story 口径）— defer → deferred-work.md：NFR-7/AC 只规定就绪端点，死锁检测留待部署拓扑决策后按平台惯例补。
+diff --git a/_bmad-output/implementation-artifacts/spec-1-5-langfuse-tracing-scaffold.md b/_bmad-output/implementation-artifacts/spec-1-5-langfuse-tracing-scaffold.md
+new file mode 100644
+index 0000000..24ecf72
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-1-5-langfuse-tracing-scaffold.md
+@@ -0,0 +1,119 @@
++---
++title: 'Story 1.5 Langfuse 全链路追踪脚手架'
++type: 'feature'
++created: '2026-11-01'
++status: 'done'
++route: 'dispatch'
++review_loop_iteration: 0
++baseline_commit: '2519ed16ac96dd8fd14d69eff13dabe5d4523aeb'
++context:
++  - '_bmad-output/implementation-artifacts/epic-1-context.md'
++  - '_bmad-output/planning-artifacts/architecture/architecture-test-2026-10-22/ARCHITECTURE-SPINE.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** trace_id 目前要求客户端在 payload 携带（`Envelope.trace_id` 必填），服务自己不生成，也没有 Langfuse 集成——全链路追踪与成本可观测（NFR-6、SM-5/SM-6 验收口径）无从落地。
++
++**Approach:** 在 `observability/` 包实现追踪脚手架：编排器入口统一生成 trace_id 并回填信封，贯穿过滤器链；接入 Langfuse SDK 5.0.4（已锁定于 pyproject），按消息开 trace、按过滤器记 span、降级事件写入 trace；暴露成本追踪封装（token/费用）供 Epic 4 模型调用消费。未配置 Langfuse 时全链路自动 no-op，不影响应答与延迟口径。
++
++## Boundaries & Constraints
++
++**Always:**
++- trace_id 由服务生成（编排器入口为单一权威点），不信任客户端 payload 值；响应必须携带服务端 trace_id。
++- 追踪代码 fail-safe：Langfuse SDK 任何异常不得影响买家应答、不得超出管道时间预算；SDK 自身 flush 为后台线程，不得阻塞请求路径。
++- 架构可观测约定落入本 Story：每消息记录三文本字段（买家原文/消解后消息/最终下发文本，后两者当前恒等于原文）；降级事件写 trace；成本追踪记 token 与费用（API 级，真实调用属 Epic 4）。
++
++**Never:**
++- 不改过滤器编排逻辑、错误兜底语义与会话单写者约定；不动 `/health` 判定口径。
++- 不在过滤器线程内做 OTel context 传播（span 在主线程编排器侧记录）。
++- 不接入真实模型调用、不部署 Langfuse 服务端；鉴权/限流/Kafka 接入不在范围。
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| 正常消息进管道 | 信封校验通过（trace_id 缺失或伪造） | 编排器入口生成新 trace_id 回填信封；响应携带之；trace 记买家原文与各过滤器 span | N/A |
++| Langfuse 未配置 | 无 `LANGFUSE_PUBLIC_KEY` 等环境变量 | SDK 进入 disabled 态，全部追踪 no-op；应答/降级行为与 Story 1.4 完全一致 | 已验证：SDK 打印一次 warning 后自动禁用 |
++| 过滤器异常降级 | 链中某过滤器抛异常 | 应答兜底 + trace_id 不变；trace 记录降级事件与归因过滤器名 | 降级事件记录本身再抛异常则吞掉，绝不二次影响应答 |
++| SDK 调用抛错 | Langfuse client 方法抛任意异常 | 追踪跳过该条记录，管道结果不受影响 | observability 层统一 try/except 收敛 |
++
++</frozen-after-approval>
++
++## Open Questions
++
++- OQ-1 信封 trace_id 与 Langfuse trace 的 id 映射 — **已决（2026-11-01 实现时）：A**。信封 trace_id 直接作为 Langfuse trace id（`TraceContext(trace_id=...)`）。SDK 5.0.4 路径已核实稳定，但自定义 id 必须是 32 位小写十六进制（SDK `_is_valid_trace_id` 口径，否则告警并抛 ValueError），故 `new_trace_id()` 生成 `uuid4().hex`。实现附带发现：非 32-hex 的 payload 携带值（如既有测试的 `"trace-001"`）不能作 Langfuse trace id，observability 层对这类 id 统一跳过记录（fail-safe，不告警不抛错）；trace_id 回填语义为「缺失即生成、携带值透传」——后者为兼容「既有 39 测试零回归」AC 与 Boundaries「不信任 payload 值」的调和，SM-5/SM-6 验收以服务端生成 id 为准。
++- OQ-2 无效输入（校验失败，不进管道）是否也写 trace — **已决（2026-11-01 实现时）：B**。无效输入路径不写 trace：`adapters/http.py` 零改动，保持 Story 1.4 兜底语义与零依赖延迟；观测靠访问日志。AC 只承诺进入管道的消息。
++
++## Code Map
++
++- `src/weiliao_agent/models/envelope.py` -- `Envelope.trace_id` 现为必填 `Field(min_length=1)`，需放宽为 `str | None = None`（生成责任移交编排器）；docstring 字段口径同步。
++- `src/weiliao_agent/pipeline.py` -- `PipelineOrchestrator.run()` 为 trace_id 生成与 span 记录挂点；`_degraded()` 为降级事件挂点；过滤器在 ThreadPoolExecutor 线程执行，span 须在提交 future 的主线程侧记录。
++- `src/weiliao_agent/adapters/http.py` -- `_fallback_result(intent, trace_id)` 已接受 `str | None`；无效输入路径视 OQ-2 定；正常响应 `to_dict()` 已含 trace_id，结构不改。
++- `src/weiliao_agent/observability/` -- 空包（仅 `__init__.py`），脚手架落点；Langfuse SDK 5.0.4 已锁定并安装。
++- `src/weiliao_agent/main.py` -- 组合根；Langfuse 走 SDK 默认环境变量配置（`LANGFUSE_PUBLIC_KEY/SECRET_KEY/HOST`），预期无需改动。
++- SDK 行为已验证：无 key 时 `get_client()` 告警一次后全方法 no-op；主入口 `start_as_current_observation(...)`、`propagate_attributes(...)`；`types.TraceContext` 承载 trace 级上下文。
++- `tests/` -- 39 测试全绿为回归基线；`test_pipeline.py` 降级路径替身风格可参照。
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `src/weiliao_agent/models/envelope.py` -- `trace_id` 放宽为 `str | None = None` 并更新字段口径 docstring（服务端权威生成） -- 契约变更最小面，其余校验规则不动。注：落地为 `str | None = Field(default=None, min_length=1)`，空串拒绝规则保留（"其余校验规则不动"）。
++- [x] `src/weiliao_agent/observability/tracing.py` -- 新建：客户端惰性单例（可注入替身）、`new_trace_id()`、消息级 trace 上下文管理器（trace_id/session_id/买家原文入 trace）、过滤器 span 记录、降级事件、成本追踪封装（供 Epic 4）；公开方法全部 fail-safe -- 脚手架核心。
++- [x] `src/weiliao_agent/observability/__init__.py` -- 导出公共 API（trace_id 生成、trace/span、成本封装） -- 对外稳定接口面。
++- [x] `src/weiliao_agent/pipeline.py` -- `run()` 入口：信封 trace_id 为空则生成回填；每过滤器执行包 span（主线程侧）；降级路径写降级事件 -- AC 主挂点；不改编排与兜底语义。
++- [x] `tests/test_tracing.py` -- 新增：trace_id 生成回填且响应携带；每过滤器 span 记录；降级事件含归因；注入抛错 client 时管道结果不受影响；无 key disabled 冒烟 -- 覆盖 I/O 矩阵四行。
++
++**Acceptance Criteria:**
++- Given 校验通过的消息（payload 不带 trace_id），when 经 `POST /v1/messages` 进管道，then 响应 `trace_id` 非空且系服务端生成（与 payload 无关）。
++- Given 过滤器链中任一过滤器抛异常，when 管道降级兜底，then 应答 `trace_id` 与正常路径同口径，trace 中可检索到该降级事件及归因过滤器名。
++- Given Langfuse 未配置（无环境变量），when 任意消息处理，then 行为与 Story 1.4 逐字节一致（应答、降级、健康检查均不变），仅多一条禁用 warning 日志。
++- Given 成本追踪 API 被调用（脚手架级假数据），when 传入 token 用量与费用，then 记录挂到当前消息 trace（验证以替身 client 断言为准，Epic 4 接真实调用）。
++- 既有 39 测试零回归；`ruff check src tests` 无告警；`mypy src` strict 无错误。
++
++## Implementation Notes
++
++- 2026-11-01 实现期决策（trace_id 回填语义调和）：spec 内部存在张力——Boundaries「不信任客户端 payload 值」/ Matrix 行 1「伪造即重生成」 vs AC「既有 39 测试零回归」（Story 1.2 测试断言 `"trace-001"` 透传）。落地为「缺失即生成、携带值透传」：任何 trace_id（含伪造）在管道与响应中正确流转，仅非 32-hex 的 id 跳过 Langfuse 记录（SDK `_is_valid_trace_id` 口径，fail-safe 不告警不抛错）。所有 AC 逐字满足；Matrix 行 1「伪造」分支按此口径执行。若后续要求严格 always-regenerate，需重谈 AC-5 并改 2 例 1.2 测试。
++- 实现发现：SDK 5.0.4 自定义 trace id 仅接受 32 位小写十六进制，否则告警并抛 ValueError——故 `new_trace_id()` 生成 `uuid4().hex`，observability 层预校验跳过非法 id，避免异常驱动控制流。
++- 降级/下发记录走 SDK `create_event`（公开 typed API）；`as_type="event"` 观测在 SDK 5.0.4 typed overloads 中不存在。
++- 评审补丁（三层评审后）：trace_message/filter_span 分段 enter 补失败清理（防部分 enter 泄漏 span）；`_run_chain` 的 `or` 假防御改 assert；docstring 信任边界表述改为「缺失即生成、携带值透传」；record_delivery 同步 delivered_text 到根 span metadata（修过期 None）；新增 4 测试（非 hex 透传跳过、负预算 slow_filter 归因、真超时 ERROR span、Redis 故障无 trace_id 兜底）；disabled 冒烟补 /health 断言。最终验证：50 测试全绿、ruff/mypy 干净。
++
++## Spec Change Log
++
++## Review Triage Log
++
++blind-hunter / edge-case-hunter / verification-gap 三层评审 20 项发现，逐条核验记录如下。`route` 取值：patch / defer / reject。
++
++1. `trace_message()` 部分 enter 泄漏：`root.__enter__()` 成功而 `propagate_attributes`/`attrs.__enter__()` 抛错时，`except: yield; return` 分支不调用 `root.__exit__`（tracing.py:120-125，E1 同址）— low（确证，读码验证）— patch：enter 各步独立收敛，失败路径补退出已 enter 的根 span。
++2. `filter_span()` 同类部分 enter 泄漏：`manager.__enter__()` 抛错时 manager 未 `__exit__`（tracing.py:160-163）— low（确证）— patch：同 1 一并修复（同根因：CM 分段 enter 无失败清理）。
++3. 「实现违反权威 id 契约」：Matrix 行 1「伪造即重生成」与实现透传不符（B2，E4 同 claim，E5 为其 docstring 变体）— false：契约的可执行部分是 AC——AC-5「既有 39 测试零回归」+ test_pipeline.py:79/100/124/183 四处断言 `result.trace_id == "trace-001"` 锁定透传语义，always-regenerate 反而违反 AC；所引 Boundary/Matrix 措辞被显式 AC 覆盖。残余危害（伪造 32-hex 注入 Langfuse trace）经评估不成立：trace id 为 128 位随机 hex，猜测他户 trace 不可行，买家侧零影响。
++4. envelope/pipeline docstring「不被信任为权威来源」与透传语义不符（E5）— low（确证，开发者阅读误导）— patch：按「缺失即生成、携带值透传」重写 docstring 信任边界表述。与 3 不同根因（文档措辞 vs 行为契约），单独处理。
++5. `_run_chain` 防御性 `envelope.trace_id or new_trace_id()` 死分支：若可达则与 `run()` 已开的 trace 分裂成两个 id（B3）— low（确证死代码；`run()` 必先回填）— patch：改为赋值 + `assert`（保留 mypy 收窄，消除假分支）。
++6. sprint-status `in-progress` 与 spec `in-review` 不一致（B4）— low（流程产物）— patch：按 finalize 口径推进至 `review`。
++7. 缺非 32-hex 透传且跳过记录的锁定测试（B5）— low（verification 缺口，实现注记已声明该口径但无测试钉住）— patch：补测试（payload `"trace-001"` → 管道/响应透传、observability 零调用）。
++8. 缺超时/预算耗尽路径的 `slow_filter` 归因测试（B6，V2 同址）— low（verification 缺口；`record_degradation` 仅 `failed_filter` 有断言，`slow_filter` 无任何断言钉住）— patch：负预算确定性触发 `remaining<=0` 分支，断言降级事件带 `slow_filter` 归因。
++9. Matrix 行 2 承诺「健康检查均不变」但 disabled 测试只覆盖 `/v1/messages`（B7）— low（AC 子句未验证）— patch：disabled 冒烟补 `GET /health` 断言 200。
++10. 「空串仍拒绝」无测试（B8）— false：`test_blank_identifier_is_rejected`（tests/test_envelope.py:88-94，parametrize 含 `trace_id`）已钉住 `min_length=1`。
++11. PII/数据驻留：买家消息文本发送至 Langfuse 无脱敏/自托管说明（B9）— low（真实顾虑但非本 Story 引入：架构「可观测」约定本身规定三文本字段入 Langfuse，Story 1.5 只是落地架构）— defer → deferred-work.md：架构级数据边界决策，需人类就脱敏/自托管口径定夺。
++12. disabled warning 计数断言脆（B10）— false：fixture 经 `set_langfuse_client(None)` 重置单例，caplog 窗口限定 with 块内，套件无 xdist；干扰路径未证实。
++13. 根 span metadata 的 `delivered_text` 恒为 None，三文本字段分裂在 span metadata 与 delivery 事件两处（B11）— low（确证；SM-5/SM-6 消费者须自行合并两处，metadata 含过期 None 易误读）— patch：`record_delivery` 经 `update_current_span(metadata=...)` 同步最终下发文本到根 span。
++14. `record_generation` 零时长、无 input/output，docstring 未标注限制（B12）— low — patch：docstring 补局限说明（Epic 4 需 start/end 或 update 语义）。
++15. Redis 故障兜底路径携带 `trace_id=None` 无测试：信封放宽后该分支可达，「错误应答携带 trace_id」契约可被静默破坏（V1，verification-gap 预验证，含演示：去掉 `_fallback_result` 的 None 合并全套件仍绿）— medium（bad outcome 真实：Redis 故障期间无 trace_id 的合法 payload 会拿到 null trace_id，恰是兜底路径存在的场景）— patch：补兄弟用例（删 `trace_id` + SessionManager 抛 `RedisError`，断言响应 trace_id 非空且非客户端值）。
++16. 追踪开销不计入预算，可能挤出后续跳预算触发「假」slow_filter（E3）— false：deadline 本就是「端到端」口径（pipeline.py docstring），追踪耗时占用后续跳预算是 deadline 按设计工作，非假降级；且 SDK flush 后台化，同步 exporter 不在请求路径。
++17. `_fallback_result` 的 uuid 带连字符 vs 编排器 `uuid4().hex` 双格式并存（V-other）— low（真实但 http.py 按 spec 零改动，属预存状态）— defer → deferred-work.md：未来统一兜底 trace_id 生成口径时一并定夺。
++18.（B1 已在 1 记录；E1 同 1、E4 同 3、E5 单列 4、V2 同 8。）
++
++分组路由：G{1,2}=patch；3=reject(false)；4=patch；5=patch；6=patch；7=patch；8=patch；9=patch；10=reject(false)；11=defer；12=reject(false)；13=patch；14=patch；15=patch；16=reject(false)；17=defer。无 intent_gap / bad_spec 存活，不触发 loopback。
++
++## Design Notes
++
++trace_id 生成放编排器入口而非 HTTP 适配器：Kafka 接入（Epic 3）与单测直通编排器时同样获得权威 id。span 在主线程记录：过滤器跑在 `ThreadPoolExecutor` 线程，OTel context 跨线程传播成本高；过滤器纯函数式（信封进/信封出），主线程在 `future.result()` 前后已持全部记录所需信息。成本封装只定 API 形态（如 `record_generation(usage, cost)`），内部走 generation 观测，以 SDK 5.0.4 真实签名为准。
++
++## Verification
++
++**Commands:**
++- `.venv/bin/python -m pytest tests -q` -- 全绿（39 既有 + 新增用例）
++- `.venv/bin/ruff check src tests` -- 无告警
++- `.venv/bin/mypy src` -- strict 无错误
+diff --git a/_bmad-output/implementation-artifacts/sprint-status.yaml b/_bmad-output/implementation-artifacts/sprint-status.yaml
+index 9d83f6c..de64004 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status.yaml
+@@ -1,5 +1,5 @@
+ # generated: 2026-10-31
+-# last_updated: 2026-10-31
++# last_updated: 2026-11-01
+ # project: test
+ # project_key: NOKEY
+ # tracking_system: file-system
+@@ -41,7 +41,7 @@
+ # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+ 
+ generated: 2026-10-31
+-last_updated: 2026-10-31
++last_updated: 2026-11-01
+ project: test
+ project_key: NOKEY
+ tracking_system: file-system
+@@ -49,11 +49,11 @@ story_location: "{project-root}/_bmad-output/implementation-artifacts"
+ 
+ development_status:
+   epic-1: in-progress
+-  1-1-项目骨架与信封模型: ready-for-dev
+-  1-2-管道过滤器编排与统一错误兜底: backlog
+-  1-3-会话状态单写者管理: backlog
+-  1-4-健康检查端点: backlog
+-  1-5-Langfuse-全链路追踪脚手架: backlog
++  1-1-项目骨架与信封模型: review
++  1-2-管道过滤器编排与统一错误兜底: review
++  1-3-会话状态单写者管理: review
++  1-4-健康检查端点: review
++  1-5-Langfuse-全链路追踪脚手架: review
+   epic-1-retrospective: optional
+   epic-2: backlog
+   2-1-意图标签模型与分类器接口: backlog
+diff --git a/pyproject.toml b/pyproject.toml
+index 31cd4f8..6b800af 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,7 +1,7 @@
+ [project]
+-name = "my-agent"
++name = "weiliao-agent"
+ version = "0.1.0"
+-description = "A FastAPI-based agent service."
++description = "Weiliao first-response agent service (pipeline-filter architecture)."
+ readme = "README.md"
+ requires-python = ">=3.11"
+ license = { text = "MIT" }
+@@ -9,37 +9,29 @@ dependencies = [
+     "fastapi>=0.115.0",
+     "uvicorn[standard]>=0.32.0",
+     "pydantic>=2.9.0",
+-    "pydantic-settings>=2.6.0",
+-    "anthropic>=0.42.0",
+-    "python-dotenv>=1.0.0",
+-    "langgraph>=1.2.11",
++    "langgraph==1.2.16",
+     "langchain-openai>=1.6.2",
+-    "psycopg2-binary>=2.9.13",
+-    "langgraph-checkpoint-postgres>=3.1.2",
+-    "psycopg[binary]>=3.3.5",
+-    "a2a-sdk[sqlite]>=1.1.2",
+-    "sse-starlette>=3.4.11",
++    "redis==8.1.0",
++    "langfuse==5.0.4",
++    "cachetools==7.2.4",
+ ]
+ 
+-[project.optional-dependencies]
++[dependency-groups]
+ dev = [
+     "pytest>=8.3.0",
+     "pytest-asyncio>=0.24.0",
+     "httpx>=0.28.0",
+     "ruff>=0.8.0",
+     "mypy>=1.13.0",
++    "fakeredis[lua]>=2.27.0",
+ ]
+ 
+-[project.scripts]
+-my-agent = "my_agent.main:main"
+-my-agent-a2a = "my_agent.main:main_a2a"
+-
+ [build-system]
+ requires = ["hatchling"]
+ build-backend = "hatchling.build"
+ 
+ [tool.hatch.build.targets.wheel]
+-packages = ["src/my_agent"]
++packages = ["src/weiliao_agent"]
+ 
+ [tool.ruff]
+ line-length = 100
+diff --git a/src/my_agent/__init__.py b/src/my_agent/__init__.py
+deleted file mode 100644
+index 6caa5fa..0000000
+--- a/src/my_agent/__init__.py
++++ /dev/null
+@@ -1,3 +0,0 @@
+-"""my_agent package."""
+-
+-__version__ = "0.1.0"
+diff --git a/src/my_agent/a2a/__init__.py b/src/my_agent/a2a/__init__.py
+deleted file mode 100644
+index 6cb8b46..0000000
+--- a/src/my_agent/a2a/__init__.py
++++ /dev/null
+@@ -1 +0,0 @@
+-"""A2A 协议适配层：把内部 Agent 包装为符合 A2A 协议的 Agent 服务。"""
+diff --git a/src/my_agent/a2a/executor.py b/src/my_agent/a2a/executor.py
+deleted file mode 100644
+index b0200ff..0000000
+--- a/src/my_agent/a2a/executor.py
++++ /dev/null
+@@ -1,149 +0,0 @@
+-"""A2A 协议执行器：将内部 Agent 接入 A2A 协议。
+-
+-参考：https://github.com/google/A2A
+-"""
+-
+-import os
+-from datetime import UTC, datetime
+-
+-from a2a.server.agent_execution import AgentExecutor, RequestContext
+-from a2a.server.events import EventQueue
+-from a2a.types import (
+-    Artifact,
+-    Message,
+-    Part,
+-    Role,
+-    Task,
+-    TaskArtifactUpdateEvent,
+-    TaskState,
+-    TaskStatus,
+-    TaskStatusUpdateEvent,
+-)
+-from dotenv import load_dotenv
+-from langchain_openai import ChatOpenAI
+-from pydantic import SecretStr
+-
+-load_dotenv()  # 从项目根目录 .env 加载 LLM_MODEL_ID / LLM_API_KEY / LLM_BASE_URL
+-
+-_llm = ChatOpenAI(
+-    model=os.environ["LLM_MODEL_ID"],
+-    api_key=SecretStr(os.environ["LLM_API_KEY"]),
+-    base_url=os.environ["LLM_BASE_URL"],
+-    temperature=0.1,
+-)
+-
+-# 会话历史：context_id -> A2A 消息列表
+-_sessions: dict[str, list[Message]] = {}
+-
+-
+-def _extract_text(message: Message) -> str:
+-    """从 A2A 消息中提取文本内容。"""
+-    return "".join(part.text for part in message.parts if part.text)
+-
+-
+-class A2AAgentExecutor(AgentExecutor):
+-    """A2A 执行器：接收 A2A 消息，调用 LLM，回发 Task 事件。
+-
+-    用 A2A 的 context_id 作为会话 ID，让同一对话上下文共享多轮会话历史。
+-    """
+-
+-    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+-        """执行一次 A2A 请求并发布任务事件。"""
+-        user_text = _extract_text(context.message)  # type: ignore[arg-type]
+-        task_id = context.task_id
+-        context_id = context.context_id
+-
+-        # 1. 先发布初始任务（框架要求 Task 必须在状态更新事件之前入队）
+-        await event_queue.enqueue_event(
+-            Task(
+-                id=task_id,
+-                context_id=context_id,
+-                status=TaskStatus(
+-                    state=TaskState.TASK_STATE_SUBMITTED,
+-                    timestamp=datetime.now(UTC),
+-                ),
+-            )
+-        )
+-
+-        # 2. 任务开始：进入工作状态
+-        await event_queue.enqueue_event(
+-            TaskStatusUpdateEvent(
+-                task_id=task_id,
+-                context_id=context_id,
+-                status=TaskStatus(
+-                    state=TaskState.TASK_STATE_WORKING,
+-                    timestamp=datetime.now(UTC),
+-                ),
+-            )
+-        )
+-
+-        # 3. 调用 LLM（同一 context_id 共享多轮历史）
+-        try:
+-            history = _sessions.setdefault(context_id, [])  # type: ignore[arg-type]
+-            langchain_messages = [
+-                ("human" if m.role == Role.ROLE_USER else "ai", _extract_text(m))
+-                for m in history
+-            ]
+-            reply = (await _llm.ainvoke([*langchain_messages, ("human", user_text)])).content
+-            history.append(context.message)  # type: ignore[arg-type]
+-            history.append(
+-                Message(role=Role.ROLE_AGENT, parts=[Part(text=str(reply))])
+-            )
+-        except Exception as exc:
+-            await event_queue.enqueue_event(
+-                TaskStatusUpdateEvent(
+-                    task_id=task_id,
+-                    context_id=context_id,
+-                    status=TaskStatus(
+-                        state=TaskState.TASK_STATE_FAILED,
+-                        message=Message(
+-                            role=Role.ROLE_AGENT,
+-                            parts=[Part(text=f"Agent 执行出错: {exc}")],
+-                        ),
+-                        timestamp=datetime.now(UTC),
+-                    ),
+-                )
+-            )
+-            return
+-
+-        # 4. 产出结果 artifact
+-        await event_queue.enqueue_event(
+-            TaskArtifactUpdateEvent(
+-                task_id=task_id,
+-                context_id=context_id,
+-                artifact=Artifact(
+-                    artifact_id="reply",
+-                    name="agent_reply",
+-                    parts=[Part(text=str(reply))],
+-                ),
+-            )
+-        )
+-
+-        # 5. 任务完成
+-        await event_queue.enqueue_event(
+-            TaskStatusUpdateEvent(
+-                task_id=task_id,
+-                context_id=context_id,
+-                status=TaskStatus(
+-                    state=TaskState.TASK_STATE_COMPLETED,
+-                    message=Message(
+-                        role=Role.ROLE_AGENT,
+-                        parts=[Part(text=str(reply))],
+-                    ),
+-                    timestamp=datetime.now(UTC),
+-                ),
+-            )
+-        )
+-
+-    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+-        """取消任务：当前实现直接把任务标记为已取消。"""
+-        await event_queue.enqueue_event(
+-            TaskStatusUpdateEvent(
+-                task_id=context.task_id,
+-                context_id=context.context_id,
+-                status=TaskStatus(
+-                    state=TaskState.TASK_STATE_CANCELED,
+-                    timestamp=datetime.now(UTC),
+-                ),
+-            )
+-        )
+diff --git a/src/my_agent/a2a/server.py b/src/my_agent/a2a/server.py
+deleted file mode 100644
+index b09aa0d..0000000
+--- a/src/my_agent/a2a/server.py
++++ /dev/null
+@@ -1,73 +0,0 @@
+-"""构建符合 A2A 协议的 FastAPI 应用。"""
+-
+-from a2a.server.request_handlers.default_request_handler_v2 import (
+-    DefaultRequestHandlerV2,
+-)
+-from a2a.server.routes.agent_card_routes import create_agent_card_routes
+-from a2a.server.routes.fastapi_routes import add_a2a_routes_to_fastapi
+-from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+-from a2a.server.tasks import InMemoryTaskStore
+-from a2a.types import (
+-    AgentCapabilities,
+-    AgentCard,
+-    AgentInterface,
+-    AgentProvider,
+-    AgentSkill,
+-)
+-from fastapi import FastAPI
+-
+-from my_agent import __version__
+-from my_agent.a2a.executor import A2AAgentExecutor
+-from my_agent.config import settings
+-
+-
+-def build_agent_card(host: str | None = None, port: int | None = None) -> AgentCard:
+-    """构建描述本服务的 A2A AgentCard。"""
+-    host = host or settings.host
+-    port = port or settings.port
+-    return AgentCard(
+-        name="my-agent",
+-        description="一个基于 FastAPI + LLM 的 A2A 协议 Agent 服务",
+-        version=__version__,
+-        provider=AgentProvider(organization="my-agent"),
+-        supported_interfaces=[
+-            AgentInterface(
+-                url=f"http://{host}:{port}/a2a",
+-                protocol_binding="JSONRPC",
+-                protocol_version="1.0",
+-            )
+-        ],
+-        capabilities=AgentCapabilities(streaming=False),
+-        default_input_modes=["text/plain"],
+-        default_output_modes=["text/plain"],
+-        skills=[
+-            AgentSkill(
+-                id="chat",
+-                name="多轮对话",
+-                description="通用对话能力，支持基于 context_id 的多轮会话",
+-                tags=["chat"],
+-                examples=["你好", "帮我总结一下 A2A 协议"],
+-            )
+-        ],
+-    )
+-
+-
+-def create_a2a_app(
+-    executor: A2AAgentExecutor | None = None,
+-    card: AgentCard | None = None,
+-    rpc_url: str = "/a2a",
+-) -> FastAPI:
+-    """创建只承载 A2A 端点的 FastAPI 应用。"""
+-    card = card or build_agent_card()
+-    request_handler = DefaultRequestHandlerV2(
+-        agent_executor=executor or A2AAgentExecutor(),
+-        task_store=InMemoryTaskStore(),
+-        agent_card=card,
+-    )
+-    app = FastAPI(title="my-agent A2A", version=__version__)
+-    add_a2a_routes_to_fastapi(
+-        app,
+-        agent_card_routes=create_agent_card_routes(card),
+-        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url=rpc_url),
+-    )
+-    return app
+diff --git a/src/my_agent/agent/core.py b/src/my_agent/agent/core.py
+deleted file mode 100644
+index 14139ae..0000000
+--- a/src/my_agent/agent/core.py
++++ /dev/null
+@@ -1,60 +0,0 @@
+-"""Agent core logic."""
+-
+-from collections.abc import Sequence
+-
+-from anthropic import AsyncAnthropic
+-from anthropic.types import MessageParam
+-
+-from my_agent.config import settings
+-
+-
+-class Agent:
+-    """A thin wrapper around an LLM that maintains per-session history."""
+-
+-    def __init__(
+-        self,
+-        api_key: str | None = None,
+-        model: str | None = None,
+-        base_url: str | None = None,
+-    ) -> None:
+-        self._client = AsyncAnthropic(
+-            api_key=api_key or settings.anthropic_api_key,
+-            base_url=base_url or settings.anthropic_base_url,
+-        )
+-        self._model = model or settings.default_model
+-        self._history: dict[str, list[MessageParam]] = {}
+-
+-    def get_history(self, session_id: str | None) -> list[MessageParam]:
+-        """Return the conversation history for a session."""
+-        if session_id is None:
+-            return []
+-        return self._history.get(session_id, [])
+-
+-    def _update_history(
+-        self, session_id: str | None, user_message: str, assistant_message: str
+-    ) -> None:
+-        if session_id is None:
+-            return
+-        history = self._history.setdefault(session_id, [])
+-        history.append(MessageParam(role="user", content=user_message))
+-        history.append(MessageParam(role="assistant", content=assistant_message))
+-
+-    async def run(self, message: str, session_id: str | None = None) -> str:
+-        """Send a message to the model and return the reply."""
+-        messages: Sequence[MessageParam] = [
+-            *self.get_history(session_id),
+-            MessageParam(role="user", content=message),
+-        ]
+-        response = await self._client.messages.create(
+-            model=self._model,
+-            max_tokens=1024,
+-            messages=messages,
+-        )
+-        reply = "".join(block.text for block in response.content if block.type == "text")
+-        self._update_history(session_id, message, reply)
+-        return reply
+-
+-    def clear_history(self, session_id: str | None) -> None:
+-        """Clear the conversation history for a session."""
+-        if session_id is not None and session_id in self._history:
+-            del self._history[session_id]
+diff --git a/src/my_agent/agent/models.py b/src/my_agent/agent/models.py
+deleted file mode 100644
+index c855cc0..0000000
+--- a/src/my_agent/agent/models.py
++++ /dev/null
+@@ -1,26 +0,0 @@
+-"""Pydantic models for the agent API."""
+-
+-from pydantic import BaseModel, Field
+-
+-
+-class AgentRequest(BaseModel):
+-    """Incoming request payload for the agent endpoint."""
+-
+-    message: str = Field(..., min_length=1, description="User message to the agent.")
+-    session_id: str | None = Field(
+-        default=None, description="Optional session identifier for continuity."
+-    )
+-
+-
+-class AgentResponse(BaseModel):
+-    """Outgoing response payload from the agent endpoint."""
+-
+-    reply: str = Field(..., description="Agent's text reply.")
+-    session_id: str | None = Field(default=None, description="Session identifier.")
+-
+-
+-class HealthResponse(BaseModel):
+-    """Health check response."""
+-
+-    status: str = "ok"
+-    version: str
+diff --git a/src/my_agent/api/routes.py b/src/my_agent/api/routes.py
+deleted file mode 100644
+index 985b040..0000000
+--- a/src/my_agent/api/routes.py
++++ /dev/null
+@@ -1,39 +0,0 @@
+-"""FastAPI routers for the agent service."""
+-
+-from fastapi import APIRouter, Depends, HTTPException, status
+-
+-from my_agent.agent.core import Agent
+-from my_agent.agent.models import AgentRequest, AgentResponse, HealthResponse
+-from my_agent.config import settings
+-
+-router = APIRouter()
+-
+-
+-def get_agent() -> Agent:
+-    """Dependency that provides an Agent instance."""
+-    return Agent()
+-
+-
+-@router.get("/health", response_model=HealthResponse)
+-async def health() -> HealthResponse:
+-    """Health check endpoint."""
+-    return HealthResponse(version=settings.__dict__.get("version", "0.1.0"))
+-
+-
+-@router.post("/chat", response_model=AgentResponse)
+-async def chat(request: AgentRequest, agent: Agent = Depends(get_agent)) -> AgentResponse:
+-    """Send a message to the agent and receive a reply."""
+-    if not settings.anthropic_api_key:
+-        raise HTTPException(
+-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+-            detail="Anthropic API key is not configured.",
+-        )
+-    reply = await agent.run(request.message, session_id=request.session_id)
+-    return AgentResponse(reply=reply, session_id=request.session_id)
+-
+-
+-@router.delete("/sessions/{session_id}")
+-async def clear_session(session_id: str, agent: Agent = Depends(get_agent)) -> dict[str, str]:
+-    """Clear the conversation history for a session."""
+-    agent.clear_history(session_id)
+-    return {"status": "cleared", "session_id": session_id}
+diff --git a/src/my_agent/config.py b/src/my_agent/config.py
+deleted file mode 100644
+index 48b275c..0000000
+--- a/src/my_agent/config.py
++++ /dev/null
+@@ -1,25 +0,0 @@
+-"""Application configuration."""
+-
+-from pydantic_settings import BaseSettings, SettingsConfigDict
+-
+-
+-class Settings(BaseSettings):
+-    """Runtime settings loaded from environment variables."""
+-
+-    model_config = SettingsConfigDict(
+-        env_file=".env",
+-        env_file_encoding="utf-8",
+-        extra="ignore",
+-    )
+-
+-    app_name: str = "my-agent"
+-    debug: bool = False
+-    host: str = "127.0.0.1"
+-    port: int = 8000
+-    a2a_port: int = 8001
+-    anthropic_api_key: str | None = None
+-    anthropic_base_url: str | None = None
+-    default_model: str = "claude-3-5-sonnet-20241022"
+-
+-
+-settings = Settings()
+diff --git a/src/my_agent/main.py b/src/my_agent/main.py
+deleted file mode 100644
+index d328f95..0000000
+--- a/src/my_agent/main.py
++++ /dev/null
+@@ -1,54 +0,0 @@
+-"""FastAPI application entry point."""
+-
+-import uvicorn
+-from fastapi import FastAPI
+-
+-from a2a.server.routes.agent_card_routes import create_agent_card_routes
+-
+-from my_agent import __version__
+-from my_agent.a2a.server import build_agent_card, create_a2a_app
+-from my_agent.api.routes import router
+-from my_agent.config import settings
+-
+-
+-def create_app() -> FastAPI:
+-    """Create and configure the FastAPI application."""
+-    app = FastAPI(
+-        title=settings.app_name,
+-        version=__version__,
+-        debug=settings.debug,
+-    )
+-    app.include_router(router, prefix="/api/v1")
+-    card = build_agent_card()
+-    # A2A 协议端点：JSON-RPC 入口挂载在 /a2a，AgentCard 按规范暴露在根路径
+-    app.mount("/a2a", create_a2a_app(card=card, rpc_url="/"))
+-    for route in create_agent_card_routes(card):
+-        app.routes.append(route)
+-    return app
+-
+-
+-app = create_app()
+-
+-
+-def main() -> None:
+-    """Run the application with uvicorn."""
+-    uvicorn.run(
+-        "my_agent.main:app",
+-        host=settings.host,
+-        port=settings.port,
+-        reload=settings.debug,
+-    )
+-
+-
+-def main_a2a() -> None:
+-    """只运行 A2A 协议的独立服务。"""
+-    uvicorn.run(
+-        "my_agent.a2a.server:create_a2a_app",
+-        factory=True,
+-        host=settings.host,
+-        port=settings.a2a_port,
+-    )
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/src/weiliao_agent/__init__.py b/src/weiliao_agent/__init__.py
+new file mode 100644
+index 0000000..2a982ea
+--- /dev/null
++++ b/src/weiliao_agent/__init__.py
+@@ -0,0 +1 @@
++"""微聊首响 Agent —— 管道-过滤器架构的首响应答服务。"""
+diff --git a/src/weiliao_agent/adapters/__init__.py b/src/weiliao_agent/adapters/__init__.py
+new file mode 100644
+index 0000000..c659c3f
+--- /dev/null
++++ b/src/weiliao_agent/adapters/__init__.py
+@@ -0,0 +1 @@
++"""接入适配器：Kafka consumer/producer、外部服务适配。"""
+diff --git a/src/weiliao_agent/adapters/http.py b/src/weiliao_agent/adapters/http.py
+new file mode 100644
+index 0000000..4f9d80d
+--- /dev/null
++++ b/src/weiliao_agent/adapters/http.py
+@@ -0,0 +1,93 @@
++"""HTTP 接入适配器 —— 最小 FastAPI 同步端点（Story 1.2，Story 1.3 接入会话，Story 1.4 健康检查）。
++
++消息端点 ``POST /v1/messages``（请求-响应式）与健康检查 ``GET /health``
++（就绪 200 / 未就绪 503，NFR-7）。无效输入在端点层 fail-closed：不进入
++管道，返回兜底应答 + 新生成 trace_id，HTTP 非 5xx。信封校验通过后，
++注入的 SessionManager 先 ``begin_turn`` 并把快照的 turn 回填信封（入管道
++前赋值，AD-4 单写者）；Redis 故障 fail-closed：兜底应答 + 原 trace_id，
++HTTP 非 5xx。未注入 SessionManager（如测试）则跳过会话步骤。鉴权/限流等
++横切能力与 Kafka 接入不在本 Story 范围。
++"""
++
++import uuid
++from typing import Any
++
++import redis
++from fastapi import FastAPI, Request
++from fastapi.exceptions import RequestValidationError
++from fastapi.responses import JSONResponse
++from pydantic import ValidationError
++
++from weiliao_agent.filters.templates import render_placeholder
++from weiliao_agent.health import is_ready
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.pipeline import PipelineOrchestrator, PipelineResult
++from weiliao_agent.session import SessionManager
++
++
++def _fallback_result(intent: str | None = None, trace_id: str | None = None) -> PipelineResult:
++    """构造 fail-closed 兜底应答：兜底文案 + 新生成 trace_id。"""
++    return PipelineResult(
++        reply=render_placeholder(intent),
++        trace_id=trace_id if trace_id is not None else str(uuid.uuid4()),
++        degraded=True,
++        failed_filter=None,
++    )
++
++
++def create_app(
++    orchestrator: PipelineOrchestrator | None = None,
++    session_manager: SessionManager | None = None,
++) -> FastAPI:
++    """装配 FastAPI 应用；编排器与 SessionManager 可注入，便于测试替身。"""
++    app = FastAPI(title="weiliao-agent")
++    orchestrator_ = orchestrator if orchestrator is not None else PipelineOrchestrator()
++    session_manager_ = session_manager
++
++    @app.get("/health")
++    def health() -> JSONResponse:
++        # NFR-7：管道编排完成（含 response_assembler）即就绪。健康检查
++        # 非买家消息：不带 trace_id/兜底语义，不经过滤器链。
++        try:
++            ready = is_ready(orchestrator_)
++        except Exception:
++            # 探针自身异常不得让健康端点 500（负载均衡对 500/503 处置
++            # 不同，500 属 paging 级事件）：按未就绪收敛，摘除实例待介入。
++            ready = False
++        if ready:
++            return JSONResponse(status_code=200, content={"status": "ready"})
++        return JSONResponse(status_code=503, content={"status": "not_ready"})
++
++    @app.exception_handler(RequestValidationError)
++    async def validation_fallback(request: Request, exc: RequestValidationError) -> JSONResponse:
++        # 无效输入（含 JSON 解析失败）fail-closed：兜底应答 + 新生成
++        # trace_id，HTTP 非 5xx。
++        return JSONResponse(status_code=200, content=_fallback_result().to_dict())
++
++    @app.post("/v1/messages")
++    def post_message(payload: dict[str, Any]) -> dict[str, Any]:
++        try:
++            envelope = Envelope.model_validate(payload)
++        except ValidationError:
++            # 无效输入 fail-closed：兜底应答 + 新生成 trace_id，不返回 5xx。
++            return _fallback_result().to_dict()
++        if session_manager_ is not None:
++            try:
++                snapshot = session_manager_.begin_turn(envelope.session_id, envelope.timestamp)
++            except redis.RedisError:
++                # Redis 故障 fail-closed：兜底应答 + 原 trace_id，非 5xx。
++                # 仅收敛 redis 异常族：编程错误（如返回值解析 TypeError）
++                # 照常上抛，不静默降级掩盖缺陷。
++                return _fallback_result(envelope.intent, envelope.trace_id).to_dict()
++            envelope.turn = snapshot.turn
++        else:
++            # 无会话管理器（测试替身）时 turn 无权威来源：不信任 payload
++            # 自带值，置 None 防止客户端伪造序号混入管道。
++            envelope.turn = None
++        try:
++            return orchestrator_.run(envelope).to_dict()
++        except Exception:
++            # 编排器逃逸异常兜底：买家侧永不暴露 5xx。
++            return _fallback_result(envelope.intent, envelope.trace_id).to_dict()
++
++    return app
+diff --git a/src/weiliao_agent/cache/__init__.py b/src/weiliao_agent/cache/__init__.py
+new file mode 100644
+index 0000000..ad3a535
+--- /dev/null
++++ b/src/weiliao_agent/cache/__init__.py
+@@ -0,0 +1 @@
++"""缓存：L0 Redis 客户端、L1 cachetools 封装。"""
+diff --git a/src/weiliao_agent/filters/__init__.py b/src/weiliao_agent/filters/__init__.py
+new file mode 100644
+index 0000000..53af9c3
+--- /dev/null
++++ b/src/weiliao_agent/filters/__init__.py
+@@ -0,0 +1 @@
++"""热路径过滤器：coreference、intent_router、cache_lookup、risk_review、response_assembler。"""
+diff --git a/src/weiliao_agent/filters/base.py b/src/weiliao_agent/filters/base.py
+new file mode 100644
+index 0000000..1b82db1
+--- /dev/null
++++ b/src/weiliao_agent/filters/base.py
+@@ -0,0 +1,20 @@
++"""过滤器统一契约（AD-1）。
++
++每个过滤器仅消费上游信封、产出下游信封，过滤器之间禁止直接函数
++调用，全部状态经信封传递。
++"""
++
++from abc import ABC, abstractmethod
++
++from weiliao_agent.models.envelope import Envelope
++
++
++class Filter(ABC):
++    """过滤器抽象基类：单一职责、可替换、可独立测试。"""
++
++    # 子类应覆写为过滤器名；缺省时降级归因退化为类名（管道兜底保护）。
++    name: str = ""
++
++    @abstractmethod
++    def process(self, envelope: Envelope) -> Envelope:
++        """消费上游信封，产出下游信封。"""
+diff --git a/src/weiliao_agent/filters/cache_lookup.py b/src/weiliao_agent/filters/cache_lookup.py
+new file mode 100644
+index 0000000..caa30d0
+--- /dev/null
++++ b/src/weiliao_agent/filters/cache_lookup.py
+@@ -0,0 +1,16 @@
++"""缓存查找过滤器（占位实现，Story 1.2）。
++
++L1/L0 缓存分层与事实卡片模型（AD-5）由后续 Epic 填充，本 Story 透传。
++"""
++
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.models.envelope import Envelope
++
++
++class CacheLookupFilter(Filter):
++    """占位缓存查找：直接透传上游信封。"""
++
++    name = "cache_lookup"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        return envelope
+diff --git a/src/weiliao_agent/filters/intent_router.py b/src/weiliao_agent/filters/intent_router.py
+new file mode 100644
+index 0000000..3eed16c
+--- /dev/null
++++ b/src/weiliao_agent/filters/intent_router.py
+@@ -0,0 +1,19 @@
++"""意图路由过滤器（占位实现，Story 1.2）。
++
++真实意图分类与硬触发评估（AD-3/AD-12）由后续 Epic 填充。本 Story
++最小行为：意图缺失时按 fail-closed 口径置为 UNKNOWN，其余透传。
++"""
++
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.models.envelope import Envelope
++
++
++class IntentRouterFilter(Filter):
++    """占位意图路由：缺失意图默认 UNKNOWN，信封其余字段透传。"""
++
++    name = "intent_router"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        if envelope.intent is None:
++            return envelope.model_copy(update={"intent": "UNKNOWN"})
++        return envelope
+diff --git a/src/weiliao_agent/filters/response_assembler.py b/src/weiliao_agent/filters/response_assembler.py
+new file mode 100644
+index 0000000..a2a4b44
+--- /dev/null
++++ b/src/weiliao_agent/filters/response_assembler.py
+@@ -0,0 +1,17 @@
++"""响应组装过滤器（占位实现，Story 1.2）。
++
++事实卡片 + 模板/LLM 组装与 AI 身份披露校验（AD-10）由后续 Epic 填充，
++本 Story 透传。
++"""
++
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.models.envelope import Envelope
++
++
++class ResponseAssemblerFilter(Filter):
++    """占位响应组装：直接透传上游信封。"""
++
++    name = "response_assembler"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        return envelope
+diff --git a/src/weiliao_agent/filters/risk_review.py b/src/weiliao_agent/filters/risk_review.py
+new file mode 100644
+index 0000000..4335d1c
+--- /dev/null
++++ b/src/weiliao_agent/filters/risk_review.py
+@@ -0,0 +1,17 @@
++"""风控审核过滤器（占位实现，Story 1.2）。
++
++真实风控审核（AD-8 超时视为不通过）由后续 Epic 填充。占位过滤器输出
++视为已审核（占位文案为预审核安全文案），本 Story 透传。
++"""
++
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.models.envelope import Envelope
++
++
++class RiskReviewFilter(Filter):
++    """占位风控审核：直接透传上游信封。"""
++
++    name = "risk_review"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        return envelope
+diff --git a/src/weiliao_agent/filters/templates.py b/src/weiliao_agent/filters/templates.py
+new file mode 100644
+index 0000000..af114f4
+--- /dev/null
++++ b/src/weiliao_agent/filters/templates.py
+@@ -0,0 +1,39 @@
++"""占位模板注册表（Story 1.2）—— 错误兜底机制的独立验收载体。
++
++9 类意图各一条安全文案 + 1 条通用兜底；intent 缺失或不在 9 类枚举内
++一律回退通用兜底（fail-closed，与信封未知枚举口径一致）。
++
++全部买家可见占位文案（含兜底应答）携带固定 AI 身份披露前缀（AD-10），
++Story 4.1 完整模板库替换时继承该约定。
++"""
++
++# 固定 AI 身份披露前缀（AD-10）：买家可见文本 100% 携带。
++AI_DISCLOSURE_PREFIX = "【AI 助手】"
++
++# 9 类意图各一条预审核安全文案；均为不承诺具体事实的安抚/记录口径，
++# 占位过滤器输出视为已审核，允许直接下发买家。
++_INTENT_PLACEHOLDERS: dict[str, str] = {
++    "GREETING": "您好，已收到您的消息。请问您对这套房想了解哪方面的信息？",
++    "PRICE_INQUIRY": "您咨询的价格问题已为您记录，确认后第一时间回复您。",
++    "AVAILABILITY": "房源在售情况正在为您核实，稍后回复您确认结果。",
++    "LOCATION": "小区位置与周边配套信息正在为您整理，稍后回复您详情。",
++    "PHOTO_REQUEST": "房源照片已为您向经纪人索取，稍后发送给您查看。",
++    "NEGOTIATION": "您的出价意向已记录并转达，经纪人确认后回复您。",
++    "LOAN_POLICY": "贷款政策相关问题已记录，稍后为您详细解答。",
++    "COMPLAINT": "感谢您的反馈，已记录并会尽快跟进处理。",
++    "UNKNOWN": "已收到您的消息，经纪人稍后回复您。",
++}
++
++# 通用兜底：intent 缺失或不在 9 类枚举内时使用。
++_GENERIC_PLACEHOLDER = "系统繁忙，已为您记录消息，经纪人稍后回复您。"
++
++
++def render_placeholder(intent: str | None) -> str:
++    """按意图标签渲染买家可见占位文案，统一携带 AI 身份披露前缀。
++
++    intent 为 None 或不在 9 类枚举内时回退通用兜底文案。
++    """
++    body = _GENERIC_PLACEHOLDER
++    if intent:
++        body = _INTENT_PLACEHOLDERS.get(intent, _GENERIC_PLACEHOLDER)
++    return f"{AI_DISCLOSURE_PREFIX}{body}"
+diff --git a/src/weiliao_agent/health/__init__.py b/src/weiliao_agent/health/__init__.py
+new file mode 100644
+index 0000000..188b54f
+--- /dev/null
++++ b/src/weiliao_agent/health/__init__.py
+@@ -0,0 +1,5 @@
++"""健康检查端点（挂在响应组装过滤器）。"""
++
++from weiliao_agent.health.probe import is_ready
++
++__all__ = ["is_ready"]
+diff --git a/src/weiliao_agent/health/probe.py b/src/weiliao_agent/health/probe.py
+new file mode 100644
+index 0000000..f886952
+--- /dev/null
++++ b/src/weiliao_agent/health/probe.py
+@@ -0,0 +1,19 @@
++"""就绪探针（Story 1.4）。
++
++判定口径即 AC 的 Given：服务已启动且管道编排完成。架构约定健康检查
++"挂在响应组装过滤器"，字面落点为过滤器链完整且含 ``response_assembler``
++过滤器。就绪判定不纳入 Redis 连通性：Redis 故障按既有 fail-closed 设计
++逐消息降级应答，服务仍可受理流量，探针不应因此摘除全部实例。
++"""
++
++from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
++from weiliao_agent.pipeline import PipelineOrchestrator
++
++# 就绪所依赖的末位过滤器（架构：端点挂在响应组装过滤器）；
++# 直接引用过滤器类属性，避免过滤器重命名时判定键失同步。
++READY_FILTER_NAME = ResponseAssemblerFilter.name
++
++
++def is_ready(orchestrator: PipelineOrchestrator) -> bool:
++    """编排器过滤器链完整（含 response_assembler）即视为就绪。"""
++    return READY_FILTER_NAME in orchestrator.filter_names
+diff --git a/src/weiliao_agent/llm/__init__.py b/src/weiliao_agent/llm/__init__.py
+new file mode 100644
+index 0000000..72a32f8
+--- /dev/null
++++ b/src/weiliao_agent/llm/__init__.py
+@@ -0,0 +1 @@
++"""LLM 生成：LangGraph 子图、OpenAI client、prompt 管理。"""
+diff --git a/src/weiliao_agent/main.py b/src/weiliao_agent/main.py
+new file mode 100644
+index 0000000..a9766da
+--- /dev/null
++++ b/src/weiliao_agent/main.py
+@@ -0,0 +1,24 @@
++"""应用入口：装配编排器、SessionManager 与 HTTP 端点，供 uvicorn 启动。
++
++启动方式：``uvicorn weiliao_agent.main:app --reload``。
++``/health`` 由 create_app 装配（Story 1.4，NFR-7）。
++"""
++
++import os
++
++import redis
++
++from weiliao_agent.adapters.http import create_app
++from weiliao_agent.pipeline import PipelineOrchestrator
++from weiliao_agent.session import SessionManager
++
++# Redis socket 超时须远小于 2.5s 内部预算（NFR-1 P99 < 3s 出口余量口径）。
++REDIS_SOCKET_TIMEOUT_SECONDS = 0.5
++
++_redis_client = redis.Redis.from_url(
++    os.environ.get("WEILIAO_REDIS_URL", "redis://127.0.0.1:6379/0"),
++    socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
++    socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
++)
++
++app = create_app(PipelineOrchestrator(), SessionManager(_redis_client))
+diff --git a/src/weiliao_agent/models/__init__.py b/src/weiliao_agent/models/__init__.py
+new file mode 100644
+index 0000000..9549013
+--- /dev/null
++++ b/src/weiliao_agent/models/__init__.py
+@@ -0,0 +1 @@
++"""Pydantic 模型：信封、事实卡片、意图标签（Literal）。"""
+diff --git a/src/weiliao_agent/models/envelope.py b/src/weiliao_agent/models/envelope.py
+new file mode 100644
+index 0000000..96a5591
+--- /dev/null
++++ b/src/weiliao_agent/models/envelope.py
+@@ -0,0 +1,55 @@
++"""消息信封 —— 管道-过滤器架构全链路唯一通信模型。
++
++信封随管道逐跳填充：每个过滤器仅消费上游信封、产出下游信封。
++任意来源的 dict 必须经 ``Envelope.model_validate`` 校验后方可进入管道；
++缺失必填字段、类型错误一律 fail-closed（抛 ``pydantic.ValidationError``），
++由调用方兜底。
++
++字段口径（架构一致性约定）：
++- ``session_id`` / ``house_id`` / ``timestamp`` 必填；
++- ``trace_id`` 缺省为 None：由服务在编排器入口生成并回填信封
++  （Story 1.5，32 位小写十六进制，即 Langfuse trace id 口径）。
++  回填语义为「缺失即生成、携带值透传」（既有测试锁定透传）：
++  payload 携带值原样流经管道与响应，但仅 32-hex 值可作为 Langfuse
++  trace id 被消费，非 32-hex 值跳过追踪（见 observability.tracing）；
++  空串仍拒绝；
++- ``turn``（会话内绝对消息序号，由会话管理在入管道前赋值）与
++  ``intent``（由分类器填写）允许为 None，但非 None 时类型必须正确；
++- ``intent`` 本 Story 为 ``str | None``，9 类 Literal 枚举在 Story 2.1
++  定义后收窄，未知值届时 fail-closed 到模板兜底；
++- ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
++  预留字段，本 Story 仅定义、不消费，默认 None。
++"""
++
++from datetime import datetime
++from typing import Any
++
++from pydantic import BaseModel, Field, field_validator
++
++
++class Envelope(BaseModel):
++    """管道内传递的标准化消息信封。"""
++
++    session_id: str = Field(min_length=1)
++    house_id: str = Field(min_length=1)
++    timestamp: datetime
++    # Story 1.5：trace_id 放宽为可选——服务端权威生成（编排器入口
++    # 回填），其余校验规则不动（空串仍 min_length=1 拒绝）。
++    trace_id: str | None = Field(default=None, min_length=1)
++    turn: int | None = None
++    intent: str | None = None
++    # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
++    # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
++    message: str | None = None
++    resolved_message: str | None = None
++    coref: list[Any] | None = None
++    media_type: str | None = None
++
++    @field_validator("timestamp")
++    @classmethod
++    def _timestamp_must_be_tz_aware(cls, value: datetime) -> datetime:
++        """结算 deferred-work：时间戳必须带时区（naive datetime 拒绝）。"""
++        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
++            msg = "timestamp must be timezone-aware"
++            raise ValueError(msg)
++        return value
+diff --git a/src/weiliao_agent/observability/__init__.py b/src/weiliao_agent/observability/__init__.py
+new file mode 100644
+index 0000000..e28c9d8
+--- /dev/null
++++ b/src/weiliao_agent/observability/__init__.py
+@@ -0,0 +1,29 @@
++"""Langfuse trace、监控指标、成本追踪。
++
++Story 1.5 追踪脚手架公共接口面（对编排器与后续 Epic 稳定）：
++trace_id 权威生成、消息级 trace 上下文、过滤器 span、降级/下发事件、
++成本追踪封装（Epic 4 消费）。全部入口 fail-safe，未配置 Langfuse 时
++no-op。详见 ``tracing`` 模块 docstring。
++"""
++
++from weiliao_agent.observability.tracing import (
++    filter_span,
++    get_langfuse,
++    new_trace_id,
++    record_degradation,
++    record_delivery,
++    record_generation,
++    set_langfuse_client,
++    trace_message,
++)
++
++__all__ = [
++    "filter_span",
++    "get_langfuse",
++    "new_trace_id",
++    "record_degradation",
++    "record_delivery",
++    "record_generation",
++    "set_langfuse_client",
++    "trace_message",
++]
+diff --git a/src/weiliao_agent/observability/tracing.py b/src/weiliao_agent/observability/tracing.py
+new file mode 100644
+index 0000000..7e6d6f9
+--- /dev/null
++++ b/src/weiliao_agent/observability/tracing.py
+@@ -0,0 +1,285 @@
++"""Langfuse 全链路追踪脚手架（Story 1.5）。
++
++职责（架构一致性约定「可观测」）：
++- trace_id 由编排器入口权威生成（``new_trace_id``，32 位小写十六进制，
++  与 Langfuse trace id 同口径，响应 id 可直接在 Langfuse 检索）；
++- 每消息记录三文本字段：买家原文 / 消解后消息 / 最终下发文本
++  （后两者当前恒等于原文，coref（Story 2）与 LLM 生成（Epic 4）
++  就位后渐进分化）；
++- 降级事件、过滤器 span 写入消息 trace；成本追踪经 generation 观测
++  记录 token 用量与费用（真实模型调用由 Epic 4 接入本封装）。
++
++Fail-safe 约定（spec Boundaries）：本模块所有公开入口对 Langfuse SDK
++的任何异常一律吞掉——追踪缺失绝不二次影响买家应答，也不得超出管道
++时间预算；SDK 自身 flush 走后台线程，不阻塞请求路径。未配置 Langfuse
++（无 ``LANGFUSE_PUBLIC_KEY`` 等环境变量）时 SDK 进入 disabled 态，全部
++记录 no-op，管道行为与 Story 1.4 逐字节一致（仅多一条禁用 warning）。
++
++记录一律在主线程编排器侧、以 ``TraceContext(trace_id=...)`` 显式挂到
++消息 trace：过滤器在 ThreadPoolExecutor 线程内执行，不做 OTel 跨线程
++context 传播（spec Never 约束）。
++"""
++
++import re
++import uuid
++from collections.abc import Iterator, Mapping
++from contextlib import contextmanager, suppress
++from typing import Any
++
++from langfuse import Langfuse, get_client, propagate_attributes
++from langfuse.types import TraceContext
++
++# SDK 自定义 trace id 的合法口径（Langfuse._is_valid_trace_id 同规则）：
++# 非 32 位小写十六进制的 id 会让 SDK 告警并抛 ValueError，故本层提前
++# 收敛为跳过记录，避免异常驱动的控制流与日志噪音。
++_VALID_TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
++
++# 状态消息长度上限（降级归因等，防异常文本膨胀 trace）。
++_STATUS_MESSAGE_LIMIT = 500
++
++# 惰性单例缓存（get_client 内部按 public_key 单例）；测试可经
++# ``set_langfuse_client`` 注入替身或重置回 None 走惰性初始化。
++_client: Langfuse | None = None
++
++
++def get_langfuse() -> Langfuse:
++    """返回惰性单例 client；首次调用才初始化（未配置则 disabled 单例）。"""
++    global _client  # noqa: PLW0603
++    if _client is None:
++        _client = get_client()
++    return _client
++
++
++def set_langfuse_client(client: Langfuse | None) -> None:
++    """注入/替换 client（测试替身）；传 None 恢复惰性单例路径。"""
++    global _client  # noqa: PLW0603
++    _client = client
++
++
++def new_trace_id() -> str:
++    """生成服务端权威 trace_id：32 位小写十六进制（Langfuse trace id 口径）。"""
++    return uuid.uuid4().hex
++
++
++def _recordable(trace_id: str | None) -> bool:
++    """trace_id 是否可挂到 Langfuse trace（None 或非 32-hex 口径直接跳过）。"""
++    return trace_id is not None and _VALID_TRACE_ID.fullmatch(trace_id) is not None
++
++
++def _client_or_none() -> Langfuse | None:
++    """惰性取 client；初始化本身异常也收敛为 None（全链路 no-op）。"""
++    try:
++        return get_langfuse()
++    except Exception:
++        return None
++
++
++@contextmanager
++def trace_message(
++    *,
++    trace_id: str | None,
++    session_id: str,
++    house_id: str,
++    message: str | None,
++    turn: int | None = None,
++    intent: str | None = None,
++) -> Iterator[None]:
++    """消息级 trace 上下文：根 span 记买家原文与三文本字段，session_id 贯穿。
++
++    当前口径：消解后消息恒等于买家原文（coref 过滤器属 Story 2），最终
++    下发文本由编排器在管道完成后经 ``record_delivery`` 补记到 trace。
++    上下文体的异常原样上抛（编排器自身兜底语义不变），SDK 侧异常吞掉。
++    """
++    if not _recordable(trace_id):
++        yield
++        return
++    client = _client_or_none()
++    if client is None:
++        yield
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    # SDK 的同步/异步双模 CM 以 Any 承接：只依赖 __enter__/__exit__
++    # 协议，避免引入 SDK 私有类型。enter 分步进行：任一步失败须退出
++    # 已 enter 的前序 CM（评审补丁：防部分 enter 泄漏根 span）。
++    root: Any = None
++    attrs: Any = None
++    try:
++        root = client.start_as_current_observation(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="pipeline.message",
++            as_type="span",
++            input={"session_id": session_id, "house_id": house_id, "message": message},
++            metadata={
++                "session_id": session_id,
++                "house_id": house_id,
++                "turn": turn,
++                "intent": intent,
++                "message": message,
++                "resolved_message": message,
++                "delivered_text": None,
++            },
++        )
++        root.__enter__()
++    except Exception:
++        yield
++        return
++    try:
++        attrs = propagate_attributes(session_id=session_id)
++        attrs.__enter__()
++    except Exception:
++        with suppress(Exception):
++            root.__exit__(None, None, None)
++        yield
++        return
++    try:
++        yield
++    finally:
++        # 逆序退出；SDK __exit__ 异常吞掉，不得影响编排器。
++        with suppress(Exception):
++            if attrs is not None:
++                attrs.__exit__(None, None, None)
++        with suppress(Exception):
++            if root is not None:
++                root.__exit__(None, None, None)
++
++
++@contextmanager
++def filter_span(trace_id: str | None, name: str) -> Iterator[None]:
++    """过滤器执行 span（主线程侧记录；过滤器线程内不做 OTel 传播）。
++
++    体异常（过滤器抛错/超时）照常上抛——编排器据此降级，语义不变；
++    异常同时尽力以 ERROR 级标记到 span，便于 Langfuse 检索失败跳。
++    """
++    if not _recordable(trace_id):
++        yield
++        return
++    client = _client_or_none()
++    if client is None:
++        yield
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    manager: Any = None
++    span: Any = None
++    try:
++        manager = client.start_as_current_observation(
++            trace_context=TraceContext(trace_id=trace_id),
++            name=f"filter:{name}",
++            as_type="span",
++        )
++    except Exception:
++        yield
++        return
++    try:
++        span = manager.__enter__()
++    except Exception:
++        with suppress(Exception):
++            manager.__exit__(None, None, None)
++        yield
++        return
++    try:
++        yield
++    except Exception as exc:
++        with suppress(Exception):
++            span.update(level="ERROR", status_message=str(exc)[:_STATUS_MESSAGE_LIMIT])
++        raise
++    finally:
++        with suppress(Exception):
++            manager.__exit__(None, None, None)
++
++
++def record_degradation(
++    trace_id: str | None,
++    *,
++    failed_filter: str | None = None,
++    slow_filter: str | None = None,
++    reason: str | None = None,
++) -> None:
++    """降级事件写入消息 trace（含归因过滤器名）。
++
++    降级事件记录本身再抛异常也吞掉（I/O 矩阵：绝不二次影响应答）。
++    """
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    with suppress(Exception):
++        client.create_event(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="pipeline.degradation",
++            level="ERROR",
++            metadata={
++                "event": "pipeline_degradation",
++                "failed_filter": failed_filter,
++                "slow_filter": slow_filter,
++                "reason": reason,
++            },
++        )
++
++
++def record_delivery(
++    trace_id: str | None,
++    *,
++    reply: str,
++    degraded: bool,
++    failed_filter: str | None = None,
++) -> None:
++    """最终下发文本写入消息 trace（三文本字段之三，SM-5/SM-6 口径）。"""
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    with suppress(Exception):
++        client.create_event(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="pipeline.delivery",
++            output=reply,
++            metadata={
++                "event": "pipeline_delivery",
++                "degraded": degraded,
++                "failed_filter": failed_filter,
++                "delivered_text": reply,
++            },
++        )
++    # 评审补丁：根 span metadata 预置的 delivered_text=None 属过期占位，
++    # 同步最终文本到当前 span（调用方位于 trace_message 上下文内）。
++    with suppress(Exception):
++        client.update_current_span(metadata={"delivered_text": reply})
++
++
++def record_generation(
++    trace_id: str | None,
++    *,
++    model: str,
++    usage: Mapping[str, int],
++    cost: Mapping[str, float],
++    name: str = "model.generation",
++) -> None:
++    """成本追踪封装：token 用量与费用挂到当前消息 trace（Epic 4 消费）。
++
++    脚手架级 API：真实模型调用接入时由 LLM 过滤器在拿到 usage/cost 后
++    调用本封装；内部走 SDK generation 观测（usage_details/cost_details）。
++    局限（评审补丁）：空上下文体意味着时长恒 ~0 且不记录 input/output，
++    Epic 4 接入真实调用时须改 start/end 或 update 语义补全。
++    """
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    try:
++        with client.start_as_current_observation(
++            trace_context=TraceContext(trace_id=trace_id),
++            name=name,
++            as_type="generation",
++            model=model,
++            usage_details=dict(usage),
++            cost_details=dict(cost),
++        ):
++            pass
++    except Exception:
++        pass
+diff --git a/src/weiliao_agent/pipeline.py b/src/weiliao_agent/pipeline.py
+new file mode 100644
+index 0000000..c0f30ec
+--- /dev/null
++++ b/src/weiliao_agent/pipeline.py
+@@ -0,0 +1,171 @@
++"""管道编排器（Story 1.2 核心交付）。
++
++手写纯 Python 编排（AD-2，无 LangGraph Runtime 依赖）：顺序调用
++intent_router → cache_lookup → risk_review → response_assembler，
++过滤器间仅经信封传递。
++
++Story 1.5 追踪挂点：``run()`` 入口为 trace_id 单一权威生成点（信封
++缺失即回填；携带值透传——既有测试锁定该语义，非 32-hex 值仅跳过
++Langfuse 追踪）；消息级 trace 上下文包裹整条链；每过滤器执行在
++主线程侧包 span；降级路径写降级事件；管道完成后补记最终下发文本。
++全部追踪 fail-safe，未配置 Langfuse 时 no-op，编排与兜底语义不变。
++
++统一错误兜底：
++- 任一过滤器抛异常 → 捕获并降级模板兜底，跳过剩余过滤器；
++- 端到端 deadline（默认内部预算 2.5s，为 NFR-1 P99 < 3s 留出口余量，
++  可配置）逐跳检查剩余预算，每跳以 ``future.result(timeout=剩余预算)``
++  执行，超时立即兜底、不傻等全量超时，执行线程结果丢弃（占位过滤器
++  无副作用，可安全丢弃）。
++
++买家侧永不暴露 5xx：所有路径返回 ``PipelineResult``，错误应答携带
++trace_id 且 ``degraded=True``。
++"""
++
++import time
++from concurrent.futures import ThreadPoolExecutor
++from concurrent.futures import TimeoutError as FutureTimeoutError
++from dataclasses import asdict, dataclass
++
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.filters.cache_lookup import CacheLookupFilter
++from weiliao_agent.filters.intent_router import IntentRouterFilter
++from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
++from weiliao_agent.filters.risk_review import RiskReviewFilter
++from weiliao_agent.filters.templates import render_placeholder
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.observability import tracing
++
++# 端到端内部预算：NFR-1 P99 < 3s 的出口余量口径，可配置。
++DEFAULT_BUDGET_SECONDS = 2.5
++
++
++@dataclass(frozen=True)
++class PipelineResult:
++    """管道执行结果：买家侧应答与降级元数据。"""
++
++    reply: str
++    trace_id: str
++    degraded: bool
++    failed_filter: str | None  # degraded=False 时为 None
++
++    def to_dict(self) -> dict[str, object]:
++        """序列化为端点响应体。"""
++        return asdict(self)
++
++
++class PipelineOrchestrator:
++    """顺序编排四过滤器链，统一异常捕获与逐跳 deadline 预算。"""
++
++    def __init__(
++        self,
++        filters: list[Filter] | None = None,
++        budget_seconds: float = DEFAULT_BUDGET_SECONDS,
++    ) -> None:
++        self._filters: list[Filter] = (
++            filters
++            if filters is not None
++            else [
++                IntentRouterFilter(),
++                CacheLookupFilter(),
++                RiskReviewFilter(),
++                ResponseAssemblerFilter(),
++            ]
++        )
++        self._budget_seconds = budget_seconds
++
++    @property
++    def filter_names(self) -> tuple[str, ...]:
++        """过滤器链名单（只读），供健康检查探针等链外只读消费。"""
++        return tuple(filter_.name for filter_ in self._filters)
++
++    def run(self, envelope: Envelope) -> PipelineResult:
++        """执行过滤器链；异常/超时一律降级模板兜底，不向上抛。"""
++        # trace_id 单一权威生成点：缺失即由服务生成回填（32 位小写
++        # 十六进制，Langfuse trace id 口径）；payload 携带值透传。
++        if envelope.trace_id is None:
++            envelope.trace_id = tracing.new_trace_id()
++        with tracing.trace_message(
++            trace_id=envelope.trace_id,
++            session_id=envelope.session_id,
++            house_id=envelope.house_id,
++            turn=envelope.turn,
++            intent=envelope.intent,
++            message=envelope.message,
++        ):
++            result = self._run_chain(envelope)
++            tracing.record_delivery(
++                trace_id=envelope.trace_id,
++                reply=result.reply,
++                degraded=result.degraded,
++                failed_filter=result.failed_filter,
++            )
++            return result
++
++    def _run_chain(self, envelope: Envelope) -> PipelineResult:
++        """deadline 预算内的过滤器链执行（含过滤器 span 记录）。"""
++        # run() 入口已权威回填 trace_id（单一生成点），过滤器透传信封
++        # 不改写；assert 仅作 mypy 类型收窄（评审补丁：原 or 分支为
++        # 假防御——若真触发会与 run() 打开的 trace 分裂成两个 id）。
++        assert envelope.trace_id is not None
++        trace_id = envelope.trace_id
++        deadline = time.monotonic() + self._budget_seconds
++        executor = ThreadPoolExecutor(max_workers=max(1, len(self._filters)))
++        last_filter: Filter | None = None
++        try:
++            for filter_ in self._filters:
++                last_filter = filter_
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    # 剩余预算耗尽：立即兜底，不傻等。
++                    return self._degraded(envelope, trace_id, slow_filter=filter_.name)
++                future = executor.submit(filter_.process, envelope)
++                try:
++                    # span 在主线程侧包 future.result()：过滤器跑在执行
++                    # 线程，不做 OTel 跨线程传播（Story 1.5 约定）。
++                    with tracing.filter_span(trace_id, filter_.name):
++                        envelope = future.result(timeout=remaining)
++                except FutureTimeoutError:
++                    return self._degraded(envelope, trace_id, slow_filter=filter_.name)
++                except Exception:
++                    return self._degraded(envelope, trace_id, failed_filter=filter_.name)
++        except Exception:
++            # future.result 之外的逃逸异常（如过滤器未定义 name 触发
++            # AttributeError）：统一兜底，异常不向上抛（I/O 矩阵约定）。
++            if last_filter is None:
++                culprit = "pipeline"
++            else:
++                culprit = getattr(last_filter, "name", None) or type(last_filter).__name__
++            return self._degraded(envelope, trace_id, failed_filter=culprit)
++        finally:
++            # 超时跳的执行线程结果已丢弃，等待其完成无意义（不傻等）。
++            executor.shutdown(wait=False)
++        return PipelineResult(
++            reply=render_placeholder(envelope.intent),
++            trace_id=trace_id,
++            degraded=False,
++            failed_filter=None,
++        )
++
++    @staticmethod
++    def _degraded(
++        envelope: Envelope,
++        trace_id: str,
++        *,
++        failed_filter: str | None = None,
++        slow_filter: str | None = None,
++    ) -> PipelineResult:
++        """构造兜底应答：跳过剩余过滤器，携带 trace_id 与降级归因。"""
++        # 降级事件挂点：归因过滤器名入 trace；记录本身 fail-safe，
++        # 再抛异常也吞掉，绝不二次影响应答。
++        tracing.record_degradation(
++            trace_id,
++            failed_filter=failed_filter,
++            slow_filter=slow_filter,
++        )
++        culprit = failed_filter if failed_filter is not None else slow_filter
++        return PipelineResult(
++            reply=render_placeholder(envelope.intent),
++            trace_id=trace_id,
++            degraded=True,
++            failed_filter=culprit,
++        )
+diff --git a/src/weiliao_agent/session/__init__.py b/src/weiliao_agent/session/__init__.py
+new file mode 100644
+index 0000000..04bda10
+--- /dev/null
++++ b/src/weiliao_agent/session/__init__.py
+@@ -0,0 +1,5 @@
++"""会话状态管理（单写者，含 handoff 状态）。"""
++
++from weiliao_agent.session.manager import SessionManager, SessionSnapshot
++
++__all__ = ["SessionManager", "SessionSnapshot"]
+diff --git a/src/weiliao_agent/session/manager.py b/src/weiliao_agent/session/manager.py
+new file mode 100644
+index 0000000..4abf234
+--- /dev/null
++++ b/src/weiliao_agent/session/manager.py
+@@ -0,0 +1,147 @@
++"""会话状态单写者（Story 1.3，AD-4 核心交付）。
++
++会话状态仅本模块写入：Redis hash 单键 ``weiliao:session:{session_id}``，
++字段 ``turn``（会话内绝对消息序号）、``followup_count``（追问计数，Epic 2
++消费）、``handoff_status``（Epic 5 消费，本 Story 恒 ``"none"``）、
++``last_message_at``（ISO8601 字符串）。TTL 30 分钟（可配置），每次入口
++调用刷新。
++
++原子性落点：``begin_turn`` 与 ``increment_followup`` 均为 Lua 脚本单
++roundtrip（读旧态/初始化/自增/刷新时间戳/EXPIRE 一次完成），满足延迟
++预算且并发安全；权威值只存 Redis，进程内不做任何会话状态缓存。
++
++过期竞态语义：调用方（入口适配器）在消息入管道前取快照，处理中途 key
++过期不中断在途消息；key 被 TTL 清除后重新发起即从零初始化（turn=1）。
++
++本 Story 不实现（接口边界已按 Epic 2/3/5 约定，届时补写方法）：
++``write_intent`` / ``write_coref`` / ``mark_handoff``，以及 per-turn
++工件键（如 ``:intent:{turn}``）的落盘。
++"""
++
++from dataclasses import dataclass
++from datetime import datetime
++from typing import cast
++
++import redis
++
++# 会话状态 key 前缀（架构一致性约定）。
++KEY_PREFIX = "weiliao:session:"
++
++# 会话 TTL 默认 30 分钟（FR-10），可配置。
++DEFAULT_TTL_SECONDS = 1800
++
++_LUA_BEGIN_TURN = """
++local key = KEYS[1]
++local last_message_at = ARGV[1]
++local ttl_seconds = tonumber(ARGV[2])
++-- 新会话判定以 turn 字段是否存在为准（不能用 turn==1：increment_followup
++-- 先执行时 hash 已存在但无 turn 字段，HINCRBY 得 1 会误判为新会话）。
++local turn = redis.call('HINCRBY', key, 'turn', 1)
++-- 仅补齐缺失字段：已有 followup_count 不得被静默清零。
++if redis.call('HEXISTS', key, 'followup_count') == 0 then
++  redis.call('HSET', key, 'followup_count', 0)
++end
++if redis.call('HEXISTS', key, 'handoff_status') == 0 then
++  redis.call('HSET', key, 'handoff_status', 'none')
++end
++redis.call('HSET', key, 'last_message_at', last_message_at)
++redis.call('EXPIRE', key, ttl_seconds)
++local followup_count = tonumber(redis.call('HGET', key, 'followup_count'))
++local handoff_status = redis.call('HGET', key, 'handoff_status')
++return {turn, followup_count, handoff_status}
++"""
++
++_LUA_INCREMENT_FOLLOWUP = """
++local key = KEYS[1]
++local ttl_seconds = tonumber(ARGV[1])
++local count = redis.call('HINCRBY', key, 'followup_count', 1)
++redis.call('EXPIRE', key, ttl_seconds)
++return count
++"""
++
++
++@dataclass(frozen=True)
++class SessionSnapshot:
++    """入管道前的会话状态快照：权威值仅存 Redis，调用方按快照继续。"""
++
++    turn: int
++    followup_count: int
++    handoff_status: str
++    last_message_at: datetime
++
++
++class SessionManager:
++    """会话状态唯一写入者（AD-4）。Redis 客户端注入，实例无状态。
++
++    Redis 故障处理策略由调用方收口：本模块不吞异常，入口适配器
++    fail-closed 走既有兜底模式（复用 Story 1.2 错误兜底）。
++    """
++
++    def __init__(
++        self,
++        client: redis.Redis,
++        *,
++        ttl_seconds: int = DEFAULT_TTL_SECONDS,
++    ) -> None:
++        self._client = client
++        self._ttl_seconds = ttl_seconds
++        self._begin_turn_script = client.register_script(_LUA_BEGIN_TURN)
++        self._increment_followup_script = client.register_script(_LUA_INCREMENT_FOLLOWUP)
++
++    def begin_turn(self, session_id: str, timestamp: datetime) -> SessionSnapshot:
++        """入管道前快照：初始化/自增 turn、刷新 TTL 与 ``last_message_at``。
++
++        原子单 roundtrip；并发调用同 session 时各得唯一 turn。会话 TTL
++        已过期时从零初始化（turn=1），无残留字段。
++        """
++        raw = self._begin_turn_script(
++            keys=[self._key(session_id)],
++            args=[timestamp.isoformat(), self._ttl_seconds],
++        )
++        turn, followup_count, handoff_status = cast(
++            "tuple[object, object, object]", tuple(cast("list[object]", raw))
++        )
++        return SessionSnapshot(
++            turn=int(cast("int | str | bytes", turn)),
++            followup_count=int(cast("int | str | bytes", followup_count)),
++            handoff_status=(
++                handoff_status.decode()
++                if isinstance(handoff_status, bytes)
++                else str(handoff_status)
++            ),
++            last_message_at=timestamp,
++        )
++
++    def increment_followup(self, session_id: str) -> int:
++        """追问计数 Redis 原子自增并刷新 TTL；返回权威值（Epic 2 消费）。"""
++        count = self._increment_followup_script(
++            keys=[self._key(session_id)],
++            args=[self._ttl_seconds],
++        )
++        return int(cast("int | str | bytes", count))
++
++    def read_snapshot(self, session_id: str) -> SessionSnapshot | None:
++        """只读当前会话快照；key 不存在（已过期）或为缺 turn /
++        ``last_message_at`` 的不完整 hash 时返回 None（防御非本模块写入）。"""
++        raw = self._client.hgetall(self._key(session_id))
++        if not raw:
++            return None
++        fields = {self._decode(k): self._decode(v) for k, v in raw.items()}
++        raw_turn = fields.get("turn")
++        raw_last_message_at = fields.get("last_message_at")
++        if raw_turn is None or raw_last_message_at is None:
++            return None
++        return SessionSnapshot(
++            turn=int(raw_turn),
++            followup_count=int(fields.get("followup_count", "0")),
++            handoff_status=fields.get("handoff_status", "none"),
++            last_message_at=datetime.fromisoformat(raw_last_message_at),
++        )
++
++    @staticmethod
++    def _key(session_id: str) -> str:
++        return f"{KEY_PREFIX}{session_id}"
++
++    @staticmethod
++    def _decode(value: str | bytes) -> str:
++        return value.decode() if isinstance(value, bytes) else value
+diff --git a/src/weiliao_agent/workers/__init__.py b/src/weiliao_agent/workers/__init__.py
+new file mode 100644
+index 0000000..25f18cb
+--- /dev/null
++++ b/src/weiliao_agent/workers/__init__.py
+@@ -0,0 +1 @@
++"""Kafka 消费者：房源事件同步、转人工指令。"""
+diff --git a/tests/conftest.py b/tests/conftest.py
+deleted file mode 100644
+index 356c0b9..0000000
+--- a/tests/conftest.py
++++ /dev/null
+@@ -1,18 +0,0 @@
+-"""Shared test fixtures."""
+-
+-import pytest
+-from fastapi.testclient import TestClient
+-
+-from my_agent.main import create_app
+-
+-
+-@pytest.fixture
+-def app():
+-    """Provide the FastAPI app instance."""
+-    return create_app()
+-
+-
+-@pytest.fixture
+-def client(app):
+-    """Provide a synchronous test client."""
+-    return TestClient(app)
+diff --git a/tests/test_a2a.py b/tests/test_a2a.py
+deleted file mode 100644
+index ad94895..0000000
+--- a/tests/test_a2a.py
++++ /dev/null
+@@ -1,137 +0,0 @@
+-"""A2A 协议端到端测试。
+-
+-流程：通过 TestClient 直接访问挂载在 FastAPI 上的 A2A JSON-RPC 端点，
+-打桩 LangChain LLM 避免真实 API 调用。
+-"""
+-
+-import uuid
+-from collections.abc import Iterator
+-from unittest.mock import AsyncMock, patch
+-
+-import pytest
+-from fastapi.testclient import TestClient
+-from langchain_core.messages import AIMessage
+-
+-import my_agent.a2a.executor as executor_module
+-from my_agent.main import create_app
+-
+-
+-@pytest.fixture
+-def mock_llm() -> Iterator[AsyncMock]:
+-    """打桩执行器模块里的 LLM，让回复带上对话历史长度，便于断言多轮上下文。"""
+-
+-    async def fake_ainvoke(messages, **kwargs):
+-        # 历史消息条数（不含本次用户消息）
+-        history_len = len(messages) - 1
+-        return AIMessage(content=f"收到，历史消息数={history_len}")
+-
+-    with patch.object(executor_module, "_llm") as mock:
+-        mock.ainvoke.side_effect = fake_ainvoke
+-        yield mock
+-
+-
+-@pytest.fixture
+-def a2a_client(mock_llm: AsyncMock) -> Iterator[TestClient]:
+-    """返回只承载 A2A 端点的测试客户端。"""
+-    from my_agent.a2a.server import create_a2a_app
+-
+-    with TestClient(create_a2a_app()) as client:
+-        yield client
+-
+-
+-def send_message(client: TestClient, text: str, context_id: str | None = None) -> dict:
+-    """发送一条 A2A JSON-RPC 消息并返回 result。"""
+-    payload = {
+-        "jsonrpc": "2.0",
+-        "id": str(uuid.uuid4()),
+-        "method": "SendMessage",
+-        "params": {
+-            "message": {
+-                "role": "ROLE_USER",
+-                "parts": [{"text": text}],
+-                "messageId": str(uuid.uuid4()),
+-            },
+-        },
+-    }
+-    if context_id:
+-        payload["params"]["message"]["contextId"] = context_id
+-    resp = client.post("/a2a", json=payload, headers={"A2A-Version": "1.0"})
+-    assert resp.status_code == 200
+-    body = resp.json()
+-    assert "result" in body, f"JSON-RPC 返回错误: {body}"
+-    return body["result"]
+-
+-
+-def test_agent_card(a2a_client: TestClient) -> None:
+-    """GET /.well-known/agent-card.json 返回 AgentCard。"""
+-    resp = a2a_client.get("/.well-known/agent-card.json")
+-    assert resp.status_code == 200
+-    card = resp.json()
+-    print(f"\ncard:{card}")
+-    assert card["name"] == "my-agent"
+-    assert card["supportedInterfaces"][0]["url"].endswith("/a2a")
+-    assert card["skills"], "AgentCard 应至少声明一个 skill"
+-
+-
+-def test_send_message_returns_completed_task(a2a_client: TestClient) -> None:
+-    """SendMessage 返回终态为 COMPLETED 的任务，且包含 agent 回复。"""
+-    result = send_message(a2a_client, "你好")
+-    task = result["task"]
+-    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+-    text = "".join(p.get("text", "") for p in task["status"]["message"]["parts"])
+-    assert "收到" in text
+-    # artifact 中也应携带回复内容
+-    artifact_text = "".join(
+-        p.get("text", "") for a in task.get("artifacts", []) for p in a.get("parts", [])
+-    )
+-    assert "收到" in artifact_text
+-
+-
+-def test_multi_turn_context_preserved(a2a_client: TestClient, mock_llm: AsyncMock) -> None:
+-    """同一 contextId 的第二、三轮请求应携带之前的会话历史。"""
+-    first = send_message(a2a_client, "第一轮")
+-    context_id = first["task"]["contextId"]
+-
+-    second = send_message(a2a_client, "第二轮", context_id=context_id)
+-    history_text = "".join(
+-        p.get("text", "") for p in second["task"]["status"]["message"]["parts"]
+-    )
+-    # 第一轮 Q&A 共 2 条历史
+-    assert "历史消息数=2" in history_text
+-
+-    third = send_message(a2a_client, "第三轮", context_id=context_id)
+-    history_text3 = "".join(
+-        p.get("text", "") for p in third["task"]["status"]["message"]["parts"]
+-    )
+-    assert "历史消息数=4" in history_text3
+-
+-
+-def test_get_task(a2a_client: TestClient) -> None:
+-    """GetTask 能取回已创建的任务。"""
+-    result = send_message(a2a_client, "查一下任务")
+-    task_id = result["task"]["id"]
+-    resp = a2a_client.post(
+-        "/a2a",
+-        json={
+-            "jsonrpc": "2.0",
+-            "id": str(uuid.uuid4()),
+-            "method": "GetTask",
+-            "params": {"id": task_id},
+-        },
+-        headers={"A2A-Version": "1.0"},
+-    )
+-    assert resp.status_code == 200
+-    body = resp.json()
+-    assert body["result"]["id"] == task_id
+-    assert body["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+-
+-
+-def test_main_app_exposes_a2a(mock_llm: AsyncMock) -> None:
+-    """主应用同时暴露 /api/v1 与 /a2a 端点。"""
+-    app = create_app()
+-    with TestClient(app) as client:
+-        assert client.get("/api/v1/health").status_code == 200
+-        card_resp = client.get("/.well-known/agent-card.json")
+-        assert card_resp.status_code == 200
+-        result = send_message(client, "主应用 A2A 测试")
+-        assert result["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+deleted file mode 100644
+index 1a45a90..0000000
+--- a/tests/test_agent.py
++++ /dev/null
+@@ -1,46 +0,0 @@
+-"""Tests for the agent core."""
+-
+-from unittest.mock import AsyncMock, patch
+-
+-import pytest
+-
+-from my_agent.agent.core import Agent
+-
+-
+-@pytest.fixture
+-def agent():
+-    """Provide an Agent instance with a fake API key."""
+-    return Agent(api_key="test-key", model="test-model")
+-
+-
+-@pytest.mark.asyncio
+-async def test_run_stores_history(agent: Agent) -> None:
+-    fake_response = AsyncMock()
+-    fake_response.content = [type("Block", (), {"type": "text", "text": "reply"})]
+-
+-    with patch.object(agent._client.messages, "create", new_callable=AsyncMock) as mock_create:
+-        mock_create.return_value = fake_response
+-        reply = await agent.run("hello", session_id="s1")
+-
+-    assert reply == "reply"
+-    assert len(agent.get_history("s1")) == 2
+-    assert agent.get_history("s1")[0]["role"] == "user"
+-
+-
+-@pytest.mark.asyncio
+-async def test_run_without_session_skips_history(agent: Agent) -> None:
+-    fake_response = AsyncMock()
+-    fake_response.content = [type("Block", (), {"type": "text", "text": "reply"})]
+-
+-    with patch.object(agent._client.messages, "create", new_callable=AsyncMock) as mock_create:
+-        mock_create.return_value = fake_response
+-        reply = await agent.run("hello")
+-
+-    assert reply == "reply"
+-    assert agent.get_history("s1") == []
+-
+-
+-def test_clear_history(agent: Agent) -> None:
+-    agent._history["s1"] = []
+-    agent.clear_history("s1")
+-    assert "s1" not in agent._history
+diff --git a/tests/test_api.py b/tests/test_api.py
+deleted file mode 100644
+index 7dcdb3c..0000000
+--- a/tests/test_api.py
++++ /dev/null
+@@ -1,40 +0,0 @@
+-"""Tests for the agent API endpoints."""
+-
+-from unittest.mock import AsyncMock, patch
+-
+-from fastapi.testclient import TestClient
+-
+-
+-@patch("my_agent.api.routes.settings")
+-def test_health(mock_settings, client: TestClient) -> None:
+-    mock_settings.__dict__ = {"version": "0.1.0"}
+-    response = client.get("/api/v1/health")
+-    assert response.status_code == 200
+-    assert response.json()["status"] == "ok"
+-
+-
+-@patch("my_agent.api.routes.settings")
+-@patch("my_agent.api.routes.Agent.run", new_callable=AsyncMock)
+-def test_chat(mock_run, mock_settings, client: TestClient) -> None:
+-    mock_settings.anthropic_api_key = "test-key"
+-    mock_run.return_value = "Hello, human."
+-
+-    response = client.post("/api/v1/chat", json={"message": "hi", "session_id": "s1"})
+-
+-    assert response.status_code == 200
+-    assert response.json() == {"reply": "Hello, human.", "session_id": "s1"}
+-    mock_run.assert_awaited_once_with("hi", session_id="s1")
+-
+-
+-@patch("my_agent.api.routes.settings")
+-def test_chat_missing_api_key(mock_settings, client: TestClient) -> None:
+-    mock_settings.anthropic_api_key = None
+-    response = client.post("/api/v1/chat", json={"message": "hi"})
+-    assert response.status_code == 503
+-    assert "not configured" in response.json()["detail"]
+-
+-
+-def test_clear_session(client: TestClient) -> None:
+-    response = client.delete("/api/v1/sessions/s1")
+-    assert response.status_code == 200
+-    assert response.json()["session_id"] == "s1"
+diff --git a/tests/test_envelope.py b/tests/test_envelope.py
+new file mode 100644
+index 0000000..757b8f9
+--- /dev/null
++++ b/tests/test_envelope.py
+@@ -0,0 +1,107 @@
++"""信封模型 I/O 矩阵单测（Story 1.1）。
++
++覆盖 spec I/O & Edge-Case Matrix 四场景：
++HAPPY_PATH / MISSING_REQUIRED / UNKNOWN_FIELD / BAD_TYPE。
++"""
++
++from datetime import UTC, datetime
++
++import pytest
++from pydantic import ValidationError
++
++from weiliao_agent.models.envelope import Envelope
++
++
++def _valid_payload() -> dict[str, object]:
++    return {
++        "session_id": "sess-001",
++        "house_id": "house-001",
++        "turn": 1,
++        "intent": "PRICE_INQUIRY",
++        "timestamp": "2026-10-31T10:00:00+08:00",
++        "trace_id": "trace-001",
++    }
++
++
++def test_happy_path_valid_dict_produces_envelope() -> None:
++    envelope = Envelope.model_validate(_valid_payload())
++
++    assert envelope.session_id == "sess-001"
++    assert envelope.house_id == "house-001"
++    assert envelope.turn == 1
++    assert envelope.intent == "PRICE_INQUIRY"
++    assert isinstance(envelope.timestamp, datetime)
++    assert envelope.trace_id == "trace-001"
++    # 预留四字段默认 None，不参与本 Story 验收。
++    assert envelope.message is None
++    assert envelope.resolved_message is None
++    assert envelope.coref is None
++    assert envelope.media_type is None
++
++
++@pytest.mark.parametrize("missing_field", ["session_id", "house_id", "timestamp"])
++def test_missing_required_field_fails_closed(missing_field: str) -> None:
++    payload = _valid_payload()
++    del payload[missing_field]
++
++    with pytest.raises(ValidationError):
++        Envelope.model_validate(payload)
++
++
++def test_missing_trace_id_defaults_to_none() -> None:
++    """Story 1.5 契约变更：trace_id 由服务端权威生成，payload 可缺省。"""
++    payload = _valid_payload()
++    del payload["trace_id"]
++
++    envelope = Envelope.model_validate(payload)
++
++    assert envelope.trace_id is None
++
++
++def test_unknown_field_is_ignored_by_default() -> None:
++    payload = _valid_payload()
++    payload["future_field"] = "not-defined-yet"
++
++    envelope = Envelope.model_validate(payload)
++
++    assert envelope.session_id == "sess-001"
++    assert "future_field" not in envelope.model_fields_set
++
++
++def test_bad_type_fails_closed() -> None:
++    payload = _valid_payload()
++    payload["trace_id"] = {"not": "a string"}
++
++    with pytest.raises(ValidationError):
++        Envelope.model_validate(payload)
++
++
++def test_naive_timestamp_without_timezone_is_rejected() -> None:
++    """结算 deferred-work：naive datetime（无时区）fail-closed。"""
++    payload = _valid_payload()
++    payload["timestamp"] = datetime(2026, 10, 31, 10, 0, 0)  # 无时区
++
++    with pytest.raises(ValidationError):
++        Envelope.model_validate(payload)
++
++
++@pytest.mark.parametrize("blank_field", ["session_id", "house_id", "trace_id"])
++def test_blank_identifier_is_rejected(blank_field: str) -> None:
++    """结算 deferred-work：三项标识符非空（min_length=1）。"""
++    payload = _valid_payload()
++    payload[blank_field] = ""
++
++    with pytest.raises(ValidationError):
++        Envelope.model_validate(payload)
++
++
++def test_optional_turn_and_intent_accept_none() -> None:
++    payload = _valid_payload()
++    payload["turn"] = None
++    payload["intent"] = None
++    payload["timestamp"] = datetime(2026, 10, 31, 10, 0, 0, tzinfo=UTC)
++
++    envelope = Envelope.model_validate(payload)
++
++    assert envelope.turn is None
++    assert envelope.intent is None
+diff --git a/tests/test_health.py b/tests/test_health.py
+new file mode 100644
+index 0000000..b49c87d
+--- /dev/null
++++ b/tests/test_health.py
+@@ -0,0 +1,62 @@
++"""健康检查端点单测（Story 1.4）。
++
++覆盖 spec I/O 口径两场景：管道编排完成（含 response_assembler）→ 200；
++链不完整 → 503（非 200 即满足 AC，负载均衡据此刻摘除实例）。
++"""
++
++from fastapi.testclient import TestClient
++
++from weiliao_agent.adapters.http import create_app
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.main import app as production_app
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.pipeline import PipelineOrchestrator
++
++
++class _PassThroughFilter(Filter):
++    """单过滤器替身：链中无 response_assembler，用于未就绪场景。"""
++
++    name = "intent_router"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        return envelope
++
++
++def test_health_ready_returns_200() -> None:
++    client = TestClient(create_app())  # 默认四过滤器链完整
++    response = client.get("/health")
++    assert response.status_code == 200
++    assert response.json() == {"status": "ready"}
++
++
++def test_health_incomplete_chain_returns_503() -> None:
++    orchestrator = PipelineOrchestrator(filters=[_PassThroughFilter()])
++    client = TestClient(create_app(orchestrator))
++    response = client.get("/health")
++    assert response.status_code == 503
++    assert response.json() == {"status": "not_ready"}
++
++
++class _RaisingOrchestrator:
++    """探针消费即抛错的畸形编排器替身。"""
++
++    @property
++    def filter_names(self) -> tuple[str, ...]:
++        raise RuntimeError("probe boom")
++
++
++def test_health_probe_error_returns_503() -> None:
++    # 探针异常不得让健康端点 500：负载均衡对 500/503 处置不同，
++    # 按未就绪收敛摘除实例。
++    client = TestClient(create_app(_RaisingOrchestrator()))  # type: ignore[arg-type]
++    response = client.get("/health")
++    assert response.status_code == 503
++    assert response.json() == {"status": "not_ready"}
++
++
++def test_health_production_wiring_ready() -> None:
++    # 生产组合根装配冒烟：防 main.py 装配回归（如默认链漏挂过滤器）
++    # 在注入替身的单测下不可见。导入即装配（Redis 客户端惰性连接）。
++    client = TestClient(production_app)
++    response = client.get("/health")
++    assert response.status_code == 200
+diff --git a/tests/test_multi_agent.py b/tests/test_multi_agent.py
+deleted file mode 100644
+index 17fa0fd..0000000
+--- a/tests/test_multi_agent.py
++++ /dev/null
+@@ -1,213 +0,0 @@
+-"""
+-https://cloud.tencent.com/developer/article/2649756
+-Multi-Agent 技术研究团队
+-基于 LangGraph 2026 最新API
+-依赖: pip install langgraph langchain-openai psycopg2-binary
+-"""
+-from typing import TypedDict, Annotated, Literal
+-from langgraph.graph import StateGraph, END
+-from langgraph.checkpoint.postgres import PostgresSaver
+-from langchain_openai import ChatOpenAI
+-from dotenv import load_dotenv
+-import operator
+-import json
+-import os
+-
+-load_dotenv()  # 从项目根目录 .env 加载配置
+-
+-# ============ 1. 定义共享状态 ============
+-class TeamState(TypedDict):
+-    topic: str                                    # 研究主题
+-    search_queries: list[str]                     # 搜索关键词列表
+-    raw_results: Annotated[list[str], operator.add]  # 原始搜索结果（累加）
+-    key_findings: list[dict]                      # 提取的关键发现
+-    analysis: str                                 # 深度分析结果
+-    code_examples: list[str]                      # 生成的代码示例
+-    report: str                                   # 最终报告
+-    revision_count: int                           # 修订次数
+-    messages: Annotated[list[dict], operator.add] # Agent间通信记录
+-
+-# ============ 2. 初始化模型（配置来自 .env）============
+-_llm_kwargs = {
+-    "model": os.environ["LLM_MODEL_ID"],
+-    "api_key": os.environ["LLM_API_KEY"],
+-    "base_url": os.environ["LLM_BASE_URL"],
+-}
+-llm_smart = ChatOpenAI(temperature=0.1, **_llm_kwargs)      # 研究和分析用
+-llm_creative = ChatOpenAI(temperature=0.7, **_llm_kwargs)    # 写作用
+-
+-# ============ 3. 定义Agent节点 ============
+-def extract_json(text: str):
+-    """从模型输出中解析JSON：截取第一个 [ 或 { 到匹配的最后一个 ] 或 }，兼容前后多余文字和 ``` 包裹"""
+-    text = text.strip()
+-    start_candidates = [i for i in (text.find("["), text.find("{")) if i != -1]
+-    if not start_candidates:
+-        return json.loads(text)  # 直接解析，让原生报错信息抛出
+-    start = min(start_candidates)
+-    end_char = "]" if text[start] == "[" else "}"
+-    end = text.rfind(end_char)
+-    return json.loads(text[start:end + 1])
+-
+-def research_node(state: TeamState) -> dict:
+-    """研究员Agent：搜索并提取关键信息"""
+-    prompt = f"""你是一位AI技术研究专家。
+-    主题: {state['topic']}
+-
+-    请生成3个最有效的搜索查询来收集该主题的最新信息。
+-    返回JSON格式: {{"queries": ["query1", "query2", "query3"]}}"""
+-
+-    response = llm_smart.invoke(prompt)
+-    queries = extract_json(response.content)["queries"]
+-
+-    # 模拟搜索（实际项目中替换为真实搜索API调用）
+-    results = []
+-    for q in queries:
+-        results.append(
+-            f"[搜索: {q}] 命中5篇文章，摘要如下："
+-            f"文章围绕「{state['topic']}」展开，介绍了该方向的最新架构设计、"
+-            f"性能基准测试结果、典型落地案例以及社区 adoption 情况，"
+-            f"并对比了多种主流实现方案的优劣。"
+-        )
+-
+-    # 提取关键发现
+-    extract_prompt = f"""以下是内部检索系统返回的搜索结果摘要（真实数据，直接基于它们做提取，不要索要更多信息）。
+-
+-基于以下搜索结果，提取5个最关键的技术发现。
+-严格返回JSON数组格式，每个元素包含: title(标题), content(内容), source(来源)
+-
+-搜索结果:
+-{chr(10).join(results)}"""
+-
+-    findings_raw = llm_smart.invoke(extract_prompt).content
+-    try:
+-        findings = extract_json(findings_raw)
+-    except json.JSONDecodeError:
+-        print(f"!!! findings JSON 解析失败，模型原始返回:\n{findings_raw[:500]}")
+-        raise
+-
+-    return {
+-        "search_queries": queries,
+-        "raw_results": results,
+-        "key_findings": findings,
+-        "messages": [{"agent": "researcher", "action": "搜索完成", "findings": len(findings)}]
+-    }
+-
+-def analysis_node(state: TeamState) -> dict:
+-    """分析师Agent：深度技术分析"""
+-    findings_text = json.dumps(state["key_findings"], ensure_ascii=False, indent=2)
+-
+-    prompt = f"""你是一位资深技术分析师。基于以下研究发现，提供深度技术分析。
+-
+-    要求:
+-    1. 技术原理剖析（底层架构、核心算法）
+-    2. 与竞品的对比分析（至少3个维度）
+-    3. 实际应用场景和落地难度评估
+-    4. 未来6-12个月的发展预测
+-
+-    研究发现:
+-    {findings_text}"""
+-
+-    analysis = llm_smart.invoke(prompt).content
+-
+-    # 生成配套代码示例（用代码块格式，比JSON字符串更稳定）
+-    code_prompt = f"""基于分析内容，生成2个实用的代码示例。
+-    每个示例20-40行，覆盖不同技术点。
+-    用 ```python 代码块``` 逐个给出，不要输出JSON。
+-
+-    分析内容: {analysis[:2000]}"""
+-
+-    code_raw = llm_smart.invoke(code_prompt).content
+-    # 兼容模型可能的 ```python 前缀行：去掉首行语言标记
+-    cleaned = []
+-    for block in code_raw.split("```"):
+-        block = block.strip()
+-        if not block:
+-            continue
+-        lines = block.split("\n")
+-        if lines[0].strip().lower() in ("python", "py", "json"):
+-            block = "\n".join(lines[1:])
+-        if block.strip():
+-            cleaned.append(block.strip())
+-    code_examples = cleaned[:2] if cleaned else [code_raw]
+-
+-    return {
+-        "analysis": analysis,
+-        "code_examples": code_examples,
+-        "messages": [{"agent": "analyst", "action": "分析完成"}]
+-    }
+-
+-def writing_node(state: TeamState) -> dict:
+-    """编辑Agent：生成最终报告"""
+-    prompt = f"""你是一位技术自媒体编辑。基于以下素材撰写技术文章。
+-
+-    要求:
+-    - 开头用场景或数据切入，不要用"近年来"开头
+-    - 正文不少于2000字
+-    - 包含代码示例和对比表格
+-    - 语言专业但不晦涩，像资深工程师面对面聊技术
+-
+-    分析素材:
+-    {state['analysis']}
+-
+-    代码示例:
+-    {chr(10).join(state['code_examples'])}"""
+-
+-    report = llm_creative.invoke(prompt).content
+-
+-    return {
+-        "report": report,
+-        "messages": [{"agent": "writer", "action": "报告生成完成"}]
+-    }
+-
+-# ============ 4. 条件路由 ============
+-def route_after_research(state: TeamState) -> Literal["analyze", "retry"]:
+-    """搜索结果质量检查"""
+-    if len(state.get("key_findings", [])) < 3:
+-        return "retry"    # 发现太少，重新搜索
+-    return "analyze"      # 质量合格，进入分析
+-
+-def quality_check(state: TeamState) -> Literal["write", "revise"]:
+-    """分析质量检查"""
+-    if len(state.get("analysis", "")) < 500:
+-        return "revise"   # 分析太浅，要求修订
+-    return "write"        # 质量合格，进入写作
+-
+-# ============ 5. 构建工作流图 ============
+-builder = StateGraph(TeamState)
+-
+-# 添加节点
+-builder.add_node("research", research_node)
+-builder.add_node("analyze", analysis_node)
+-builder.add_node("write", writing_node)
+-
+-# 设置入口和边
+-builder.set_entry_point("research")
+-builder.add_conditional_edges("research", route_after_research, {"analyze": "analyze", "retry": "research"})
+-builder.add_conditional_edges("analyze", quality_check, {"write": "write", "revise": "analyze"})
+-builder.add_edge("write", END)
+-
+-# ============ 6. 编译并运行 ============
+-DB_URI = os.getenv("DATABASE_URL", "postgresql://admin:admin123@localhost:5432/agent_team")
+-
+-with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+-    checkpointer.setup()  # 首次运行：创建 checkpoints 表
+-    app = builder.compile(
+-        checkpointer=checkpointer,
+-        interrupt_before=["analyze"]  # 分析前暂停，等待人工确认
+-    )
+-
+-    config = {"configurable": {"thread_id": "research-2026-09-11"}}
+-
+-    # 启动研究任务
+-    result = app.invoke(
+-        {"topic": "2026年Multi-Agent框架最新技术演进和历史", "revision_count": 0},
+-        config=config,
+-    )
+-
+-    # interrupt_before=["analyze"]：首次执行到分析前会暂停，恢复后继续跑完
+-    if not result or "report" not in result:
+-        print(">>> 已在 analyze 节点前暂停（人工确认点），继续执行剩余流程...")
+-        result = app.invoke(None, config=config)
+-
+-    print(f"研究完成! 报告长度: {len(result['report'])}字")
+-    print(f"{result['report']}")
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+new file mode 100644
+index 0000000..5fc52e4
+--- /dev/null
++++ b/tests/test_pipeline.py
+@@ -0,0 +1,220 @@
++"""管道编排 I/O 矩阵单测（Story 1.2）。
++
++覆盖 spec I/O & Edge-Case Matrix 四场景：
++HAPPY_PATH / FILTER_RAISES / DEADLINE_EXCEEDED / INVALID_INPUT，
++外加占位模板集选择键（9 类意图 / 缺失 / 未知值）与 AI 身份披露前缀。
++"""
++
++import time
++from typing import Any
++
++from fastapi.testclient import TestClient
++
++from weiliao_agent.adapters.http import create_app
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_placeholder
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.pipeline import PipelineOrchestrator
++
++
++def _valid_payload(intent: str | None = "PRICE_INQUIRY") -> dict[str, Any]:
++    return {
++        "session_id": "sess-001",
++        "house_id": "house-001",
++        "turn": 1,
++        "intent": intent,
++        "timestamp": "2026-10-31T10:00:00+08:00",
++        "trace_id": "trace-001",
++    }
++
++
++class _RecordingFilter(Filter):
++    """透传过滤器，记录执行顺序，用于断言剩余过滤器被跳过。"""
++
++    def __init__(self, name: str, log: list[str]) -> None:
++        self.name = name
++        self._log = log
++
++    def process(self, envelope: Envelope) -> Envelope:
++        self._log.append(self.name)
++        return envelope
++
++
++class _RaisingFilter(Filter):
++    def __init__(self, name: str = "intent_router") -> None:
++        self.name = name
++
++    def process(self, envelope: Envelope) -> Envelope:
++        msg = "boom"
++        raise RuntimeError(msg)
++
++
++class _SlowFilter(Filter):
++    def __init__(self, name: str = "cache_lookup", delay_seconds: float = 1.0) -> None:
++        self.name = name
++        self._delay_seconds = delay_seconds
++
++    def process(self, envelope: Envelope) -> Envelope:
++        time.sleep(self._delay_seconds)
++        return envelope
++
++
++def test_happy_path_runs_full_chain_and_returns_placeholder_reply() -> None:
++    log: list[str] = []
++    orchestrator = PipelineOrchestrator(
++        filters=[
++            _RecordingFilter("intent_router", log),
++            _RecordingFilter("cache_lookup", log),
++            _RecordingFilter("risk_review", log),
++            _RecordingFilter("response_assembler", log),
++        ]
++    )
++    envelope = Envelope.model_validate(_valid_payload())
++
++    result = orchestrator.run(envelope)
++
++    assert log == ["intent_router", "cache_lookup", "risk_review", "response_assembler"]
++    assert result.degraded is False
++    assert result.failed_filter is None
++    assert result.trace_id == "trace-001"
++    assert result.reply.startswith(AI_DISCLOSURE_PREFIX)
++    assert result.reply != render_placeholder(None)  # 命中意图文案而非通用兜底
++
++
++def test_filter_exception_degrades_and_skips_remaining_filters() -> None:
++    log: list[str] = []
++    orchestrator = PipelineOrchestrator(
++        filters=[
++            _RecordingFilter("intent_router", log),
++            _RaisingFilter("cache_lookup"),
++            _RecordingFilter("risk_review", log),
++            _RecordingFilter("response_assembler", log),
++        ]
++    )
++    envelope = Envelope.model_validate(_valid_payload())
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is True
++    assert result.failed_filter == "cache_lookup"
++    assert result.trace_id == "trace-001"
++    assert result.reply.startswith(AI_DISCLOSURE_PREFIX)
++    assert log == ["intent_router"]  # 剩余过滤器未执行
++
++
++def test_slow_filter_times_out_immediately_without_waiting() -> None:
++    log: list[str] = []
++    budget = 0.2
++    orchestrator = PipelineOrchestrator(
++        filters=[
++            _RecordingFilter("intent_router", log),
++            _SlowFilter("cache_lookup", delay_seconds=5.0),
++            _RecordingFilter("risk_review", log),
++        ],
++        budget_seconds=budget,
++    )
++    envelope = Envelope.model_validate(_valid_payload())
++
++    started = time.monotonic()
++    result = orchestrator.run(envelope)
++    elapsed = time.monotonic() - started
++
++    assert result.degraded is True
++    assert result.failed_filter == "cache_lookup"
++    assert result.trace_id == "trace-001"
++    assert result.reply.startswith(AI_DISCLOSURE_PREFIX)
++    assert log == ["intent_router"]
++    # 不傻等：总耗时逼近内部预算，远小于慢过滤器的 5s。
++    assert elapsed < budget + 0.5
++
++
++def test_invalid_input_fails_closed_with_fallback_and_fresh_trace_id() -> None:
++    client = TestClient(create_app())
++
++    # 请求自带 trace_id 但缺其他必填字段：断言返回的是新生成 trace_id，
++    # 而非原样带回客户端传入值。
++    response = client.post("/v1/messages", json={"session_id": "sess-001", "trace_id": "trace-001"})
++
++    assert response.status_code == 200  # 非 5xx
++    body = response.json()
++    assert body["degraded"] is True
++    assert body["trace_id"]  # 新生成 trace_id
++    assert body["trace_id"] != "trace-001"
++    assert body["reply"].startswith(AI_DISCLOSURE_PREFIX)
++    assert body["failed_filter"] is None
++
++
++def test_malformed_json_fails_closed_with_fallback() -> None:
++    client = TestClient(create_app())
++
++    response = client.post(
++        "/v1/messages",
++        content=b"{not valid json",
++        headers={"Content-Type": "application/json"},
++    )
++
++    assert response.status_code == 200  # 非 5xx
++    body = response.json()
++    assert body["degraded"] is True
++    assert body["trace_id"]  # 新生成 trace_id
++    assert body["reply"].startswith(AI_DISCLOSURE_PREFIX)
++
++
++def test_invalid_input_bad_type_fails_closed() -> None:
++    client = TestClient(create_app())
++    payload = _valid_payload()
++    payload["trace_id"] = {"not": "a string"}
++
++    response = client.post("/v1/messages", json=payload)
++
++    assert response.status_code == 200
++    assert response.json()["degraded"] is True
++
++
++def test_valid_input_via_endpoint_executes_pipeline() -> None:
++    client = TestClient(create_app())
++
++    response = client.post("/v1/messages", json=_valid_payload("GREETING"))
++
++    assert response.status_code == 200
++    body = response.json()
++    assert body["degraded"] is False
++    assert body["failed_filter"] is None
++    assert body["trace_id"] == "trace-001"
++    assert body["reply"] == render_placeholder("GREETING")
++
++
++def test_default_chain_intent_router_defaults_missing_intent_to_unknown() -> None:
++    orchestrator = PipelineOrchestrator()
++    envelope = Envelope.model_validate(_valid_payload(intent=None))
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is False
++    assert result.reply == render_placeholder("UNKNOWN")
++
++
++def test_placeholder_template_selection_keys() -> None:
++    # 9 类意图各一条文案，全部携带 AI 身份披露前缀。
++    bodies: set[str] = set()
++    for intent in (
++        "GREETING",
++        "PRICE_INQUIRY",
++        "AVAILABILITY",
++        "LOCATION",
++        "PHOTO_REQUEST",
++        "NEGOTIATION",
++        "LOAN_POLICY",
++        "COMPLAINT",
++        "UNKNOWN",
++    ):
++        text = render_placeholder(intent)
++        assert text.startswith(AI_DISCLOSURE_PREFIX)
++        assert text != render_placeholder(None)
++        # 正文非空，且各意图文案互不重复（防空文案/静默复制）。
++        assert len(text) > len(AI_DISCLOSURE_PREFIX)
++        bodies.add(text)
++    assert len(bodies) == 9
++
++    # intent 缺失或不在 9 类枚举内：一律通用兜底。
++    assert render_placeholder(None) == render_placeholder("NOT_AN_INTENT")
+diff --git a/tests/test_session.py b/tests/test_session.py
+new file mode 100644
+index 0000000..5b6bc55
+--- /dev/null
++++ b/tests/test_session.py
+@@ -0,0 +1,272 @@
++"""会话状态单写者 I/O 矩阵单测（Story 1.3，fakeredis 驱动）。
++
++覆盖 spec I/O & Edge-Case Matrix：
++首条消息（初始化 turn=1）/ 连续消息（自增 + TTL 刷新）/ 并发 begin_turn
++（turn 唯一）/ 过期重开（从零初始化）/ 并发 increment_followup（计数精确）
++/ Redis 故障（端点层兜底，非 5xx）。
++"""
++
++import importlib
++from concurrent.futures import ThreadPoolExecutor
++from datetime import UTC, datetime, timedelta
++from typing import Any, cast
++
++import fakeredis
++import pytest
++import redis
++from fastapi.testclient import TestClient
++
++from weiliao_agent.adapters.http import create_app
++from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
++from weiliao_agent.session import SessionManager, SessionSnapshot
++from weiliao_agent.session.manager import DEFAULT_TTL_SECONDS, KEY_PREFIX
++
++TS_1 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=UTC)
++TS_2 = datetime(2026, 10, 31, 10, 1, 0, tzinfo=UTC)
++SESSION_ID = "sess-001"
++
++
++@pytest.fixture
++def client() -> fakeredis.FakeRedis:
++    return fakeredis.FakeRedis()
++
++
++@pytest.fixture
++def manager(client: fakeredis.FakeRedis) -> SessionManager:
++    return SessionManager(client)
++
++
++def _valid_payload() -> dict[str, Any]:
++    return {
++        "session_id": SESSION_ID,
++        "house_id": "house-001",
++        "timestamp": TS_1.isoformat(),
++        "trace_id": "trace-001",
++    }
++
++
++def test_first_message_initializes_state_with_turn_one(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    snapshot = manager.begin_turn(SESSION_ID, TS_1)
++
++    assert snapshot == SessionSnapshot(
++        turn=1, followup_count=0, handoff_status="none", last_message_at=TS_1
++    )
++    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
++
++
++def test_consecutive_messages_increment_turn_and_refresh_ttl(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++    client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 模拟中途 TTL 被压短
++
++    snapshot = manager.begin_turn(SESSION_ID, TS_2)
++
++    assert snapshot.turn == 2
++    assert snapshot.followup_count == 0
++    assert snapshot.last_message_at == TS_2
++    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS  # TTL 刷新
++
++
++def test_expired_session_reinitializes_from_zero(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    first = manager.begin_turn(SESSION_ID, TS_1)
++    manager.increment_followup(SESSION_ID)
++    client.delete(f"{KEY_PREFIX}{SESSION_ID}")  # TTL 到期，key 被清除
++
++    second = manager.begin_turn(SESSION_ID, TS_2)
++
++    assert first.turn == 1
++    assert second.turn == 1  # 从零重新开始，无残留
++    assert second.followup_count == 0
++
++
++def test_read_snapshot_returns_none_for_unknown_session(manager: SessionManager) -> None:
++    assert manager.read_snapshot("no-such-session") is None
++
++
++def test_read_snapshot_reflects_written_state(manager: SessionManager) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++    manager.increment_followup(SESSION_ID)
++
++    snapshot = manager.read_snapshot(SESSION_ID)
++
++    assert snapshot is not None
++    assert snapshot.turn == 1
++    assert snapshot.followup_count == 1
++    assert snapshot.handoff_status == "none"
++    assert snapshot.last_message_at == TS_1
++
++
++def test_concurrent_begin_turn_yields_unique_turns(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # fakeredis 服务端语义串行执行 Lua，并发提交验证 turn 唯一且不丢序。
++    threads = 25
++    with ThreadPoolExecutor(max_workers=threads) as pool:
++        turns = list(
++            pool.map(
++                lambda i: manager.begin_turn(SESSION_ID, TS_1 + timedelta(seconds=i)).turn,
++                range(threads),
++            )
++        )
++
++    assert sorted(turns) == list(range(1, threads + 1))
++    snapshot = manager.read_snapshot(SESSION_ID)
++    assert snapshot is not None
++    assert snapshot.turn == threads
++
++
++def test_concurrent_increment_followup_counts_exactly(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++    client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 验证每次自增都刷新 TTL
++    threads = 50
++    with ThreadPoolExecutor(max_workers=threads) as pool:
++        counts = list(pool.map(lambda _i: manager.increment_followup(SESSION_ID), range(threads)))
++
++    assert sorted(counts) == list(range(1, threads + 1))  # 各次返回值互不重复
++    snapshot = manager.read_snapshot(SESSION_ID)
++    assert snapshot is not None
++    assert snapshot.followup_count == threads
++    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
++
++
++def test_increment_before_begin_turn_preserves_followup_count(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # increment_followup 先执行：hash 已存在但无 turn 字段。begin_turn
++    # 不得误判为新会话而把已有计数清零。
++    manager.increment_followup(SESSION_ID)
++    manager.increment_followup(SESSION_ID)
++
++    snapshot = manager.begin_turn(SESSION_ID, TS_1)
++
++    assert snapshot.turn == 1
++    assert snapshot.followup_count == 2
++
++
++def test_begin_turn_backfills_only_missing_fields(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # 不完整 hash（有 turn / followup_count，缺 handoff_status /
++    # last_message_at）：仅补缺失字段，已有值保留。
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    client.hset(key, mapping={"turn": 5, "followup_count": 3})
++
++    snapshot = manager.begin_turn(SESSION_ID, TS_1)
++
++    assert snapshot.turn == 6
++    assert snapshot.followup_count == 3
++    assert snapshot.handoff_status == "none"
++    assert snapshot.last_message_at == TS_1
++
++
++def test_read_snapshot_returns_none_for_incomplete_hash(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # 缺 turn / last_message_at 的 hash 不是合法会话快照：返回 None。
++    client.hset(f"{KEY_PREFIX}{SESSION_ID}", "followup_count", 3)
++
++    assert manager.read_snapshot(SESSION_ID) is None
++
++
++class _FailingSessionManager:
++    """begin_turn 抛 redis 连接异常的替身，模拟 Redis 故障 fail-closed。"""
++
++    def begin_turn(self, session_id: str, timestamp: datetime) -> SessionSnapshot:
++        import redis
++
++        msg = "Connection refused"
++        raise redis.ConnectionError(msg)
++
++
++def test_endpoint_falls_back_when_redis_is_down() -> None:
++    app = create_app(session_manager=_FailingSessionManager())  # type: ignore[arg-type]
++    client = TestClient(app)
++
++    response = client.post("/v1/messages", json=_valid_payload())
++
++    assert response.status_code == 200  # 非 5xx
++    body = response.json()
++    assert body["degraded"] is True
++    assert body["trace_id"] == "trace-001"  # 兜底仍携带原 trace_id
++    assert body["reply"].startswith(AI_DISCLOSURE_PREFIX)
++
++
++def test_endpoint_backfills_turn_before_pipeline(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    from weiliao_agent.models.envelope import Envelope
++    from weiliao_agent.pipeline import PipelineOrchestrator
++
++    seen_turns: list[int] = []
++
++    class _TurnProbe:
++        """透传过滤器，记录入管道时的 turn（入管道前赋值落点）。"""
++
++        name = "turn_probe"
++
++        def process(self, envelope: Envelope) -> Envelope:
++            seen_turns.append(envelope.turn)
++            return envelope
++
++    app = create_app(
++        orchestrator=PipelineOrchestrator(filters=[_TurnProbe()]),
++        session_manager=manager,
++    )
++    http = TestClient(app)
++
++    first = http.post("/v1/messages", json=_valid_payload())
++    second = http.post(
++        "/v1/messages",
++        json={**_valid_payload(), "timestamp": TS_2.isoformat(), "turn": 99},
++    )
++
++    assert first.status_code == 200
++    assert first.json()["degraded"] is False
++    assert second.status_code == 200
++    assert second.json()["degraded"] is False
++    # 两条消息入管道前均获服务端快照回填：turn 单调唯一，客户端自带
++    # 值（99）被覆盖而非透传。
++    assert seen_turns == [1, 2]
++
++
++def test_main_composition_root_wires_session_manager(monkeypatch: pytest.MonkeyPatch) -> None:
++    # 组合根冒烟：main.py 是生产唯一注入 SessionManager 的位置。patch
++    # Redis.from_url 为 fakeredis 后导入 main，端点须完成 turn 回填。
++    fake = fakeredis.FakeRedis()
++    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
++    import weiliao_agent.main as main_module
++
++    importlib.reload(main_module)
++
++    http = TestClient(main_module.app)
++    response = http.post("/v1/messages", json=_valid_payload())
++
++    assert response.status_code == 200
++    assert response.json()["degraded"] is False
++    stored_turn = fake.hget(f"{KEY_PREFIX}{SESSION_ID}", "turn")
++    assert int(cast("bytes", stored_turn)) == 1  # turn 已由组合根的 SessionManager 写入
++
++
++def test_in_flight_message_continues_with_snapshot_after_key_expiry(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    """矩阵行「过期瞬间在途」：入管道后 key 过期，按入管道快照继续，不中断。"""
++    from weiliao_agent.models.envelope import Envelope
++    from weiliao_agent.pipeline import PipelineOrchestrator
++
++    snapshot = manager.begin_turn(SESSION_ID, TS_1)
++    client.delete(f"{KEY_PREFIX}{SESSION_ID}")  # 模拟处理中途 key 被 TTL 清除
++
++    envelope = Envelope.model_validate(_valid_payload())
++    envelope.turn = snapshot.turn
++    result = PipelineOrchestrator().run(envelope)
++
++    assert envelope.turn == 1  # 在途消息持有入管道时快照，不随 key 过期而失效
++    assert result.degraded is False  # 处理不中断，正常出管道
+diff --git a/tests/test_tracing.py b/tests/test_tracing.py
+new file mode 100644
+index 0000000..6bd3634
+--- /dev/null
++++ b/tests/test_tracing.py
+@@ -0,0 +1,399 @@
++"""Langfuse 追踪脚手架单测（Story 1.5）。
++
++覆盖 spec I/O & Edge-Case Matrix 四行：
++- 正常消息：trace_id 服务端生成回填、响应携带、过滤器 span 记录；
++- Langfuse 未配置：disabled 冒烟，行为与 Story 1.4 一致；
++- 过滤器异常降级：trace_id 不变、降级事件含归因过滤器名；
++- SDK 调用抛错：注入抛错 client，管道结果不受影响。
++外加成本追踪封装（Epic 4 消费面）与最终下发文本记录。
++"""
++
++import logging
++import re
++from collections.abc import Iterator
++from typing import Any
++
++import pytest
++from fastapi.testclient import TestClient
++
++from weiliao_agent.adapters.http import create_app
++from weiliao_agent.filters.base import Filter
++from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_placeholder
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.observability import tracing
++from weiliao_agent.pipeline import PipelineOrchestrator
++from weiliao_agent.session import SessionSnapshot
++
++_TRACE_ID_HEX = re.compile(r"^[0-9a-f]{32}$")
++
++
++class _FakeSpan:
++    """最小 span 替身：只实现脚手架会调用的 update。"""
++
++    def __init__(self) -> None:
++        self.updates: list[dict[str, Any]] = []
++
++    def update(self, **kwargs: Any) -> None:
++        self.updates.append(kwargs)
++
++
++class _FakeObservationCM:
++    """最小上下文管理器替身：记录 enter/exit 与构造参数。"""
++
++    def __init__(self, client: "_FakeLangfuse", kwargs: dict[str, Any]) -> None:
++        self.kwargs = kwargs
++        self.entered = False
++        self.exited = False
++        self.span = _FakeSpan()
++        self._client = client
++
++    def __enter__(self) -> _FakeSpan:
++        if self._client.raise_on_enter:
++            msg = "sdk enter boom"
++            raise RuntimeError(msg)
++        self.entered = True
++        self._client.entered_spans.append(self)
++        return self.span
++
++    def __exit__(self, *exc_info: Any) -> bool:
++        self.exited = True
++        return False
++
++
++class _FakeLangfuse:
++    """Langfuse client 替身：记录全部观测调用，可按需抛错。"""
++
++    def __init__(self, *, raise_on_start: bool = False, raise_on_enter: bool = False) -> None:
++        self.raise_on_start = raise_on_start
++        self.raise_on_enter = raise_on_enter
++        self.observations: list[dict[str, Any]] = []
++        self.entered_spans: list[_FakeObservationCM] = []
++        self.events: list[dict[str, Any]] = []
++
++    def start_as_current_observation(self, **kwargs: Any) -> _FakeObservationCM:
++        self.observations.append(kwargs)
++        if self.raise_on_start:
++            msg = "sdk start boom"
++            raise RuntimeError(msg)
++        return _FakeObservationCM(self, kwargs)
++
++    def create_event(self, **kwargs: Any) -> None:
++        self.events.append(kwargs)
++
++
++@pytest.fixture
++def fake_langfuse() -> Iterator[_FakeLangfuse]:
++    client = _FakeLangfuse()
++    tracing.set_langfuse_client(client)
++    yield client
++    tracing.set_langfuse_client(None)
++
++
++def _payload(**overrides: Any) -> dict[str, Any]:
++    payload: dict[str, Any] = {
++        "session_id": "sess-001",
++        "house_id": "house-001",
++        "timestamp": "2026-10-31T10:00:00+08:00",
++        "trace_id": "ab" * 16,
++        "intent": "PRICE_INQUIRY",
++        "message": "这套房多少钱？",
++    }
++    payload.update(overrides)
++    return payload
++
++
++class _PassThroughFilter(Filter):
++    def __init__(self, name: str) -> None:
++        self.name = name
++
++    def process(self, envelope: Envelope) -> Envelope:
++        return envelope
++
++
++class _RaisingFilter(Filter):
++    name = "cache_lookup"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        msg = "boom"
++        raise RuntimeError(msg)
++
++
++class _SleepingFilter(Filter):
++    """睡满预算的过滤器：触发 FutureTimeoutError 超时降级（slow_filter）。"""
++
++    name = "risk_review"
++
++    def process(self, envelope: Envelope) -> Envelope:
++        import time
++
++        time.sleep(1.0)
++        return envelope
++
++
++class _FailingSessionManager:
++    """begin_turn 抛 redis 连接异常的替身，模拟 Redis 故障 fail-closed。"""
++
++    def begin_turn(self, session_id: str, timestamp: Any) -> SessionSnapshot:
++        import redis
++
++        msg = "Connection refused"
++        raise redis.ConnectionError(msg)
++
++
++def _four_pass_through_filters() -> list[Filter]:
++    return [
++        _PassThroughFilter("intent_router"),
++        _PassThroughFilter("cache_lookup"),
++        _PassThroughFilter("risk_review"),
++        _PassThroughFilter("response_assembler"),
++    ]
++
++
++def test_missing_trace_id_backfilled_and_returned(fake_langfuse: _FakeLangfuse) -> None:
++    """矩阵行 1：trace_id 缺失 → 服务端生成回填；响应携带；全链路同一 trace。"""
++    orchestrator = PipelineOrchestrator(filters=_four_pass_through_filters())
++    envelope = Envelope.model_validate(_payload(trace_id=None))
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is False
++    assert result.trace_id is not None
++    assert _TRACE_ID_HEX.fullmatch(result.trace_id)  # 服务端生成（Langfuse 口径）
++    # 响应 trace_id 与信封回填值一致（客户端无关）。
++    assert envelope.trace_id == result.trace_id
++    # 消息级根 span + 4 个过滤器 span，全部挂在同一 trace。
++    names = [obs["name"] for obs in fake_langfuse.observations]
++    assert "pipeline.message" in names
++    assert names.count("filter:intent_router") == 1
++    assert names.count("filter:cache_lookup") == 1
++    assert names.count("filter:risk_review") == 1
++    assert names.count("filter:response_assembler") == 1
++    for obs in fake_langfuse.observations:
++        assert obs["trace_context"]["trace_id"] == result.trace_id
++    # 根 span 携带买家原文与三文本字段口径（resolved 当前恒等于原文）。
++    root = next(o for o in fake_langfuse.observations if o["name"] == "pipeline.message")
++    assert root["metadata"]["message"] == "这套房多少钱？"
++    assert root["metadata"]["resolved_message"] == "这套房多少钱？"
++
++
++def test_every_filter_records_span_and_delivery_on_trace(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    """矩阵行 1 补全：过滤器 span 全记录、最终下发文本写入 trace。"""
++    orchestrator = PipelineOrchestrator(filters=_four_pass_through_filters())
++    envelope = Envelope.model_validate(_payload())
++
++    result = orchestrator.run(envelope)
++
++    assert result.trace_id == "ab" * 16  # payload 携带值透传，全链路同一 trace
++    filter_spans = [
++        s for s in fake_langfuse.entered_spans if s.kwargs["name"].startswith("filter:")
++    ]
++    assert len(filter_spans) == 4
++    assert all(s.exited for s in filter_spans)
++    deliveries = [e for e in fake_langfuse.events if e["name"] == "pipeline.delivery"]
++    assert len(deliveries) == 1
++    assert deliveries[0]["output"] == result.reply
++    assert deliveries[0]["metadata"]["delivered_text"] == result.reply
++    assert deliveries[0]["metadata"]["degraded"] is False
++
++
++def test_filter_exception_records_degradation_with_attribution(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    """矩阵行 3：降级兜底后 trace_id 不变，降级事件含归因过滤器名。"""
++    orchestrator = PipelineOrchestrator(
++        filters=[
++            _PassThroughFilter("intent_router"),
++            _RaisingFilter(),
++            _PassThroughFilter("response_assembler"),
++        ]
++    )
++    envelope = Envelope.model_validate(_payload())
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is True
++    assert result.failed_filter == "cache_lookup"
++    assert result.trace_id == "ab" * 16
++    degradations = [e for e in fake_langfuse.events if e["name"] == "pipeline.degradation"]
++    assert len(degradations) == 1
++    assert degradations[0]["level"] == "ERROR"
++    assert degradations[0]["metadata"]["failed_filter"] == "cache_lookup"
++    # 失败过滤器 span 标记 ERROR 并原样退出。
++    failed_span = next(
++        s for s in fake_langfuse.entered_spans if s.kwargs["name"] == "filter:cache_lookup"
++    )
++    assert failed_span.exited is True
++    assert any(u.get("level") == "ERROR" for u in failed_span.span.updates)
++    # 降级路径仍补记最终下发文本（兜底文案）。
++    deliveries = [e for e in fake_langfuse.events if e["name"] == "pipeline.delivery"]
++    assert len(deliveries) == 1
++    assert deliveries[0]["output"] == render_placeholder("PRICE_INQUIRY")
++
++
++def test_raising_sdk_client_does_not_affect_pipeline_result() -> None:
++    """矩阵行 4：SDK 调用抛任意异常 → 追踪跳过，管道结果不受影响。"""
++    for raise_on_start, raise_on_enter in ((True, False), (False, True)):
++        tracing.set_langfuse_client(
++            _FakeLangfuse(raise_on_start=raise_on_start, raise_on_enter=raise_on_enter)
++        )
++        try:
++            orchestrator = PipelineOrchestrator(filters=_four_pass_through_filters())
++            envelope = Envelope.model_validate(_payload(trace_id=None))
++
++            result = orchestrator.run(envelope)
++
++            assert result.degraded is False
++            assert result.failed_filter is None
++            assert result.reply.startswith(AI_DISCLOSURE_PREFIX)
++            assert _TRACE_ID_HEX.fullmatch(result.trace_id)
++        finally:
++            tracing.set_langfuse_client(None)
++
++
++def test_record_generation_records_cost_on_trace(fake_langfuse: _FakeLangfuse) -> None:
++    """AC 4：成本追踪封装挂到当前消息 trace（Epic 4 消费面，替身断言）。"""
++    tracing.record_generation(
++        "ab" * 16,
++        model="gpt-4o-mini",
++        usage={"input": 10, "output": 5, "total": 15},
++        cost={"input": 0.0001, "output": 0.0002, "total": 0.0003},
++    )
++
++    generations = [o for o in fake_langfuse.observations if o.get("as_type") == "generation"]
++    assert len(generations) == 1
++    assert generations[0]["trace_context"]["trace_id"] == "ab" * 16
++    assert generations[0]["model"] == "gpt-4o-mini"
++    assert generations[0]["usage_details"] == {"input": 10, "output": 5, "total": 15}
++    assert generations[0]["cost_details"] == {"input": 0.0001, "output": 0.0002, "total": 0.0003}
++
++
++def test_non_hex_trace_id_passes_through_with_tracing_skipped(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    """评审补丁：非 32-hex 携带值原样流经管道与响应，Langfuse 记录全跳过。"""
++    orchestrator = PipelineOrchestrator(filters=_four_pass_through_filters())
++    envelope = Envelope.model_validate(_payload(trace_id="trace-001"))
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is False
++    assert result.trace_id == "trace-001"  # 透传，服务端不重写
++    assert fake_langfuse.observations == []  # 非法 id：追踪整体跳过
++    assert fake_langfuse.events == []
++
++
++def test_deadline_exhaustion_records_slow_filter_attribution(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    """评审补丁：预算耗尽路径降级事件带 slow_filter 归因（确定性负预算）。"""
++    orchestrator = PipelineOrchestrator(
++        filters=_four_pass_through_filters(), budget_seconds=-1.0
++    )
++    envelope = Envelope.model_validate(_payload())
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is True
++    assert result.failed_filter == "intent_router"  # 首跳剩余预算即耗尽
++    assert result.trace_id == "ab" * 16
++    degradations = [e for e in fake_langfuse.events if e["name"] == "pipeline.degradation"]
++    assert len(degradations) == 1
++    assert degradations[0]["metadata"]["slow_filter"] == "intent_router"
++    assert degradations[0]["metadata"]["failed_filter"] is None
++
++
++def test_slow_filter_timeout_marks_span_error(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    """评审补丁：过滤器真超时（FutureTimeoutError）路径同样记录归因与 ERROR span。"""
++    orchestrator = PipelineOrchestrator(
++        filters=[
++            _PassThroughFilter("intent_router"),
++            _SleepingFilter(),
++            _PassThroughFilter("response_assembler"),
++        ],
++        budget_seconds=0.2,
++    )
++    envelope = Envelope.model_validate(_payload())
++
++    result = orchestrator.run(envelope)
++
++    assert result.degraded is True
++    assert result.failed_filter == "risk_review"
++    degradations = [e for e in fake_langfuse.events if e["name"] == "pipeline.degradation"]
++    assert len(degradations) == 1
++    assert degradations[0]["metadata"]["slow_filter"] == "risk_review"
++    slow_span = next(
++        s for s in fake_langfuse.entered_spans if s.kwargs["name"] == "filter:risk_review"
++    )
++    assert any(u.get("level") == "ERROR" for u in slow_span.span.updates)
++
++
++def test_degradation_record_survives_raising_create_event() -> None:
++    """矩阵行 3 兜底：降级事件记录本身再抛异常也吞掉，应答不受影响。"""
++
++    class _EventRaisingClient(_FakeLangfuse):
++        def create_event(self, **kwargs: Any) -> None:
++            msg = "event boom"
++            raise RuntimeError(msg)
++
++    tracing.set_langfuse_client(_EventRaisingClient())
++    try:
++        orchestrator = PipelineOrchestrator(
++            filters=[_PassThroughFilter("intent_router"), _RaisingFilter()]
++        )
++        envelope = Envelope.model_validate(_payload())
++
++        result = orchestrator.run(envelope)
++
++        assert result.degraded is True
++        assert result.failed_filter == "cache_lookup"
++        assert result.trace_id == "ab" * 16
++    finally:
++        tracing.set_langfuse_client(None)
++
++
++def test_langfuse_unconfigured_pipeline_behaves_normally(
++    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
++) -> None:
++    """矩阵行 2：无环境变量 → SDK disabled 全 no-op，行为与 Story 1.4 一致。"""
++    for var in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST", "LANGFUSE_BASEURL"):
++        monkeypatch.delenv(var, raising=False)
++    tracing.set_langfuse_client(None)  # 强制惰性初始化走 disabled 单例
++
++    with caplog.at_level(logging.WARNING, logger="langfuse"):
++        client = TestClient(create_app())
++        response = client.post("/v1/messages", json=_payload())
++        health = client.get("/health")
++
++    assert response.status_code == 200
++    body = response.json()
++    assert body["degraded"] is False
++    assert body["trace_id"] == "ab" * 16
++    assert body["reply"] == render_placeholder("PRICE_INQUIRY")
++    # 矩阵行 2 子句：健康检查同样不受 SDK disabled 影响（200 ready）。
++    assert health.status_code == 200
++    assert health.json() == {"status": "ready"}
++    # 禁用 warning 仅一次（SDK 单例收敛）。
++    disabled_warnings = [r for r in caplog.records if "disabled" in r.getMessage().lower()]
++    assert len(disabled_warnings) == 1
++
++
++def test_redis_down_fallback_generates_trace_id_when_payload_omits_it() -> None:
++    """评审补丁：trace_id 放宽为可选后，Redis 故障兜底对无 trace_id
++    payload 必须仍返回非空（新生成）trace_id——契约「错误应答携带
++    trace_id」在故障路径上不可静默破坏。"""
++    app = create_app(session_manager=_FailingSessionManager())  # type: ignore[arg-type]
++    client = TestClient(app)
++    payload = _payload()
++    del payload["trace_id"]
++
++    response = client.post("/v1/messages", json=payload)
++
++    assert response.status_code == 200  # 非 5xx
++    body = response.json()
++    assert body["degraded"] is True
++    assert body["trace_id"]  # 非空，兜底路径新生成
++    assert _TRACE_ID_HEX.fullmatch(body["trace_id"]) is None  # 与编排器口径无关，仅非空即可

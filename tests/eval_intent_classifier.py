@@ -17,22 +17,14 @@ import csv
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, get_args
 
 from weiliao_agent.filters.intent_router import IntentClassifier
 from weiliao_agent.models.intent import IntentClassification, IntentTag
 
-ALL_TAGS: tuple[IntentTag, ...] = (
-    "GREETING",
-    "PRICE_INQUIRY",
-    "AVAILABILITY",
-    "LOCATION",
-    "PHOTO_REQUEST",
-    "NEGOTIATION",
-    "LOAN_POLICY",
-    "COMPLAINT",
-    "UNKNOWN",
-)
+# 9 类权威清单经 Literal 派生（评审补丁：手抄字面量曾与 2.1 模式漂移，
+# IntentTag 增删类时覆盖率/门禁口径静默失效）。
+ALL_TAGS: tuple[IntentTag, ...] = get_args(IntentTag)
 
 MIN_EVAL_ROWS = 1000
 GATE_ACCURACY = 0.9
@@ -318,7 +310,9 @@ def _source_of(classifier: IntentClassifier) -> str:
 
 def _load_csv(path: str) -> list[tuple[str, IntentTag]]:
     rows: list[tuple[str, IntentTag]] = []
-    with open(path, newline="", encoding="utf-8") as handle:
+    # utf-8-sig：容忍 Excel/WPS 另存 CSV 的 BOM（评审补丁；utf-8 下首
+    # 列名解析为 "\ufefftext" 致列校验 SystemExit，报错具误导性）。
+    with open(path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or not {"text", "label"} <= set(reader.fieldnames):
             msg = f"CSV must have columns text,label; got {reader.fieldnames}"

@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -177,7 +178,52 @@ def test_negative_words_normalized_in_constructor() -> None:
     assert _assess(assessor, message="你好").triggered is False
 
 
+# ---- 匹配归一化（2026-11-11 裁决 A：NFC/NFKC + 剥零宽 + 简繁折叠） ----
+
+
+def test_negative_word_traditional_variant_hits_after_normalization() -> None:
+    # 繁体消息折叠为简体后命中简体词表——「騙子」不再绕过负面通道。
+    assessor = _assessor()
+    assert _assess(assessor, message="你們這些騙子").conditions == ["骗子"]
+
+
+def test_negative_word_zero_width_bypass_closed() -> None:
+    # 零宽字符插入（骗\u200b子）剥除后命中——trivial 绕过关闭。
+    assessor = _assessor()
+    assert _assess(assessor, message="你这个骗\u200b子").conditions == ["骗子"]
+    assert _assess(assessor, message="你这个骗\ufeff子").conditions == ["骗子"]
+
+
+def test_negative_word_full_width_folds_to_half_width_domain() -> None:
+    # NFKC 全半角折叠：词表含全角形态时两侧同口径（词条侧构造归一
+    # 已覆盖；此处锁消息侧折叠不破坏既有简体命中）。
+    assessor = HardTriggerAssessor(negative_words=["ＱＱ诈骗"])
+    assert _assess(assessor, message="你这是QQ诈骗").conditions == ["QQ诈骗"]
+
+
+def test_negative_word_substring_semantics_unchanged_for_benign_collision() -> None:
+    # 裁决 A 保持子串语义：「垃圾分类」仍命中「垃圾」——误触发治理
+    # 归风控词表瘦身，本补丁不改动匹配语义（锁行为不漂移）。
+    assessor = _assessor()
+    assert _assess(assessor, message="小区垃圾分类几点").conditions == ["垃圾"]
+
+
+def test_normalized_word_list_matches_normalized_message() -> None:
+    # 词表繁体/全角形态加载时归一为简体半角——与消息侧同口径。
+    assessor = HardTriggerAssessor(negative_words=["騙子", "ＱＱ诈骗"])
+    assert assessor.negative_words == frozenset({"骗子", "QQ诈骗"})
+    assert _assess(assessor, message="你这个骗子").conditions == ["骗子"]
+
+
 # ---- 词表加载 ----
+
+
+def test_load_negative_words_strips_bom(tmp_path: Any) -> None:
+    # utf-8-sig：Windows/Excel 保存的词表首行带 BOM——首词条不再
+    # 永久失配（Epic 5 code review 补丁）。
+    path = tmp_path / "words.txt"
+    path.write_bytes("\ufeff骗子\n垃圾\n".encode("utf-8"))
+    assert load_negative_words(path) == frozenset({"骗子", "垃圾"})
 
 
 def test_load_negative_words_skips_blanks_and_comments(tmp_path: Any) -> None:
@@ -273,6 +319,20 @@ class _RecordingMarker:
         self.calls.append((session_id, conditions))
 
 
+class _FlakyMarker:
+    """前 N 次抛错、之后成功的 marker 替身（重试矩阵用）。"""
+
+    def __init__(self, *, failures: int) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+        self._failures = failures
+
+    def __call__(self, session_id: str, conditions: list[str]) -> None:
+        self.calls.append((session_id, conditions))
+        if len(self.calls) <= self._failures:
+            msg = "redis boom"
+            raise RuntimeError(msg)
+
+
 def _router(
     tag: str = "GREETING",
     *,
@@ -320,8 +380,10 @@ def test_router_miss_records_trace_but_does_not_mark(fake_langfuse: Any) -> None
 
 
 def test_router_followup_count_at_threshold_triggers(fake_langfuse: Any) -> None:
-    def recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int]:
-        return 3, 5
+    # 2026-11-11 裁决 B：阈值判定取 per-tag 聚合计数——per-anchor 被
+    # 锚定稀释（=1）也不影响「同一意图 ≥3」命中。
+    def recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int, int]:
+        return 1, 5, 3
 
     result = _router("PRICE_INQUIRY", recorder=recorder).process(_envelope())
     assert result.handoff is not None
@@ -329,12 +391,63 @@ def test_router_followup_count_at_threshold_triggers(fake_langfuse: Any) -> None
     assert result.handoff.conditions == [CONDITION_FOLLOWUP_THRESHOLD]
 
 
+def test_router_followup_per_anchor_dilution_still_triggers(
+    fake_langfuse: Any,
+) -> None:
+    # 裁决 B 回归锚点：per-(tag, anchor) 细键被交替锚定稀释（任一键
+    # 永不达 3）时，per-tag 聚合仍使硬触发在第 3 次同意图消息命中——
+    # 若实现退回 per-anchor 取数，本条即红。
+    per_anchor: dict[str, int] = {}
+    state = {"per_tag": 0}
+    anchors = iter(["house:h1", "none", "house:h1"])
+
+    def recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int, int]:
+        anchor = next(anchors)
+        per_anchor[anchor] = per_anchor.get(anchor, 0) + 1
+        state["per_tag"] += 1
+        return per_anchor[anchor], 0, state["per_tag"]
+
+    filter_ = _router("PRICE_INQUIRY", recorder=recorder)
+    first = filter_.process(_envelope())
+    second = filter_.process(_envelope())
+    third = filter_.process(_envelope())
+
+    assert not first.handoff.triggered
+    assert not second.handoff.triggered
+    # per-anchor 分别只有 2 与 1（细键口径下永不达 3）；per-tag 聚合 = 3。
+    assert third.handoff.conditions == [CONDITION_FOLLOWUP_THRESHOLD]
+
+
+def test_router_followup_per_tag_reaches_threshold_at_third_message(
+    fake_langfuse: Any,
+) -> None:
+    # 语义钉死（裁决 B）：「同一意图 ≥3」= 该意图第 3 次消息即命中
+    # （per-tag 聚合 = 3），第 1、2 次不触发。
+    per_tag = {"n": 0}
+
+    def recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int, int]:
+        per_tag["n"] += 1
+        return per_tag["n"], 0, per_tag["n"]
+
+    filter_ = _router("PRICE_INQUIRY", recorder=recorder)
+    first = filter_.process(_envelope())
+    second = filter_.process(_envelope())
+    third = filter_.process(_envelope())
+
+    assert first.handoff is not None and not first.handoff.triggered
+    assert second.handoff is not None and not second.handoff.triggered
+    assert third.handoff is not None
+    assert third.handoff.conditions == [CONDITION_FOLLOWUP_THRESHOLD]
+
+
 def test_router_recorder_failure_followup_not_triggered_but_redline_assessed(
     fake_langfuse: Any,
 ) -> None:
     # Redis 故障 fail-safe（沿用 2.3 语义）：追问条件不触发，但其余
     # 条件照常判定——红线意图在 Redis 故障时绝不得漏放。
-    def failing_recorder(session_id: str, tag: str, anchor: str) -> tuple[int, int]:
+    def failing_recorder(
+        session_id: str, tag: str, anchor: str
+    ) -> tuple[int, int, int]:
         msg = "redis down"
         raise RuntimeError(msg)
 
@@ -383,6 +496,66 @@ def test_router_marker_failure_fails_safe_and_records_trace(fake_langfuse: Any) 
     assert not [
         e for e in fake_langfuse.events if e["name"] == "intent.classification_failure"
     ]
+
+
+def test_router_marker_failure_retries_then_succeeds(
+    fake_langfuse: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 2026-11-11 裁决 A：marker 写失败有界重试——瞬时故障在重试内
+    # 成功则终态落盘、无失败事件、无 ERROR 日志。
+    marker = _FlakyMarker(failures=2)
+    with caplog.at_level(logging.ERROR):
+        result = _router("NEGOTIATION", marker=marker).process(_envelope())
+
+    assert result.handoff is not None
+    assert result.handoff.triggered is True
+    assert len(marker.calls) == 3  # 初败 2 次 + 末次成功
+    assert "handoff.mark_failed" not in [
+        e["name"] for e in fake_langfuse.events
+    ]
+    assert not [
+        r for r in caplog.records if r.levelno >= logging.ERROR
+    ]
+
+
+def test_router_marker_failure_exhaustion_logs_error(
+    fake_langfuse: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 裁决 A：重试耗尽——会话未入终态（人机混答窗口）必须本地可观测：
+    # ERROR 日志（可检索可告警）+ trace 失败事件双留痕。
+    with caplog.at_level(logging.ERROR):
+        _router("NEGOTIATION", marker=_FlakyMarker(failures=99)).process(_envelope())
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("handoff mark failed" in r.getMessage() for r in errors)
+    assert any("sess-001" in r.getMessage() for r in errors)
+    (event,) = [e for e in fake_langfuse.events if e["name"] == "handoff.mark_failed"]
+    assert event["level"] == "ERROR"
+
+
+def test_router_assessor_exception_logs_local_error(
+    fake_langfuse: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 补丁：assessment_error fail-closed 路径补本地 ERROR 日志——
+    # 评估器持续故障会把全量消息误判触发，仅 Langfuse 可见时未配置
+    # Langfuse 的部署零留痕。
+    class _BoomAssessor:
+        def assess(self, **kwargs: Any) -> HandoffAssessment:
+            msg = "assess boom"
+            raise RuntimeError(msg)
+
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier("GREETING"),
+        handoff_assessor=_BoomAssessor(),  # type: ignore[arg-type]
+        handoff_marker=_RecordingMarker(),
+    )
+    with caplog.at_level(logging.ERROR):
+        result = filter_.process(_envelope())
+
+    assert result.handoff is not None
+    assert result.handoff.conditions == [CONDITION_ASSESSMENT_ERROR]
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("handoff assessment failed" in r.getMessage() for r in errors)
 
 
 def test_router_non_text_media_triggers_without_classifier_output_dependency(
@@ -506,6 +679,33 @@ def test_pipeline_pre_assessed_envelope_short_circuits_first_filter() -> None:
     result = orchestrator.run(envelope)
     assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     assert log == ["cache_lookup"]  # 首跳透传执行后立即短路，无后续跳
+
+
+class _RecordingCommandSender:
+    """HandoffCommandSender 协议替身：记录载荷 reply 实参。"""
+
+    def __init__(self) -> None:
+        self.replies: list[str] = []
+
+    def send_command(self, envelope: Envelope, *, reply: str) -> None:
+        self.replies.append(reply)
+
+
+def test_pipeline_handoff_payload_reply_carries_ai_prefix(
+    fake_langfuse: Any,
+) -> None:
+    # Epic 5 code review 补丁：载荷当前轮 agent_reply 与买家实收逐字节
+    # 一致（均带 AI 披露前缀）——与同 payload 历史轮（转写落盘带前缀）
+    # 及 5.2 决策 Q1-A「买家所见逐字原文」对齐。
+    sender = _RecordingCommandSender()
+    orchestrator = PipelineOrchestrator(
+        filters=[_router("NEGOTIATION")],
+        handoff_sender=sender,
+    )
+    result = orchestrator.run(_envelope())
+
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
+    assert sender.replies == [f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"]
 
 
 # ---- SessionManager.mark_handoff（AD-4 单写者，fakeredis 驱动） ----

@@ -42,7 +42,7 @@ context:
 
 | 场景 | 输入 / 状态 | 期望输出 / 行为 | 错误处理 |
 |------|------------|----------------|----------|
-| L1 写读最近意图 | 分类成功 tag=PRICE_INQUIRY | `get_recent_intent` 返回该 tag，TTL ≤30s | 写入异常静默吞，不影响应答 |
+| L1 写读最近意图 | 分类成功 tag=PRICE_INQUIRY | `get_recent_intent` 返回该 tag，TTL ≤30s | 写入异常静默吞，不影响应答；**UNKNOWN 不落最近意图**（2026-11-11 评审裁决 D2：降级信号非真实意图，防误导 Epic 4 LLM 上下文消费方） |
 | L1 追问快照 | record_followup 返回会话总数 3 | `get_followup_count` 返回 3 | 同上静默 |
 | L1 条目过期 | 条目存活超过 TTL | get 返回 None（调用方回落 Redis 权威值） | N/A |
 | L1 容量打满 | 条目数超 maxsize | 最旧条目 LRU 逐出，客户端不抛异常 | N/A |
@@ -141,3 +141,10 @@ context:
 - `uv run pytest -q` -- expected: 既有 168 测试零回归 + 新增测试全过
 - `uv run mypy src` -- expected: 零错误（aiokafka 的 `type: ignore[import-untyped]` 先例口径不变）
 - `uv run ruff check src tests` -- expected: 零告警
+
+### Review Findings
+
+（2026-11-10 Epic 级 code review，全局统计见 spec-3-1 分录头。本分录 2 项 decision-needed。）
+
+- [x] [Review][Patch] `l1_hit` 预留分子位与 AD-5 互相矛盾，三份文档命中率口径不一致（medium；blind-hunter + verification-gap 两层） [`src/weiliao_agent/observability/metrics.py`、`README.md`、epic-3-context 命中率口径] — AD-5 严禁 L1 存事实卡片且 3.3 未交付 L1 读路径，`l1_hit` 恒 0、`hits = l0_hit + l1_hit` 的并入逻辑是为被 AD-5 封死的场景预留的死设计。口径冲突：epic-3-context 写「L1 与 L0 命中均计入分子」、README 写「l1_hit 为 L1 预留并入位」、metrics docstring 自述「恒 0」。**裁决（2026-11-11）：选 B**——保留预留位（防未来 L1 读腿合规场景复用字段形状）。**已修复（2026-11-11）**：README 命中率口径处加「AD-5 下 l1_hit 永不兑现」脚注；epic-3-context 口径原文修订为「L0 命中计入分子（l1_hit 为 AD-5 下永不兑现的预留位）」，分母同步明确为「含 intent 的首次消息」。L1 读腿无实现无测试锚点属 AD-5 既定边界，不修。
+- [x] [Review][Patch] UNKNOWN 分类结果也写入 L1 最近意图快照（low；acceptance-auditor 层） [`src/weiliao_agent/filters/intent_router.py` `_recent_intent_writer` 挂点] — `_recent_intent_writer` 位于分类成功后、无 `tag != UNKNOWN` 守卫；UNKNOWN 在 Epic 2 语义中是降级信号而非真实意图，落为「最近意图」可能误导 Epic 4 的 LLM 上下文消费方。**裁决（2026-11-11）：选 A**。**已修复（2026-11-11）**：过滤器加 `classification.tag != "UNKNOWN"` 排除守卫；本 spec I/O 矩阵「L1 写读最近意图」行补「UNKNOWN 不落最近意图」说明；新增 `test_recent_intent_writer_skipped_on_unknown_classification` 用例。

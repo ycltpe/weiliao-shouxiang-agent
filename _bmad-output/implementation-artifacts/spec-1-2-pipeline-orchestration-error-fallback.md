@@ -74,6 +74,11 @@ context:
 - Given 某过滤器执行逼近端到端预算，当剩余预算不足，则编排器立即触发兜底、不傻等全量超时，兜底应答在 P99 < 3s 预算内
 - Given 占位模板集就位，当任一意图（含缺失/未知）需兜底，则存在对应安全文案，错误兜底机制可独立验收
 
+### Review Findings
+
+- [x] [Review][Patch] 超时/预算耗尽路径 `slow_filter=filter_.name` 未做兜底（过滤器子类未覆写 name 时为空串，降级事件归因丢失），与第 133 行逃逸路径 `getattr(...) or type(...).__name__` 口径不一致 [src/weiliao_agent/pipeline.py:306,319]
+- [x] [Review][Patch] spec Verification 声明 `uv run ruff check .` 预期无告警，与仓库实际矛盾（全仓 302 存量告警）；应收窄为 `ruff check src tests`（1.3/1.4/1.5 已用收窄口径）[spec-1-2 Verification]
+
 ## Implementation Notes
 
 ## Spec Change Log
@@ -111,5 +116,5 @@ context:
 **Commands:**
 - `uv sync` -- expected: 无新依赖，lock 不变
 - `uv run pytest` -- expected: 全绿（含 I/O 矩阵四场景）
-- `uv run ruff check .` -- expected: 无告警
+- `uv run ruff check src tests` -- expected: 无告警（code review 补丁：全仓含 vendored skills/docs 存量告警，收窄口径同 1.3-1.5）
 - `uv run mypy src` -- expected: strict 模式无错误

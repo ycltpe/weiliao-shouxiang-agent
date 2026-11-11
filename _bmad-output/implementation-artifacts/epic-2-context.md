@@ -16,7 +16,7 @@
 
 - 意图标签为 9 类固定枚举：GREETING / PRICE_INQUIRY / AVAILABILITY / LOCATION / PHOTO_REQUEST / NEGOTIATION / LOAN_POLICY / COMPLAINT / UNKNOWN。全链路以单一 Literal 类型承载，经 `model_validate` 校验，未知值 fail-closed 到模板兜底应答。
 - 分类输出为单一标签 + 置信度分数。多意图消息不拆分处理，按置信度最高的标签路由（多意图扇出留待 V2）。
-- 分类延迟 P99 < 50ms。注意此预算为含前置指代消解的端到端口径，意图分类自身只消费消解后的消息（resolved_message），不直接读取买家原文。
+- 分类延迟：原 P99 < 50ms 预算（含前置指代消解的端到端口径）经 2026-11-10 Epic 级评审判定与真实 LLM 网络 RTT 物理不相容，记为不可达 NFR 缺口——实现内硬超时守卫放宽至默认 800ms（`WEILIAO_INTENT_TIMEOUT_SECONDS` env 可调），真实 P99 经 `latency_ms` 埋点 + 压测设施实测回填。意图分类自身只消费消解后的消息（resolved_message），不直接读取买家原文。
 - 分类准确率 ≥90%，基于规模 ≥1000 条、覆盖全部 9 类意图的人工标注测试集验收。
 - 分类结果必须写入会话状态（Redis），键结构 `weiliao:session:{session_id}:intent:{turn}`，写入行为需经 Langfuse trace 可验证。
 - 同一 session 中针对同一意图的第 2 次及以后消息标记为 Follow-up Query，识别准确率 ≥95%，同义改写视为同一意图（归并职责在分类器，不得对消息文本做相似度比对）。

@@ -128,3 +128,13 @@ class Envelope(BaseModel):
             msg = "timestamp must be timezone-aware"
             raise ValueError(msg)
         return value
+
+    @field_validator("session_id", "house_id", "trace_id")
+    @classmethod
+    def _non_blank(cls, value: str | None) -> str | None:
+        """code review 补丁：min_length=1 不挡纯空白串（" "），空白
+        标识会生成 ``weiliao:session: `` 类脏 key 致会话路由静默失效。"""
+        if value is not None and not value.strip():
+            msg = "field must not be blank"
+            raise ValueError(msg)
+        return value

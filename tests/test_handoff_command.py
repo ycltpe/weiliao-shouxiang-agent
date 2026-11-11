@@ -545,8 +545,9 @@ def test_orchestrator_sends_command_before_reply(fake_langfuse: Any) -> None:
     assert len(sender.calls) == 1
     (envelope, reply) = sender.calls[0]
     assert envelope.session_id == "sess-001"
-    assert reply == HANDOFF_REPLY_TEXT
-    # 出口文案语义不变：固定文案、非降级、绝不兜底。
+    # 载荷当前轮与买家实收逐字节一致（均带 AI 披露前缀，Epic 5
+    # code review 补丁对齐 5.2 Q1-A「买家所见逐字原文」）。
+    assert reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
     # 出口文案语义不变（5.4 决策 Q1-B 携标）：固定文案 + 前缀，非降级。
     assert HANDOFF_REPLY_TEXT == "已为您转接经纪人，请稍候"
     assert result.reply == f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
@@ -583,13 +584,17 @@ def test_orchestrator_without_sender_skips_send(fake_langfuse: Any) -> None:
 
 
 class _FakeProducer:
-    """aiokafka producer 替身：start/stop/send_and_wait 记录调用。"""
+    """aiokafka producer 替身：start/stop/send_and_wait 记录调用。
+
+    send_and_wait 的 key 实参为 bytes（真实 aiokafka 0.15 无
+    key_serializer 契约——str key 会在 record builder 抛 TypeError；
+    Epic 5 code review 补丁后由 _KafkaTransport 负责编码）。"""
 
     def __init__(self, *, fail_start: bool = False) -> None:
         self.fail_start = fail_start
         self.started = False
         self.stopped = False
-        self.sent: list[tuple[str, bytes, str]] = []
+        self.sent: list[tuple[str, bytes, bytes]] = []
 
     async def start(self) -> None:
         if self.fail_start:
@@ -599,7 +604,7 @@ class _FakeProducer:
     async def stop(self) -> None:
         self.stopped = True
 
-    async def send_and_wait(self, topic: str, value: bytes, key: str) -> object:
+    async def send_and_wait(self, topic: str, value: bytes, key: bytes) -> object:
         self.sent.append((topic, value, key))
         return object()
 
@@ -617,7 +622,9 @@ def test_transport_lifecycle_start_send_close_without_broker() -> None:
     assert thread is not None and thread.is_alive()
 
     transport.send(topic=TOPIC, value=b"{}", key="sess-001", timeout=1.0)
-    assert producer.sent == [(TOPIC, b"{}", "sess-001")]
+    # 传输层负责 str → utf-8 bytes 编码（真实 aiokafka 契约锚点：
+    # 若 _KafkaTransport 把 str key 直接透传，本条即红）。
+    assert producer.sent == [(TOPIC, b"{}", b"sess-001")]
 
     transport.close()
     assert producer.stopped

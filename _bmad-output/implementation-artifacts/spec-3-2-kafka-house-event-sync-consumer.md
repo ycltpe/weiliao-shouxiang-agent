@@ -96,11 +96,13 @@ context: []
 - **守卫拒写 vs Redis 故障的两段诊断**（评审前自查发现的契约缺口）：
   L0 `set` 返回 False 不区分成因，而矩阵要求「守卫拒写 → offset 提交」
   「Redis 故障 → 不提交」。消费者先 `get` 裁决索引守卫（读到 ≥ 事件
-  版本卡片即冲突提交）；`get` 为 None 时以 `invalidate(event 版本)` 作
-  健康探针——墓碑守卫下现存墓碑版本必 ≥ 事件版本，探针幂等不重
-  （生效版本取最大）；探针失败即 Redis 故障（不提交）；探针成功而重试
-  `set` 仍被拒即确认守卫拒写（提交），重试同时兜住 Redis 瞬断恢复的
-  补写窗口（metadata 记 `probe_retry`）。探针副作用仅限墓碑 TTL 刷新。
+  版本卡片即冲突提交）；`get` 为 None 时以只读墓碑探针
+  `tombstone_version` 裁决墓碑守卫（2026-11-11 Epic 评审 P1 修复：
+  原副作用式 `invalidate` 探针在瞬断恢复场景新立版本=事件版本的墓碑、
+  反噬重试写入致事实丢失且 offset 已提交）——现存墓碑版本 ≥ 事件版本
+  即守卫拒写确认（提交、其余 intent 短路）；探针未遮蔽则 set False 只
+  能是 Redis 故障/瞬断，重试 `set` 兜住瞬断恢复的补写窗口（metadata
+  记 `probe_retry`），重试仍失败走 failure 不提交。
 - **逐 record 精确提交**：aiokafka `commit()` 提交「已消费位置」会把
   已拉取未处理的消息一并标记，崩溃即丢 at-least-once 承诺；故
   `KafkaMessageSource` 按 `{TopicPartition: offset+1}` 单条提交。
@@ -110,8 +112,8 @@ context: []
   `type: ignore[import-untyped]`（mypy strict 兼容，spec 已预留口径）。
 - 已知残余风险：Redis 故障发生在 upsert 多 intent 写入中途时，已写
   intent 与未写 intent 短暂不一致，重放由守卫逐 intent 收敛；探针路径
-  可能在 Redis 恢复窗口内为「实际未写入」的事件提交 offset（重试补写
-  已尽量收窄该窗口）——两者均不违反「永不错误返回旧卡片」优先级。
+  语义已改为只读探针（上文），「探针副作用新建墓碑」残余风险随 P1 修复
+  消除——两者均不违反「永不错误返回旧卡片」优先级。
 
 ## Spec Change Log
 
@@ -162,3 +164,15 @@ context: []
 
 **Manual checks:**
 - `docker compose up redpanda` 后向 `house.sync.trigger` 发送示例事件（redpanda 控制台或 rpk），观察服务日志与 Langfuse 事件形态
+
+### Review Findings
+
+（2026-11-10 Epic 级 code review，全局统计见 spec-3-1 分录头。本分录 1 项 high patch + 4 项 low/medium patch + 1 项 defer。）
+
+- [x] [Review][Patch] upsert 瞬断恢复场景：健康探针把新鲜事实永久作废且 offset 照常提交（**high**；blind-hunter + edge-case-hunter 两层独立同指，blind-hunter 已用 fakeredis + 真实 `L0CacheClient` + `HouseSyncConsumer` 实证复现） [`src/weiliao_agent/workers/house_sync.py` `_handle_upsert`] — 复现链：`set` 首试遇瞬时 RedisError → fail-safe 吞错返回 False（与守卫拒写在类型上不可区分）→ `get` 返 None → 探针 `invalidate` 成功且无现存墓碑时**新立版本恰等于事件版本的墓碑** → 重试 `set` 被守卫 (a) 恒拒 → `version_conflict=True` → 提交 offset；`probe_retry=True` 分支在真实客户端下不可达。**已修复（2026-11-11）**：副作用式 `invalidate` 探针改为只读 `L0CacheClient.tombstone_version` 探针——现存墓碑版本 ≥ 事件版本即守卫拒写确认（短路提交）；探针未遮蔽则 set False 只能是 Redis 故障/瞬断，直接重试 set 兜住瞬断恢复补写窗口，重试仍失败走 failure 不提交。回归测试 `test_transient_set_failure_recovery_writes_card_and_commits`（真实 L0 端到端：事实落盘、无假墓碑残留）、`test_tombstone_guard_rejection_commits_as_version_conflict`、`test_real_tombstone_guard_rejection_short_circuits`。
+- [x] [Review][Patch] 「消费延迟 ≤500ms」唯一断言近同义反复，边界两侧无用例（medium；verification-gap 层） [`tests/test_house_sync.py`] — `assert 0 <= latency_ms <= 500` 在 now-100ms 构造下几乎恒真；500ms 边界两侧无用例。**已修复（2026-11-11）**：`test_stale_gate_boundary_pins_500ms_budget` 参数化 499ms（放行）/501ms（转失效），冻结消费时刻时钟（`_FrozenDateTime` monkeypatch）零时序松弛压线。容器化 redpanda + 真实 Redis 集成测试归 deferred-work fakeredis 根因条目。
+- [x] [Review][Patch] `KafkaMessageSource.messages()` 真实异步迭代从未被任何测试执行（low；verification-gap 层，已读码证实） [`src/weiliao_agent/workers/house_sync.py` `messages()`、`tests/test_house_sync.py`] — `_StubKafkaConsumer` 无 `__aiter__`，record 属性读取、`Message` 组装、`offset+1` 提交映射在真实迭代形状下全部未执行。**已修复（2026-11-11）**：stub 补 `__aiter__`，新增 `test_kafka_source_messages_iterates_records_with_payload_and_commit` 驱动完整迭代断言 payload 透传与逐 record TopicPartition/offset+1 映射。
+- [x] [Review][Patch] `_handle_stale` 的 stale_alert 事件携带入口时刻延迟且无 `stale` 标记（low；blind-hunter 层，已读码证实） [`src/weiliao_agent/workers/house_sync.py` `_handle_stale`] — `metadata["stale"]=True` 与 `_refresh_latency` 均在 `stale_alert` 事件记录之后才执行：同一 event_id 在 Langfuse 留下两个 latency 值，告警落点无 `stale` 字段。**已修复（2026-11-11）**：`stale` 标记与 AC 权威延迟（写完成时刻）重算移至 alert 事件与日志之前；stale 用例补 `metadata["stale"] is True` 断言。
+- [x] [Review][Patch] 测试资产未真正收敛：test_house_sync 仍内联 `_FakeLangfuse` 且 teardown 语义与 conftest 相反（low；blind-hunter 层） [`tests/conftest.py`、`tests/test_house_sync.py`] — conftest 注释宣称收敛为单一共享实现（teardown 快照恢复），test_house_sync 仍自带同名假件、teardown 无条件 `set_langfuse_client(None)`。**已修复（2026-11-11）**：test_house_sync 删除内联 `_FakeLangfuse` 与 fixture，统一改用 conftest 版本（快照式 teardown）。
+- [x] [Review][Patch] `_lifespan` yield 后清理不在 try/finally 中（low；blind-hunter 层） [`src/weiliao_agent/main.py` `_lifespan`] — lifespan 运行期抛异常时消费者任务与 metrics 任务泄漏为悬挂 task。**已修复（2026-11-11）**：yield 后全部清理（metrics 任务取消回收、发送器关闭、消费者关停强退）包入 try/finally。
+- [x] [Review][Defer] upsert 写路径最坏 36+ 次串行 Redis 往返，Redis 劣化时吞吐坍缩且滞后事件被批量误判 stale 转失效（medium；blind-hunter 层） [`src/weiliao_agent/workers/house_sync.py:248-287`] — deferred：9 intent 串行 set 是结构性放大（无批量脚本/并发），但「超期事件按失效处理」本身合规 spec-3-2 AC，失效是安全降级非数据丢失；settle：随 Epic 4 后压测评估消费者吞吐，必要时引入批量/并发写入或按房源合并 intent 写入。

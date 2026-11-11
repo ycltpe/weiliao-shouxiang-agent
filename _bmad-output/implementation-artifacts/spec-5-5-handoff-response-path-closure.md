@@ -158,3 +158,10 @@ Status: done
 **Residual risks:**
 - 编排器闸门在 HTTP 主流径恒不触发（适配器先拦截），其生产价值依赖未来非 HTTP 入口；行为由 armed 双闸门用例锁定
 - Redis 权威实读为每消息一次额外 HGET（毫秒级）；无闸门专用计数指标，审计走 Langfuse trace 事件
+
+### Review Findings
+
+（2026-11-10 Epic 5 级 code review，全局统计见 spec-5-1 分录头。本分录 1 项 patch + 1 项 defer。）
+
+- [x] [Review][Patch] 5.5 闸门 catch-Exception 补丁无对应回归测试，与仓库异常收窄惯例相反的取舍未独立复核（low；blind-hunter + acceptance-auditor 双层） [`src/weiliao_agent/pipeline.py:241-247`、`tests/test_handoff_response_path_closure.py`] — 闸门 `except Exception` 收口后任何 reader 异常（含编程错误）均 fail-closed 降级为模板兜底——买家无感、无 ERROR 日志、只有 degraded 指标，故障被系统性掩盖；对照 http.py 5.3 闸门刻意只收敛 `redis.RedisError`、编程错误上抛。现有 `_FailingReader` 仅抛 `redis.RedisError`，无任何用例断言非 Redis 异常（如 UnicodeDecodeError、编程错误）也兜底——补丁本身不在回归网内。修法：补一条非 RedisError 异常用例锁定「编程错误也 fail-closed」的拍板口径（若改为收窄捕获则连带改实现），spec 5.5 Follow-up Review 自承的「未经独立复核」随之关闭。
+- [x] [Review][Defer] HTTP 主流径每消息双重 handoff 状态读取（适配器快照 + 编排器 HGET）（low；blind-hunter 层） [`src/weiliao_agent/adapters/http.py:188-208`、`src/weiliao_agent/pipeline.py:235-248`] — 5.3 适配器闸门用 begin_turn 快照判定后，编排器 5.5 闸门对同一请求再实读一次 HGET；同一请求内两次读取结果必然一致（其间无写），99.9% 永不触发的会话多付一次 Redis RTT。Residual risks 已自认「每消息一次额外 HGET」。settle：Story 7.2 压测实测闸门开销后再优化（快照透传或读跳过），与 spec-5-5 既有条目同路径。

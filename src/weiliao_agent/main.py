@@ -188,11 +188,16 @@ def _resolve_redis_socket_timeout() -> float:
 
 _REDIS_SOCKET_TIMEOUT_SECONDS = _resolve_redis_socket_timeout()
 
-_redis_client = redis.Redis.from_url(
-    os.environ.get("WEILIAO_REDIS_URL", "redis://127.0.0.1:6379/0"),
-    socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-    socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-)
+try:
+    _redis_client = redis.Redis.from_url(
+        os.environ.get("WEILIAO_REDIS_URL", "redis://127.0.0.1:6379/0"),
+        socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+    )
+except ValueError as exc:
+    # code review 补丁：非法 WEILIAO_REDIS_URL 以 fail-fast 提示拒绝启动，
+    # 而非 import 期裸抛原始 ValueError 堆栈。
+    raise SystemExit(f"invalid WEILIAO_REDIS_URL: {exc}") from exc
 
 _session_manager = SessionManager(_redis_client)
 # 空串等空值回落默认实现（文档承诺），仅显式非法值 fail-fast。
@@ -519,7 +524,11 @@ if _HANDOFF_KAFKA_DLQ_TOPIC == _HANDOFF_KAFKA_TOPIC:
 # broker 未配置（本地开发/测试）不创建发送器，编排器注入 None，出口
 # 分支跳过发送、出口文案语义不变。装配期零网络触达：后台事件循环
 # 线程与 producer start/stop 归 lifespan 托管。
-_KAFKA_BROKERS = os.environ.get("WEILIAO_KAFKA_BROKERS")
+# strip 后判空（Epic 5 code review 补丁）：纯空白 env（如 " "）原样
+# 真值判通过，producer start 必败后静默降级禁用——与 topic 变量的
+# strip+fail-fast 口径对齐，配置错误不经启动即败发现。
+_KAFKA_BROKERS_RAW = os.environ.get("WEILIAO_KAFKA_BROKERS")
+_KAFKA_BROKERS = _KAFKA_BROKERS_RAW.strip() if _KAFKA_BROKERS_RAW else None
 _handoff_command_sender: HandoffCommandSender | None = None
 if _KAFKA_BROKERS:
     _handoff_command_sender = HandoffCommandSender.kafka(
@@ -557,8 +566,9 @@ async def _lifespan(app: object) -> AsyncIterator[None]:
     consumer_task: asyncio.Task[None] | None = None
     metrics_task: asyncio.Task[None] | None = None
     # 消费者门控运行期读 env（既有测试 monkeypatch env 的口径）；发送器
-    # 装配期门控见模块级 _KAFKA_BROKERS（import 时定版）。
-    if os.environ.get("WEILIAO_KAFKA_BROKERS"):
+    # 装配期门控见模块级 _KAFKA_BROKERS（import 时定版）。strip 后判空
+    # 与装配门控同口径（纯空白 env 不触发消费者创建）。
+    if (os.environ.get("WEILIAO_KAFKA_BROKERS") or "").strip():
         consumer = HouseSyncConsumer(
             L0CacheClient(_redis_client),
             source=KafkaMessageSource(
@@ -578,24 +588,29 @@ async def _lifespan(app: object) -> AsyncIterator[None]:
             )
             _handoff_command_sender.disable()
     metrics_task = asyncio.create_task(_metrics_log_loop())
-    yield
-    metrics_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await metrics_task
-    if _handoff_command_sender is not None:
-        await asyncio.to_thread(_handoff_command_sender.close)
-    if consumer is not None and consumer_task is not None:
-        await consumer.stop()
-        try:
-            await asyncio.wait_for(consumer_task, timeout=CONSUMER_SHUTDOWN_TIMEOUT_SECONDS)
-        except Exception as exc:  # 关停超时/任务异常强退：取消任务并回收
-            logger.warning(
-                "house sync consumer task did not stop cleanly; forcing cancel",
-                exc_info=exc,
-            )
-            consumer_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await consumer_task
+    try:
+        yield
+    finally:
+        # 运行期异常路径也必须回收后台任务（2026-11-11 评审补丁：
+        # yield 后清理原不在 try/finally 中，lifespan 主体抛异常时
+        # 消费者/metrics 任务泄漏为悬挂 task）。
+        metrics_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await metrics_task
+        if _handoff_command_sender is not None:
+            await asyncio.to_thread(_handoff_command_sender.close)
+        if consumer is not None and consumer_task is not None:
+            await consumer.stop()
+            try:
+                await asyncio.wait_for(consumer_task, timeout=CONSUMER_SHUTDOWN_TIMEOUT_SECONDS)
+            except Exception as exc:  # 关停超时/任务异常强退：取消任务并回收
+                logger.warning(
+                    "house sync consumer task did not stop cleanly; forcing cancel",
+                    exc_info=exc,
+                )
+                consumer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer_task
 
 
 app = create_app(

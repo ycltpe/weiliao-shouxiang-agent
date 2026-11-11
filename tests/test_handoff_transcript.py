@@ -18,13 +18,15 @@ import fakeredis
 import pytest
 import redis
 from fastapi.testclient import TestClient
-from test_handoff_command import _FakeTransport, _HandoffFilter
 
 from weiliao_agent.adapters.http import create_app
 from weiliao_agent.filters.base import Filter
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
-from weiliao_agent.handoff.command import HandoffCommand, HandoffCommandSender
-from weiliao_agent.models.envelope import Envelope
+from weiliao_agent.handoff.command import (
+    HandoffCommand,
+    HandoffCommandSender,
+)
+from weiliao_agent.models.envelope import Envelope, HandoffAssessment
 from weiliao_agent.pipeline import HANDOFF_REPLY_TEXT, PipelineOrchestrator, PipelineResult
 from weiliao_agent.session import SessionManager, TranscriptTurn
 from weiliao_agent.session.manager import (
@@ -37,6 +39,42 @@ TS_1 = datetime(2026, 11, 9, 10, 0, 0, tzinfo=UTC)
 TS_2 = datetime(2026, 11, 9, 10, 1, 0, tzinfo=UTC)
 SESSION_ID = "sess-001"
 TRANSCRIPT_KEY = f"{KEY_PREFIX}{SESSION_ID}:transcript"
+
+
+class _FakeTransport:
+    """HandoffTransport 替身：记录发送（本文件内联，消除跨测试文件
+    私有导入——spec 5.3 Review Triage 已裁 patch，Epic 5 code review
+    兑现）。"""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, bytes, str, float]] = []
+        self.started = False
+        self.closed = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def send(self, *, topic: str, value: bytes, key: str, timeout: float) -> None:
+        self.sent.append((topic, value, key, timeout))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _HandoffFilter(Filter):
+    """首跳即挂硬触发判定结果的信封透传过滤器（内联替身）。"""
+
+    def __init__(self) -> None:
+        self.name = "intent_router"
+
+    def process(self, envelope: Envelope) -> Envelope:
+        return envelope.model_copy(
+            update={
+                "handoff": HandoffAssessment(
+                    triggered=True, conditions=["redline_intent"]
+                )
+            }
+        )
 
 
 @pytest.fixture

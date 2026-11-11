@@ -45,6 +45,10 @@ _ENDPOINT_ENV = "WEILIAO_RISK_REVIEW_ENDPOINT"
 # 风暴下的线程膨胀；调用侧守卫先行返回，不傻等（同分类器口径）。
 _MAX_WORKERS = 8
 
+# 中台响应体读取上界（code review Epic 4 补丁）：无界 read() 会被故障中台
+# 的超大 body 打满进程内存；超界按传输层异常归一 fail-closed（不通过）。
+_MAX_BODY_BYTES = 64 * 1024
+
 # 归因文本长度上限（防异常文本膨胀指标与 trace）。
 _REASON_LIMIT = 500
 
@@ -89,10 +93,16 @@ def _urllib_transport(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            body = response.read().decode("utf-8", "replace")
+            raw = response.read(_MAX_BODY_BYTES + 1)
+            if len(raw) > _MAX_BODY_BYTES:
+                raise ValueError("risk review response body too large")
+            body = raw.decode("utf-8", "replace")
             return RiskReviewHttpResponse(status=response.status, body=body)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
+        raw = exc.read(_MAX_BODY_BYTES + 1)
+        if len(raw) > _MAX_BODY_BYTES:
+            raise ValueError("risk review response body too large") from None
+        body = raw.decode("utf-8", "replace")
         return RiskReviewHttpResponse(status=exc.code, body=body)
 
 

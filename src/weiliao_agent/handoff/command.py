@@ -114,7 +114,10 @@ class HandoffTransport(Protocol):
 
     def send(self, *, topic: str, value: bytes, key: str, timeout: float) -> None:
         """单条发送（key=session_id 分区保序）；``timeout`` 为本次
-        调用的阻塞上限（秒）。"""
+        调用的阻塞上限（秒）。key 经传输层序列化为 utf-8 bytes——
+        aiokafka 无 key_serializer 时 record builder 只接受 bytes
+        （Epic 5 code review 补丁：str key 会使真实发送 100% 抛
+        TypeError）。"""
 
     def close(self) -> None:
         """关闭 producer（幂等；未 start 时 no-op）。"""
@@ -202,7 +205,7 @@ class _KafkaTransport:
             msg = "handoff command transport is not started"
             raise RuntimeError(msg)
         future = asyncio.run_coroutine_threadsafe(
-            producer.send_and_wait(topic, value=value, key=key), loop
+            producer.send_and_wait(topic, value=value, key=key.encode("utf-8")), loop
         )
         future.result(timeout=timeout)
 

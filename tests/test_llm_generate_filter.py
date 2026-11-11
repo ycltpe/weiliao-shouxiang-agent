@@ -453,7 +453,8 @@ def test_open_breaker_skips_generation_without_subgraph_call(
     """open 期间请求：不调子图（<100ms 切换前提=零子图调用）、信封透传。"""
     chat = _StubChat()
     breaker = LlmCircuitBreaker(cooldown_seconds=10)
-    breaker.on_failure("rate_limit")  # 预置 open 态
+    # 预置 open 态（分键补丁：按 subgraph alias 键）
+    breaker.on_failure("rate_limit", model="gpt-4o")
     envelope = _envelope(fact_card=_fact_card())
 
     result = LlmGenerateFilter(subgraph=_subgraph(chat), breaker=breaker).process(envelope)
@@ -473,7 +474,7 @@ def test_open_breaker_preserves_redline_and_non_text_early_return(
     """红线/非文本早退在熔断咨询之前：open 态也不产生 skip 事件（不污染统计）。"""
     chat = _StubChat()
     breaker = LlmCircuitBreaker(cooldown_seconds=10)
-    breaker.on_failure("rate_limit")
+    breaker.on_failure("rate_limit", model="gpt-4o")
     filter_ = LlmGenerateFilter(subgraph=_subgraph(chat), breaker=breaker)
 
     redline = filter_.process(_envelope(intent="NEGOTIATION"))
@@ -554,7 +555,7 @@ def test_breaker_stepwise_recovery_via_filter(
     )
 
     # 故障跳闸（不注入故障替身——直接信号，保持本走查聚焦恢复段）。
-    breaker.on_failure("server_500")
+    breaker.on_failure("server_500", model="gpt-4o")
     skipped = filter_.process(_envelope())
     assert skipped.generated_reply is None
     assert breaker.state == "open"
@@ -585,7 +586,7 @@ def test_probe_failure_via_filter_reopens_breaker(
     """AC 第 2 条：试探失败立即回 open，冷却重启，后续请求重新跳过。"""
     clock = _FakeClock()
     breaker = LlmCircuitBreaker(cooldown_seconds=10, recovery_step=0.1, clock=clock)
-    breaker.on_failure("rate_limit")
+    breaker.on_failure("rate_limit", model="gpt-4o")
     clock.advance(10)
 
     failing = _StubChat(error=LlmGenerationError("timeout", "budget exhausted"))
@@ -611,21 +612,21 @@ class _FlakyBreaker:
         self._fail_before = fail_before
         self._fail_signal = fail_signal
 
-    def before_request(self) -> bool:
+    def before_request(self, model: str | None = None) -> bool:
         self.before_calls += 1
         if self._fail_before:
             msg = "breaker consult boom"
             raise RuntimeError(msg)
         return True
 
-    def on_failure(self, reason: str) -> bool:
+    def on_failure(self, reason: str, model: str | None = None) -> bool:
         self.failure_calls += 1
         if self._fail_signal:
             msg = "breaker signal boom"
             raise RuntimeError(msg)
         return False
 
-    def on_success(self) -> bool:
+    def on_success(self, model: str | None = None) -> bool:
         self.success_calls += 1
         if self._fail_signal:
             msg = "breaker signal boom"

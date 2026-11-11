@@ -53,6 +53,7 @@ writer 未注入，False）。记录本身 fail-safe，未配置 Langfuse 时 no
 """
 
 import re
+import sys
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -181,12 +182,15 @@ def trace_message(
         yield
     finally:
         # 逆序退出；SDK __exit__ 异常吞掉，不得影响编排器。
+        # code review 补丁：退出携带体异常三元组——降级/异常路径根
+        # span 在 Langfuse 上标 ERROR，按根 span 状态可检索失败消息
+        # （与过滤器 span 口径对齐）。
         with suppress(Exception):
             if attrs is not None:
-                attrs.__exit__(None, None, None)
+                attrs.__exit__(*sys.exc_info())
         with suppress(Exception):
             if root is not None:
-                root.__exit__(None, None, None)
+                root.__exit__(*sys.exc_info())
 
 
 @contextmanager
@@ -846,18 +850,21 @@ def record_llm_breaker_event(
 def record_model_routing_event(
     trace_id: str | None,
     *,
-    outcome: Literal["primary", "mini", "forced_mini", "recovered"],
+    outcome: Literal["primary", "mini", "forced_mini", "recovered", "tightened"],
     intent: str | None = None,
 ) -> None:
     """模型路由事件（Story 4.6）：单条消息可复盘路由判定与收紧/恢复。
 
     事件 taxonomy（outcome）：``primary``（名单外意图或 intent=None 走
     主模型，DEFAULT 级）/ ``mini``（名单内简单意图走 mini 模型，DEFAULT
-    级）/ ``forced_mini``（滑窗预算收紧期强制 mini，ERROR 级——成本异常
-    信号锚点）/ ``recovered``（窗口消耗回落阈值以下、自动恢复常规路由，
-    DEFAULT 级）。买家可见语义逐字节不动（路由只决定用哪个模型生成），
-    本事件仅成本与质量复盘信号；ERROR 级 ``model_routing_alert`` 告警
-    日志由指标定时日志通道发射（收紧态追加）。
+    级）/ ``forced_mini``（滑窗预算收紧期强制 mini，DEFAULT 级——收紧
+    可能持续数小时至数天，每请求一条 ERROR 会成噪音洪流，同 4.5 熔断
+    skip 口径；code review Epic 4 补丁降级）/ ``recovered``（窗口消耗
+    回落阈值以下、自动恢复常规路由，DEFAULT 级）/ ``tightened``（进入
+    收紧的迁移瞬间，ERROR 级——成本异常信号锚点，仿熔断 tripped 口径）。
+    买家可见语义逐字节不动（路由只决定用哪个模型生成），本事件仅成本
+    与质量复盘信号；ERROR 级 ``model_routing_alert`` 告警日志由指标
+    定时日志通道发射（收紧态追加）。
     fail-safe 口径同 ``record_llm_breaker_event``：记录本身再抛异常也吞掉。
     """
     if not _recordable(trace_id):
@@ -866,7 +873,7 @@ def record_model_routing_event(
     if client is None:
         return
     assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
-    level: Literal["DEFAULT", "ERROR"] = "ERROR" if outcome == "forced_mini" else "DEFAULT"
+    level: Literal["DEFAULT", "ERROR"] = "ERROR" if outcome == "tightened" else "DEFAULT"
     with suppress(Exception):
         client.create_event(
             trace_context=TraceContext(trace_id=trace_id),

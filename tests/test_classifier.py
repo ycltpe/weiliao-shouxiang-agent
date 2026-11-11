@@ -132,6 +132,7 @@ def test_writer_failure_fails_safe_and_records_trace_event() -> None:
     assert result.intent == "GREETING"  # 信封保留分类结果
     failure = [e for e in fake.events if e["name"] == "intent.classification_failure"]
     assert len(failure) == 1
+    assert failure[0]["level"] == "ERROR"  # 评审补丁：失败事件级别锁定
     assert failure[0]["metadata"]["reason"] == "intent_write_failed"
 
 
@@ -175,6 +176,7 @@ def test_classification_failure_records_reason_and_degrades() -> None:
     assert result.intent == "UNKNOWN"  # 过滤器契约：不向上抛
     failure = [e for e in fake.events if e["name"] == "intent.classification_failure"]
     assert len(failure) == 1
+    assert failure[0]["level"] == "ERROR"  # 评审补丁：失败事件级别锁定
     assert failure[0]["metadata"]["reason"] == "timeout"
 
 

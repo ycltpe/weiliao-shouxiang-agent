@@ -67,6 +67,7 @@ recorder——意图标签仍为追问判定唯一依据，coref 只做计数键
 输入变量，收窄后文本口径自动一致，无需独立改动。
 """
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -81,6 +82,15 @@ from weiliao_agent.models.coref import CorefRef
 from weiliao_agent.models.envelope import Envelope, HandoffAssessment
 from weiliao_agent.models.intent import IntentClassification, IntentTag
 from weiliao_agent.observability import tracing
+
+logger = logging.getLogger(__name__)
+
+# 转人工状态写重试口径（2026-11-11 Epic 5 code review 裁决 A）：marker
+# 单写者失败意味着会话未入终态——后续消息仍走 AI 管道（人机混答窗口），
+# 必须终态尽力达且失败可观测。有界重试（Redis 瞬时故障窗口），总耗
+# 时上限 ≈0.15s，远在过滤器链预算内；最终失败仅告警，应答口径不变。
+_MARK_HANDOFF_MAX_ATTEMPTS = 3
+_MARK_HANDOFF_RETRY_BACKOFF_SECONDS = 0.05
 
 
 class IntentClassifier(Protocol):
@@ -106,7 +116,9 @@ class IntentRouterFilter(Filter):
         self,
         classifier: IntentClassifier | None = None,
         intent_writer: Callable[[str, int, IntentClassification], None] | None = None,
-        followup_recorder: Callable[[str, IntentTag, str], tuple[int, int]] | None = None,
+        followup_recorder: (
+            Callable[[str, IntentTag, str], tuple[int, int, int]] | None
+        ) = None,
         recent_intent_writer: Callable[[str, IntentTag], None] | None = None,
         followup_snapshot_writer: Callable[[str, int], None] | None = None,
         handoff_assessor: HardTriggerAssessor | None = None,
@@ -133,7 +145,11 @@ class IntentRouterFilter(Filter):
         if message is None or not message.strip():
             # 分类器契约要求非空消息文本：None、空串与纯空白一律
             # fail-closed UNKNOWN，不调用分类器（Story 6.3 空白口径）。
-            unknown = envelope.model_copy(update={"intent": "UNKNOWN"})
+            # is_followup 一并复位：过滤器为追问判定唯一权威，payload
+            # 预设值不允许透传（2026-11-10 评审补丁）。
+            unknown = envelope.model_copy(
+                update={"intent": "UNKNOWN", "is_followup": False}
+            )
             # 硬触发评估不依赖分类器输出（媒体条件照常判定）：空消息
             # 路径以 UNKNOWN / 追问序号 0 评估，追问条件天然不触发。
             return self._assess_handoff(unknown, "UNKNOWN", 0, message)
@@ -151,12 +167,22 @@ class IntentRouterFilter(Filter):
             # tag）在此拒绝；tag 提取同置 try 内，返回 None 或无 .tag
             # 对象的 AttributeError 同样降级，过滤器自身不向上抛。
             classified = Envelope.model_validate(
-                {**envelope.model_dump(), "intent": classification.tag}
+                {
+                    **envelope.model_dump(),
+                    "intent": classification.tag,
+                    # is_followup 复位为判定起点 False：追问命中仅在出口
+                    # 单向置位（2026-11-10 评审补丁，payload 预设不透传）。
+                    "is_followup": False,
+                }
             )
             # confidence 提取同置 try 内（2.1 防御口径）：非一致性分类器
             # （有 .tag 无 .confidence）的 AttributeError 同样 fail-closed，
             # 不得逃逸 process()。
             confidence = classification.confidence
+            if confidence != confidence:  # NaN 守卫（评审补丁）：duck-type
+                # 实现绕过 IntentClassification 边界校验时，NaN metadata
+                # 会致 Langfuse 序列化抛错被吞、分类成功事件静默丢失。
+                raise ValueError("nan confidence from classifier")
         except Exception as exc:
             # 分类异常 fail-closed：UNKNOWN，过滤器自身不向上抛。
             # 硬触发评估照常执行（UNKNOWN / 追问序号 0，同空消息路径
@@ -165,7 +191,9 @@ class IntentRouterFilter(Filter):
             tracing.record_classification_failure(
                 envelope.trace_id, reason=_failure_reason(exc)
             )
-            unknown = envelope.model_copy(update={"intent": "UNKNOWN"})
+            unknown = envelope.model_copy(
+                update={"intent": "UNKNOWN", "is_followup": False}
+            )
             return self._assess_handoff(unknown, "UNKNOWN", 0, message)
         # 分类成功：trace 事件（来源取实现自报 source，缺省类名）。
         latency_ms = (time.monotonic() - started) * 1000
@@ -185,32 +213,44 @@ class IntentRouterFilter(Filter):
                 tracing.record_classification_failure(
                     envelope.trace_id, reason="intent_write_failed"
                 )
-        if envelope.turn is not None and self._recent_intent_writer is not None:
+        if (
+            envelope.turn is not None
+            # UNKNOWN 是降级信号而非真实意图：不落「最近意图」快照，
+            # 防误导 Epic 4 的 LLM 上下文消费方（2026-11-11 评审裁决）。
+            and classification.tag != "UNKNOWN"
+            and self._recent_intent_writer is not None
+        ):
             # L1 写失败静默 fail-safe（Story 3.3 设计笔记）：优化层
             # 不记 trace、不应答降级，信封保留分类结果。
             with suppress(Exception):
                 self._recent_intent_writer(envelope.session_id, classification.tag)
-        is_followup, per_intent_count = self._record_followup(envelope, classification.tag)
+        is_followup, _, per_tag_count = self._record_followup(
+            envelope, classification.tag
+        )
         assessed = self._assess_handoff(
-            classified, classification.tag, per_intent_count, message
+            classified, classification.tag, per_tag_count, message
         )
         if not is_followup:
             return assessed
         return assessed.model_copy(update={"is_followup": True})
 
-    def _record_followup(self, envelope: Envelope, tag: IntentTag) -> tuple[bool, int]:
+    def _record_followup(
+        self, envelope: Envelope, tag: IntentTag
+    ) -> tuple[bool, int, int]:
         """追问识别落点（Story 2.3）：原子计数、信封标记、trace 挂点。
 
-        返回 ``(是否追问命中, per_(tag, anchor) 计数)``——追问命中为
-        per-(tag, anchor) ≥2（is_followup 口径）；per_intent 计数供
-        Story 5.1 硬触发追问条件消费（达阈值判定归 AD-12 评估模块，
-        勿复用 is_followup）。anchor 为 FR-2 锚定计数键：由信封
-        ``coref`` 机械导出（排序拼接 ``(entity_type, entity_id)``，
-        空列表/None → 哨兵值），不读 Redis 审计键、不回溯历史——
-        锚定的唯一真相源是信封。前置条件不满足（turn 为 None、未注入
-        recorder、tag 为 UNKNOWN）一律跳过：不调 recorder、不累积计数、
-        计数返回 0（追问条件不触发）、信封 ``is_followup`` 保持默认
-        False。
+        返回 ``(是否追问命中, per_(tag, anchor) 计数, per-tag 聚合
+        计数)``——追问命中为 per-(tag, anchor) ≥2（is_followup 口径，
+        Story 6.3 FR-2 锚定）；per-tag 聚合计数供 Story 5.1 硬触发
+        追问条件消费（2026-11-11 Epic 5 code review 裁决 B：阈值判定
+        回到「同一意图 ≥3」冻结口径，per-(tag, anchor) 细键会稀释
+        阈值，勿复用 is_followup 的锚定口径）。anchor 为 FR-2 锚定
+        计数键：由信封 ``coref`` 机械导出（排序拼接
+        ``(entity_type, entity_id)``，空列表/None → 哨兵值），不读
+        Redis 审计键、不回溯历史——锚定的唯一真相源是信封。前置条件
+        不满足（turn 为 None、未注入 recorder、tag 为 UNKNOWN）一律
+        跳过：不调 recorder、不累积计数、计数返回 0（追问条件不触发）、
+        信封 ``is_followup`` 保持默认 False。
         recorder 异常 fail-safe 收敛在本方法内，不外抛。
         """
         if (
@@ -218,11 +258,11 @@ class IntentRouterFilter(Filter):
             or self._followup_recorder is None
             or tag == "UNKNOWN"
         ):
-            return False, 0
+            return False, 0, 0
         anchor = _followup_anchor(envelope.coref)
         try:
-            per_intent_count, session_followup_count = self._followup_recorder(
-                envelope.session_id, tag, anchor
+            per_anchor_count, session_followup_count, per_tag_count = (
+                self._followup_recorder(envelope.session_id, tag, anchor)
             )
         except Exception:
             # 记录失败 fail-safe：应答不降级、信封保留分类结果、
@@ -231,8 +271,8 @@ class IntentRouterFilter(Filter):
             tracing.record_classification_failure(
                 envelope.trace_id, reason="followup_record_failed"
             )
-            return False, 0
-        is_followup = per_intent_count >= 2
+            return False, 0, 0
+        is_followup = per_anchor_count >= 2
         if self._followup_snapshot_writer is not None:
             # 同 recent_intent_writer：L1 快照写失败静默吞，不记 trace。
             with suppress(Exception):
@@ -242,7 +282,7 @@ class IntentRouterFilter(Filter):
         tracing.record_followup(
             envelope.trace_id,
             tag=tag,
-            per_tag_anchor_count=per_intent_count,
+            per_tag_anchor_count=per_anchor_count,
             session_followup_count=session_followup_count,
             is_followup=is_followup,
         )
@@ -254,13 +294,13 @@ class IntentRouterFilter(Filter):
             tracing.record_followup_hard_trigger(
                 envelope.trace_id, count=session_followup_count
             )
-        return is_followup, per_intent_count
+        return is_followup, per_anchor_count, per_tag_count
 
     def _assess_handoff(
         self,
         envelope: Envelope,
         tag: IntentTag,
-        per_intent_count: int,
+        per_tag_count: int,
         message: str | None,
     ) -> Envelope:
         """硬触发评估落点（Story 5.1，AD-12）：集中判定、写信封、记 trace。
@@ -268,12 +308,15 @@ class IntentRouterFilter(Filter):
         未注入 assessor 时透传（判定集中挂载点缺失即不评估，信封
         ``handoff`` 保持 None）。评估未命中也记 trace（支撑漏判审计）；
         评估代码自身异常 fail-closed：按触发处理（conditions=
-        [assessment_error]）并记 ERROR 级 trace 告警，消息绝不放行到
-        生成链路。触发时经 marker 单写者落 handoff 状态（try 包裹
-        fail-safe，写失败经 ``record_handoff_mark_failed`` 专用事件
-        观测）；信封条件清单含内部诊断哨兵 assessment_error（审计归因），
-        但传给 marker 的清单过滤该哨兵——5.2 的转交载荷消费
-        handoff_conditions，只携带真实命中条件。
+        [assessment_error]）并记 ERROR 级 trace 告警 + ERROR 级本地
+        日志（Epic 5 code review 补丁：该路径持续故障会把全量消息
+        误判触发，无本地留痕时仅 Langfuse 可见），消息绝不放行到
+        生成链路。触发时经 marker 单写者落 handoff 状态（有界重试 +
+        本地告警，2026-11-11 裁决 A：写失败意味着会话未入终态，必须
+        尽力达且可观测；应答口径不变）；信封条件清单含内部诊断哨兵
+        assessment_error（审计归因），但传给 marker 的清单过滤该
+        哨兵——5.2 的转交载荷消费 handoff_conditions，只携带真实
+        命中条件。
         """
         if self._handoff_assessor is None:
             return envelope
@@ -281,10 +324,18 @@ class IntentRouterFilter(Filter):
             assessment = self._handoff_assessor.assess(
                 intent=tag,
                 media_type=envelope.media_type,
-                per_intent_followup_count=per_intent_count,
+                per_intent_followup_count=per_tag_count,
                 message=message,
             )
         except Exception as exc:
+            logger.error(
+                "handoff assessment failed; fail-closed trigger "
+                "session_id=%s trace_id=%s error=%s",
+                envelope.session_id,
+                envelope.trace_id,
+                _failure_reason(exc),
+                exc_info=True,
+            )
             tracing.record_handoff_assessment(
                 envelope.trace_id,
                 triggered=True,
@@ -308,11 +359,34 @@ class IntentRouterFilter(Filter):
                 for condition in assessment.conditions
                 if condition != CONDITION_ASSESSMENT_ERROR
             ]
-            try:
-                self._handoff_marker(envelope.session_id, mark_conditions)
-            except Exception:
-                # 状态写失败 fail-safe：判定结果已挂信封，应答不降级，
-                # trace 记专用失败事件（绝不二次影响买家应答）。
+            last_error: Exception | None = None
+            for attempt in range(_MARK_HANDOFF_MAX_ATTEMPTS):
+                try:
+                    self._handoff_marker(envelope.session_id, mark_conditions)
+                except Exception as exc:
+                    last_error = exc
+                    if attempt + 1 < _MARK_HANDOFF_MAX_ATTEMPTS:
+                        time.sleep(
+                            _MARK_HANDOFF_RETRY_BACKOFF_SECONDS * (attempt + 1)
+                        )
+                else:
+                    break
+            else:
+                # 状态写失败 fail-safe：判定结果已挂信封，应答不降级；
+                # 有界重试耗尽——会话未入终态（后续消息仍走 AI 管道，
+                # 人机混答窗口），ERROR 本地告警（可检索可告警）+
+                # trace 专用失败事件，绝不二次影响买家应答。
+                logger.error(
+                    "handoff mark failed after %d attempts; session not "
+                    "terminal session_id=%s trace_id=%s conditions=%s "
+                    "error=%s",
+                    _MARK_HANDOFF_MAX_ATTEMPTS,
+                    envelope.session_id,
+                    envelope.trace_id,
+                    mark_conditions,
+                    type(last_error).__name__ if last_error else "unknown",
+                    exc_info=last_error is not None,
+                )
                 tracing.record_handoff_mark_failed(envelope.trace_id)
         return envelope.model_copy(update={"handoff": assessment})
 

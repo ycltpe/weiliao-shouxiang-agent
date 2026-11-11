@@ -22,7 +22,7 @@ context:
 ## Boundaries & Constraints
 
 **Always:**
-- trace_id 由服务生成（编排器入口为单一权威点），不信任客户端 payload 值；响应必须携带服务端 trace_id。
+- trace_id 契约（2026-11-10 人工重谈修订，取代「不信任客户端 payload 值」原口径）：缺失即由服务生成（编排器入口为单一权威点），客户端携带值透传（含非 32-hex 值——该值仅跳过 Langfuse 追踪，fail-safe）；响应必须携带最终生效的 trace_id。
 - 追踪代码 fail-safe：Langfuse SDK 任何异常不得影响买家应答、不得超出管道时间预算；SDK 自身 flush 为后台线程，不得阻塞请求路径。
 - 架构可观测约定落入本 Story：每消息记录三文本字段（买家原文/消解后消息/最终下发文本，后两者当前恒等于原文）；降级事件写 trace；成本追踪记 token 与费用（API 级，真实调用属 Epic 4）。
 
@@ -35,7 +35,7 @@ context:
 
 | Scenario | Input / State | Expected Output / Behavior | Error Handling |
 |----------|--------------|---------------------------|----------------|
-| 正常消息进管道 | 信封校验通过（trace_id 缺失或伪造） | 编排器入口生成新 trace_id 回填信封；响应携带之；trace 记买家原文与各过滤器 span | N/A |
+| 正常消息进管道 | 信封校验通过（trace_id 缺失或携带值） | 编排器入口对缺失值生成新 trace_id 回填信封、携带值透传（2026-11-10 人工重谈裁定：透传为正式契约，见 Boundaries）；响应携带之；trace 记买家原文与各过滤器 span | 非 32-hex 携带值仅跳过 Langfuse 追踪（fail-safe） |
 | Langfuse 未配置 | 无 `LANGFUSE_PUBLIC_KEY` 等环境变量 | SDK 进入 disabled 态，全部追踪 no-op；应答/降级行为与 Story 1.4 完全一致 | 已验证：SDK 打印一次 warning 后自动禁用 |
 | 过滤器异常降级 | 链中某过滤器抛异常 | 应答兜底 + trace_id 不变；trace 记录降级事件与归因过滤器名 | 降级事件记录本身再抛异常则吞掉，绝不二次影响应答 |
 | SDK 调用抛错 | Langfuse client 方法抛任意异常 | 追踪跳过该条记录，管道结果不受影响 | observability 层统一 try/except 收敛 |
@@ -72,6 +72,14 @@ context:
 - Given Langfuse 未配置（无环境变量），when 任意消息处理，then 行为与 Story 1.4 逐字节一致（应答、降级、健康检查均不变），仅多一条禁用 warning 日志。
 - Given 成本追踪 API 被调用（脚手架级假数据），when 传入 token 用量与费用，then 记录挂到当前消息 trace（验证以替身 client 断言为准，Epic 4 接真实调用）。
 - 既有 39 测试零回归；`ruff check src tests` 无告警；`mypy src` strict 无错误。
+
+### Review Findings
+
+- [x] [Review][Decision] trace_id 信任边界矛盾 — 已决（2026-11-10 人工重谈）：维持携带值透传为正式契约；冻结块 Boundaries 与 Matrix 行 1 已同步修订 [src/weiliao_agent/pipeline.py:226]
+- [x] [Review][Patch] 兜底路径（校验失败/Redis 故障/编排器逃逸）trace_id 为 36 位带连字符 uuid，与编排器 32-hex 口径分裂，错误应答在 Langfuse 不可检索；且 tests/test_tracing.py:403 断言 `_TRACE_ID_HEX.fullmatch(...) is None` 把缺陷固化为期望行为，修复时需同步改测试 [src/weiliao_agent/adapters/http.py:71, tests/test_tracing.py:403]
+- [x] [Review][Patch] 根 span 在降级/异常路径 `__exit__(None, None, None)` 正常退出，过滤器 span 标 ERROR 而根 span 恒绿，Langfuse 按根 span 状态筛失败消息为零 [src/weiliao_agent/observability/tracing.py:177,189]
+- [x] [Review][Patch] `record_delivery` 的 `client.update_current_span(metadata={"delivered_text": reply})` 无测试替身实现（`_FakeLangfuse` 只有 start_as_current_observation/create_event），该路径在所有测试中从未成功执行（AttributeError 被 suppress 吞掉），删除该行全套件仍绿 [tests/test_tracing.py:63, src/weiliao_agent/observability/tracing.py:296]
+- [x] [Review][Defer] 买家原文明文作 span input/metadata 发往 Langfuse，无脱敏/PII 数据边界决策，仅 defer 给部署——届时加 masking 是 breaking change — deferred, pre-existing [src/weiliao_agent/observability/tracing.py trace_message]
 
 ## Implementation Notes
 

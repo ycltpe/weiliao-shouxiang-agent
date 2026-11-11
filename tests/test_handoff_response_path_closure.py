@@ -209,6 +209,24 @@ def test_gate_fail_closed_on_redis_error() -> None:
     assert result.trace_id == TRACE_ID
 
 
+def test_gate_fail_closed_on_non_redis_error() -> None:
+    # Epic 5 code review 补丁：5.5 闸门 catch-Exception 口径的回归锁定——
+    # 非 Redis 异常（编程错误等）同样 fail-closed 兜底（spec 5.5 评审
+    # 补丁 #1 的拍板行为进网；若未来收窄捕获，本条驱动实现同步改）。
+    class _ProgrammingErrorReader:
+        def read_handoff_status(self, session_id: str) -> str | None:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+
+    counting = _counting_filter()
+    orchestrator = _orchestrator(counting, _RecordingSender(), _ProgrammingErrorReader())
+
+    result = orchestrator.run(_envelope())
+
+    assert counting.calls == 0
+    assert result.degraded is True
+    assert result.failed_filter == "handoff_gate"
+
+
 def test_gate_backfills_trace_id_when_missing(
     manager: SessionManager, fake_langfuse: Any
 ) -> None:

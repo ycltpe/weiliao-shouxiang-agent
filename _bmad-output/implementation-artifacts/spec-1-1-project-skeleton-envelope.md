@@ -68,6 +68,13 @@ context:
 - Given 架构 Structural Seed 定义，当初始化代码库与依赖，则全部目录与最小可运行骨架就位，pyproject 版本与 Stack 表一致，既有 my-agent 依赖不复用、不继承
 - Given 任意来源的信封 dict，当经 `model_validate` 校验，则合法输入产出信封实例，缺必填字段/类型错误 fail-closed 抛 `ValidationError`
 
+### Review Findings
+
+- [x] [Review][Patch] 组合根 Redis URL 非法时 import 即崩（`redis.Redis.from_url` 裸抛 ValueError，无 fail-fast 提示）[src/weiliao_agent/main.py]
+- [x] [Review][Patch] 信封 `min_length=1` 不挡纯空白字符串（`" "` 可通过 session_id/house_id/trace_id 校验，生成 `weiliao:session: ` 类脏 key）[src/weiliao_agent/models/envelope.py:81-86]
+- [x] [Review][Patch] README 与实现矛盾两处：声称过滤器链/会话/健康/追踪"将在后续 Story 实现"（本 Epic 已交付），且 trace_id 仍列为必填 fail-closed（Story 1.5 已放宽为可选）[README.md]
+- [x] [Review][Patch] spec Verification 声明 `uv run ruff check .` 预期无告警，与仓库实际矛盾（全仓 302 存量告警）；应收窄为 `ruff check src tests`（1.3/1.4/1.5 已用收窄口径）[spec-1-1 Verification]
+
 ## Implementation Notes
 
 ## Spec Change Log
@@ -104,5 +111,5 @@ context:
 **Commands:**
 - `uv sync` -- expected: lock 更新成功，无依赖冲突
 - `uv run pytest` -- expected: 全绿（旧耦合测试已按处置方案移除）
-- `uv run ruff check .` -- expected: 无告警
+- `uv run ruff check src tests` -- expected: 无告警（code review 补丁：全仓含 vendored skills/docs 存量告警，收窄口径同 1.3-1.5）
 - `uv run mypy src` -- expected: strict 模式无错误

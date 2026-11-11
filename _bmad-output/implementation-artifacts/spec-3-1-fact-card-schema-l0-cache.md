@@ -210,3 +210,12 @@ set 用 Lua 原子写「索引 + 值 + 双双 EXPIRE 300s」，写入前执行 f
 - `pytest` -- expected: 全量含既有测试零回归 -- actual (2026-11-04): 165 passed（41→51 新测试，既有 114 零回归）
 - `mypy src` -- expected: strict 无错误 -- actual (2026-11-04): Success: no issues found in 28 source files
 - `ruff check src tests` -- expected: 无告警 -- actual (2026-11-04): All checks passed!
+
+### Review Findings
+
+（2026-11-10 Epic 级 code review：blind-hunter 9 / edge-case-hunter 4 / verification-gap 6 / acceptance-auditor 2，共 21 项原始发现，合并去重并驳回 1 项后 18 项——decision-needed 3 / patch 10 / defer 4 / dismiss 1。本分录 2 项 patch + 2 项 defer；decision-needed 2 项见 spec-3-3，patch 5 项见 spec-3-2，decision 1 项 + patch 2 项 + defer 1 项见 spec-3-4。驳回 1 项：`record_cache_event` 的 `invalidated` 兼指「写作废动作」与「读拦截」——docstring 已自认双语义，属文档化已知项。）
+
+- [x] [Review][Patch] 损坏墓碑读路径 fail-open 放行旧卡片、写路径 fail-close 拒新写入（medium；blind-hunter 层，已读码证实） [`src/weiliao_agent/cache/l0_client.py` `_decode_pair`] — 墓碑标记被写成浮点版本（手工修复/上游 bug，如 `v:2.5`）时：读路径 Python 侧 `int("2.5")` 抛 ValueError 被吞 → tomb_version=None → 照常返回旧卡片；写路径 Lua `tonumber` 得 2.5 → `2.5 >= 2` → 拒写。同一 Redis 状态两条路径裁决相反，形成「读得到但 300s 内写不进」的卡死窗口。**已修复（2026-11-11）**：读路径版本解析改为 float 与 Lua `tonumber` 对齐，浮点版本参与 `card.fact_version <= tomb_version` 比较（fail-close 遮蔽），`_decode_pair` 返回类型同步为 `float | None`。
+- [x] [Review][Patch] `L0CacheClient` 构造器 `ttl_seconds` 无正数校验（low；edge-case-hunter 层，已读码证实） [`src/weiliao_agent/cache/l0_client.py` `__init__`] — 与 L1 构造期 fail-fast 不对称；`ttl_seconds=0` 时写入静默恒败 → 消费者永不提交 offset → 同一事件无限重放，故障形态为日志噪音而非启动 fail-fast。**已修复（2026-11-11）**：构造器加 `ttl_seconds <= 0` 抛 ValueError，与 L1 对称。
+- [x] [Review][Defer] 缓存击穿：热 key 过期瞬间并发 miss 无 single-flight/按 key 互斥（low；edge-case-hunter 层） [`src/weiliao_agent/filters/cache_lookup.py:61-78`] — deferred，非本 Epic 规格要求（cache-aside 常规形态）；settle：Epic 4 LLM 链路接线后随压测评估 LLM 调用放大系数，若冲击 NFR-1 预算再引入请求合并。
+- [x] [Review][Defer] 缓存雪崩：批量写入 key 共享同一过期时刻，无 TTL jitter（low；edge-case-hunter 层） [`src/weiliao_agent/cache/l0_client.py:136-137`] — deferred，与击穿条目同根因评估路径；settle：随压测观察周期性命中率塌缩，必要时对 TTL 加 ±10% jitter。

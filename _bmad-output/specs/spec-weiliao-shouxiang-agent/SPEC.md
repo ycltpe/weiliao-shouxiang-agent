@@ -1,7 +1,7 @@
 ---
 id: SPEC-weiliao-shouxiang-agent
 companions:
-  - architecture-decisions.md      # spec-authored：AD-1..AD-10 架构决策与不变量
+  - architecture-decisions.md      # spec-authored：AD-1..AD-12 架构决策与不变量
   - structural-seed.md             # spec-authored：目录结构种子 + Capability→Architecture 映射
   - glossary.md                    # spec-authored：意图枚举、事实卡片、会话等领域词汇
   - stack.md                       # spec-authored：技术栈与部署形态（含既有脚手架排除说明）
@@ -40,7 +40,7 @@ sources: []
   - **success:** 生成内容不虚构事实卡片之外的房源数据（价格、面积、学区）；首 token 到达 P99 < 1.5s。
 - **CAP-7 生成内容审核**
   - **intent:** LLM 生成内容 100% 经风控中台后置审核通过后才可发送给买家；审核不通过时切换至模板兜底应答。
-  - **success:** 审核通过率 ≥ 95%（上线前压测基线，作为全量放行门槛）；审核不通过时买家收到模板兜底响应、服务无中断；未审核内容零外发。
+  - **success:** 审核通过率 ≥ 95%（上线前压测基线，作为全量放行门槛）；通过率持续监控，线上跌破阈值时触发告警；审核不通过时买家收到模板兜底响应、服务无中断；未审核内容零外发。
 - **CAP-8 OpenAI 故障降级**
   - **intent:** OpenAI 返回 429 / 5xx / 超时（> 1.8s）时自动切换至模板兜底；恢复后按 10% 步进逐步切回。
   - **success:** 降级切换时间 < 100ms；降级期间服务可用性不降级（不向买家返回 5xx）；降级事件写入 Langfuse trace 并触发监控告警。
@@ -53,6 +53,12 @@ sources: []
 - **CAP-11 指代消解**
   - **intent:** 在意图分类之前，将会话上下文中已知的实体引用（"它""这套""那套""上面说的"等）归一化为显式引用，输出自包含的消解后消息与引用元数据，作为意图分类、重复追问判定与 LLM 生成的唯一输入。
   - **success:** 房源指代消解准确率 ≥ 95%（人工标注测试集，含指代类样本 ≥ 20%）；消解延迟 P99 < 10ms；无法确定先行词时保留原文进入意图分类，不阻塞、不转人工（PRD FR-11）。
+- **CAP-12 转人工后响应路径关闭**
+  - **intent:** 转人工后，同一会话的后续消息被入口/编排器短路，不再产生任何 AI 应答（无 LLM 生成、无模板兜底），避免人机混答。
+  - **success:** 编排器经 SessionManager 读取 Redis 权威 handoff_status 短路后续消息，不重建信封走 AI 管道；"转人工后零 AI 回复"端到端测试用例存在且通过；handoff 状态不存在或会话已过期（TTL 30 分钟）时，新消息状态从零初始化、走正常管道。
+- **CAP-13 模型路由与成本护栏**
+  - **intent:** 按流量特征（意图复杂度/置信度）在 gpt-4o / gpt-4o-mini 之间进行配置化路由，并设定 token 预算护栏，成本异常时主动收紧而非仅事后记录。
+  - **success:** 路由策略配置化、可灰度调整，单条消息的模型选择与调用费用经 Langfuse trace 可复盘；预算超限时自动收紧路由（提高 mini 模型占比）并触发 ERROR 级告警。
 
 ## Constraints
 
@@ -62,6 +68,10 @@ sources: []
 - 合规：AI 身份必须明确披露，不得以任何形式伪装真人经纪人。
 - 全链路数据交换统一为单一 Pydantic 信封模型（session_id、house_id、turn、intent、timestamp、trace_id、message、resolved_message、coref、media_type 十字段，schema 见 [glossary.md](glossary.md)）；管道过滤器间仅通过信封传递，禁止跨过滤器私有耦合（细节见 [architecture-decisions.md](architecture-decisions.md) AD-1）。
 - 追问计数的权威值只存于 Redis，任何进程内缓存（L1）快照不得作为判定依据；硬触发判定一律读 Redis 权威值（AD-4/AD-5/AD-12）。
+- 过审草稿冻结：过审草稿除添加"AI 助手："前缀外不得再被改写；空串或仅空白草稿由 risk_review / 响应组装入口按"无草稿"拦截，走模板兜底应答，拦截发生于携标组装之前，draft_empty 拦截事件记入 Langfuse trace（FR13）。
+- PHOTO_REQUEST 意图的模板兜底须提供图片素材应答（房源图片链接/相册引导）与无图时的替代话术，禁止以纯文本敷衍照片请求。
+- 运维交付门：全部新增 env 变量（含 WEILIAO_LLM_BREAKER_* 系列）须在 runbook/README 中具备说明、缺省值与调参影响；`/health` 返回的 model_routing 快照与 ERROR 级 model_routing_alert 告警须有 runbook 处置步骤；`.env.example` 不留空值变量，整体拷贝为 .env 即可启动（NFR9）。
+- 超时风暴压测门：Epic 4 真实过滤器落地后须执行超时风暴压测，重审编排器执行器生命周期（共享池/cancel/信封所有权）并落地决策；被超时丢弃的生成调用须完成 token 记账落地，或记录"不做"的决策理由（NFR10）。
 
 ## Non-goals
 

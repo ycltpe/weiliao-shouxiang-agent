@@ -129,3 +129,12 @@ context:
 - `uv run pytest -q` -- expected: 既有 236 测试零回归 + 新增测试全过
 - `uv run mypy src` -- expected: 零错误
 - `uv run ruff check src tests` -- expected: 零告警
+
+### Review Findings
+
+（2026-11-10 Epic 级 code review，全局统计见 spec-3-1 分录头。本分录 1 项 decision + 2 项 patch + 1 项 defer。）
+
+- [x] [Review][Decision] 命中率分母被收窄为「实际 L0 查询数」，与 Epic 级口径「基数为全部首次消息」存在已记录偏离（low；acceptance-auditor 层） [`src/weiliao_agent/observability/metrics.py:84-88`、`src/weiliao_agent/filters/cache_lookup.py:55-60`] — 追问剔除分母 ✓、L1+L0 分子 ✓；但 intent=None 消息（分类 fail-closed / 占位路径）被 cache_lookup 的提前 return 整体剔除分母，spec Design Notes 已冻结为「最小差异」。**裁决（2026-11-11）：选 A 接受收窄口径**——spec 冻结区固化即 Epic 验收口径，无代码改动；后续 Epic 压测验收时以「含 intent 的首次消息」为分母口径读数。
+- [x] [Review][Patch] 「同 session 同 intent 第 2 条消息 100% 禁走 L0」无组合管线级验证，「100% 进入 LLM 链路」完全无下游断言（medium；verification-gap 层） [`src/weiliao_agent/filters/cache_lookup.py`、`tests/test_cache_lookup.py`、`tests/test_session.py`] — 禁走行为只在两个孤立单测 seam 验证，生产接线全链路无测试走过；intent_router 的 followup_recorder 注入若被移除，接缝回归全绿入库。**已修复（2026-11-11）**：新增组合根端到端 `test_main_composition_root_followup_bypasses_l0`——同 session 两条同 intent 消息经真实默认链（含 coreference），第 2 条断言 L0 get 类级 spy 调用数零增长、metrics `bypassed==1`、Langfuse `bypass` 事件存在（trace_id 用 32-hex 口径以满足 `_recordable`）。「响应非模板占位、相似度 <0.8」断言仍待 Epic 4 接线后追加（deferred-work 条目）。
+- [x] [Review][Patch] /health 命中率读数入口只验证零态，「过滤器计数→/health 快照」贯通无单一测试（low；verification-gap 层） [`tests/test_health.py`、`src/weiliao_agent/health/probe.py`] — 现有断言只锁零态三个键，`l0_miss`/`l1_hit`/`bypassed` 形状无断言；组合根若换成独立 collector 实例，两端单测各自仍绿、/health 读数恒零静默失灵。**已修复（2026-11-11）**：新增 `test_health_cache_metrics_full_shape_and_wiring`——计数器注入 hit/miss/bypass 后经 `create_app()` TestClient 读 /health，断言 `cache_metrics` 七字段精确数值（含 `hit_rate` approx）。
+- [x] [Review][Defer] 命中率 ≥80% 无任何可执行验证，且「命中改变买家应答」无下游消费断言（medium；verification-gap 层） [`src/weiliao_agent/filters/cache_lookup.py:65`] — deferred：L0 命中把 FactCard 挂到信封后 Epic 3 内无任何下游消费者读取 fact_card，命中率分子涨落与买家体验的接线留给 Epic 4，无守护；≥80% 压测验证 spec-3-4 明示不在本 Story，仓库无发布门。settle：Epic 4 接线后补组合测试（预置卡片→首条消息应答来自卡片→/health hit_rate 读数正确）；压测脚本化（≥80% 写成可执行发布断言）随 deferred-work 既有 fakeredis/压测设施条目一并 settle。

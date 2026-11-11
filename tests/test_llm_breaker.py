@@ -249,6 +249,37 @@ def test_concurrent_trips_count_exactly_once() -> None:
     assert metrics.snapshot()["trips"] == 1
 
 
+def test_per_model_states_are_isolated() -> None:
+    # code review Epic 4 补丁：mini 瞬态故障只熔断 mini 键，主模型与
+    # 缺省键健康路径照常放行（此前全局单状态会连坐全链路）。
+    clock = _FakeClock()
+    breaker = LlmCircuitBreaker(cooldown_seconds=10, clock=clock)
+
+    assert breaker.on_failure("rate_limit", model="gpt-4o-mini") is True
+    assert breaker.before_request(model="gpt-4o-mini") is False
+    assert breaker.before_request(model="gpt-4o") is True
+    assert breaker.before_request() is True  # 缺省键不受影响
+    assert breaker.state == STATE_OPEN  # 最重态上报
+
+    # mini 键冷却满后步进恢复，不触碰主模型键。
+    clock.advance(10)
+    assert breaker.before_request(model="gpt-4o-mini") is True
+    assert breaker.on_success(model="gpt-4o-mini") is False  # 步进未闭合
+    assert breaker.before_request(model="gpt-4o") is True
+
+
+def test_per_model_snapshot_exposes_non_default_keys() -> None:
+    breaker = LlmCircuitBreaker()
+    breaker.on_failure("timeout", model="gpt-4o-mini")
+
+    snapshot = breaker.snapshot()
+
+    assert snapshot["state"] == STATE_OPEN
+    assert snapshot["models"] == {
+        "gpt-4o-mini": {"state": STATE_OPEN, "current_step": 1}
+    }
+
+
 def test_concurrent_consults_are_exact() -> None:
     # 线程安全：并发咨询的放行/拒绝计数须精确（过滤器在 executor 线程执行）。
     metrics = LlmBreakerMetricsCollector()

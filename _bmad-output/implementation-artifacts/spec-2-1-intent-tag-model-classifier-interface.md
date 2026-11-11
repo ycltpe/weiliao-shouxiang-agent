@@ -111,6 +111,12 @@ deferred:
   - verification-gap 层：无发现（I/O 矩阵六场景与既有测试覆盖均已核验在跑且通过）。
   - `[false]` `[reject]` intent 对齐审计（描述性，无行动项）：diff 落在 R1+R2 读法；R3（配置选择机制）由 epics AC 原文延期（「切换方式在第 2 周选型时确定」），spec Design Notes 明示不动组合根——无规格外偏离。
 
+### Review Findings
+
+（2026-11-10 Epic 级 code review：blind-hunter / edge-case-hunter / verification-gap / acceptance-auditor 四层，原始 16 项，合并去重后 15 项；本分录 1 项 patch，其余见 spec-2-2 / spec-2-3）
+
+- [x] [Review][Patch] 非一致性分类器的 NaN confidence 使分类成功 trace 事件静默丢失（low；edge-case-hunter 层） [`src/weiliao_agent/filters/intent_router.py` `process()` confidence 提取处] — Protocol 为结构化鸭子类型：duck-type 实现（测试替身/未来规则引擎）返回合法 tag + `confidence=float('nan')` 时，`IntentClassification` 的 `Field(ge=0.0, le=1.0)` 校验被绕过（对象未经构造器），`record_classification` metadata 携带 NaN 致 Langfuse 序列化抛错、被 `suppress(Exception)` 吞掉——分类成功事件静默丢失，与 fail-closed 在外部观测不可区分；修法：confidence 取值后加 `confidence != confidence` NaN 守卫（移入既有 try，自动走 fail-closed UNKNOWN 并记 trace），一行。**已修复（2026-11-10）：守卫落位 try 内 + `test_nan_confidence_fails_closed_to_unknown` 用例。**
+
 ## Design Notes
 
 选择 `typing.Protocol` 而非 ABC 定义分类器接口：实现方（规则引擎 / LLM zero-shot / 微调模型）本就异构，Protocol 允许其保持任意继承结构，符合"可替换而不影响路由链路"。注入点放在 `IntentRouterFilter` 构造参数而非配置模块硬注册：路由链路代码因此零感知切换，"通过配置选择"由组合根（如 `main.py`，本 Story 不动）日后装配时兑现，Story 2.2 提供默认实现时亦无需回改本接口。

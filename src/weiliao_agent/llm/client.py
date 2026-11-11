@@ -59,6 +59,9 @@ class LlmGenerationError(Exception):
     def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(detail or reason)
         self.reason = reason
+        # 实际出错的模型 alias（client 在抛出点回填；供熔断器按 alias
+        # 分键，code review Epic 4 补丁）。手工构造的异常缺省 None。
+        self.model: str | None = None
 
 
 @dataclass
@@ -159,12 +162,19 @@ class OpenAiGenerationClient:
             # 回调自身 fail-safe，绝不阻塞应答路径。
             future.add_done_callback(_discarded_completion_callback(trace_id))
             msg = f"llm generation exceeded {self._budget_seconds:.2f}s budget"
-            raise LlmGenerationError("timeout", msg) from None
-        except LlmGenerationError:
+            error = LlmGenerationError("timeout", msg)
+            error.model = self._model
+            raise error from None
+        except LlmGenerationError as exc:
+            # 回填实际出错的模型 alias（熔断器按 alias 分键消费）。
+            if exc.model is None:
+                exc.model = self._model
             raise
         except Exception as exc:
             # 惰性构造异常等未归类失败归一为统一错误（自报底层类型名）。
-            raise LlmGenerationError(type(exc).__name__, str(exc)) from exc
+            error = LlmGenerationError(type(exc).__name__, str(exc))
+            error.model = self._model
+            raise error from exc
 
     def _generate_with_retry(self, messages: list[BaseMessage]) -> GenerationResult:
         """执行线程内：惰性构造 + 至多 1 次重试（仅可重试错误）。"""
@@ -228,8 +238,15 @@ def _to_result(response: Any, *, model: str) -> GenerationResult:
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
+        # 纯 str 块（部分兼容网关/中转对 text part 的返回形态）直接取用；
+        # 其余未知类型块不静默丢弃——文本为空时归一 invalid_output 上抛
+        # （code review Epic 4 补丁：静默截断比抛错更糟）。
         text = "".join(
-            str(block.get("text", "")) for block in content if isinstance(block, dict)
+            block
+            if isinstance(block, str)
+            else str(block.get("text", ""))
+            for block in content
+            if isinstance(block, (str, dict))
         )
     else:
         msg = f"unexpected response content type: {type(content).__name__}"

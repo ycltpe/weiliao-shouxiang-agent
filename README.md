@@ -6,7 +6,10 @@
 
 买家消息经标准化信封（Envelope）流经处理管道，每个过滤器仅消费上游信封、
 产出下游信封，过滤器之间禁止私有耦合。当前代码库已完成项目骨架与信封模型
-（Story 1.1），过滤器链、会话管理、健康检查与追踪脚手架等能力将在后续 Story 实现。
+（Story 1.1）及过滤器链编排、会话状态管理、健康检查端点、Langfuse
+追踪脚手架（Story 1.2-1.5，Epic 1 已交付）；意图分类、事实缓存、LLM
+子图、转人工与指代消解等能力见 `_bmad-output/implementation-artifacts/`
+各 Story spec。
 
 ## 目录结构（Structural Seed）
 
@@ -30,8 +33,10 @@ src/weiliao_agent/
 `message`、`resolved_message`、`coref`、`media_type` 四字段（暂未消费）。
 
 任意来源的 dict 必须经 `Envelope.model_validate` 校验后方可进入管道；缺失必填
-字段（`session_id` / `house_id` / `timestamp` / `trace_id`）或类型错误一律
+字段（`session_id` / `house_id` / `timestamp`）或类型错误一律
 fail-closed，抛出 `pydantic.ValidationError`，由调用方兜底。
+`trace_id` 自 Story 1.5 起放宽为可选——缺失由编排器入口权威生成，
+客户端携带值按正式契约透传（纯空白串拒绝）。
 
 ## 快速启动
 
@@ -113,6 +118,7 @@ curl -s localhost:8000/health
 |------|------|------|----------|
 | `WEILIAO_INTENT_CLASSIFIER` | `llm_zero_shot` | 意图分类器实现（`none` 保留占位行为） | 非法值启动 fail-fast；换实现只动配置与组合根 |
 | `WEILIAO_INTENT_MODEL` | `gpt-4o-mini` | 意图分类模型 alias（构造参数 > 本变量 > 模块缺省） | 换更优模型提分类质量；alias 不存在时分类 fail-closed 走兜底 |
+| `WEILIAO_INTENT_TIMEOUT_SECONDS` | `0.8` | 意图分类硬超时秒数（构造参数 > 本变量 > 模块缺省；2026-11-10 评审放宽，原 45ms 与真实 LLM 网络 RTT 物理不相容） | 调小收紧延迟、调大容忍慢网络；非正值启动 fail-fast（构造抛 `ValueError`） |
 
 **Kafka（Story 3.2 / 5.2 共用门控，可选启停）：**
 
@@ -134,7 +140,8 @@ L0 命中（`l1_hit` 为 L1 预留并入位，当前无 L1 读消费者、恒 0�
 追问且 intent 非 None 的实际 L0 查询数（hit + miss，Redis 故障归并 miss）；
 分母为 0 时 `hit_rate` 为 `null`。计数器是进程内单例：多实例部署时每个进程
 独立计数，`/health` 读到的是被采样实例自身的数；计数窗口等于进程生命周期，
-进程重启即清零。
+进程重启即清零。注：`l1_hit` 字段为预留并入位，AD-5 严禁 L1 存事实卡片、
+L1 不存在事实命中，该字段永不兑现、恒 0（2026-11-11 评审裁决 D1）。
 
 **风控中台审核（Story 4.4）：**
 

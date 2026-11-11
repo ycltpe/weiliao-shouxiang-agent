@@ -129,6 +129,16 @@ class LlmGenerationSubgraph:
         self._router = router
         self._graph = build_generation_graph(self._client, router=router)
 
+    def peek_model(self, intent: IntentTag | None) -> str:
+        """纯读预览本次将使用的模型 alias（code review Epic 4 补丁）。
+
+        无副作用（router.peek_model 不做窗口剔除/状态迁移），供过滤器层
+        熔断器按 alias 分键；无 router 时为主模型 client 的 alias。
+        """
+        if self._router is not None:
+            return self._router.peek_model(intent)
+        return self._client.model
+
     def generate(
         self,
         resolved_message: str,

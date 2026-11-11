@@ -28,7 +28,7 @@ context:
 **Always:**
 - 分类器只消费消息文本 + 会话上下文（`Mapping`），输出单一 `IntentClassification`；不读信封其他字段、不直接碰 Redis。
 - 意图写入只经 `SessionManager.write_intent`（AD-4 单写者）；过滤器注入 writer callable，写失败 fail-safe：应答不降级、信封保留分类结果、trace 记失败事件。
-- 分类延迟预算 P99 < 50ms：实现内部自带硬超时守卫（超时 fail-closed UNKNOWN 并记 trace），不依赖编排器 deadline 兜底。
+- 分类延迟硬超时守卫：实现内部自带硬超时（默认 800ms，构造参数 > `WEILIAO_INTENT_TIMEOUT_SECONDS` env > 默认；超时 fail-closed UNKNOWN 并记 trace），不依赖编排器 deadline 兜底。原 P99 < 50ms 预算与真实 LLM 网络 RTT 物理不相容，2026-11-10 评审决策记为不可达 NFR 缺口（见 Review Findings 决策项），真实 P99 经 `latency_ms` 埋点 + 压测设施实测。
 - 既有 fail-closed 行为零回归：空文本不调分类器、分类异常 UNKNOWN、未注入分类器占位行为逐字节保留（既有 73 例测试锁定）。
 - `mypy src` strict 与 `ruff check src tests` 保持干净；切换实现只动配置与组合根（`main.py`），`pipeline.py` 默认链不改。
 
@@ -65,7 +65,7 @@ context:
 
 **Execution:**
 - [x] `src/weiliao_agent/classifiers/__init__.py` -- 新建：按配置名构造分类器实现的工厂（`create_classifier(name: str) -> IntentClassifier`），包级统一入口。
-- [x] `src/weiliao_agent/classifiers/llm_zero_shot.py` -- 新建 LLM zero-shot 默认实现（ChatOpenAI 结构化输出单一标签 + 置信度）；含硬超时守卫（45ms）与模型名经配置注入（脊柱：模型名禁硬编码，gpt-4o 系 2027-01-14 关停需 alias 可换）。
+- [x] `src/weiliao_agent/classifiers/llm_zero_shot.py` -- 新建 LLM zero-shot 默认实现（ChatOpenAI 结构化输出单一标签 + 置信度）；含硬超时守卫（默认 800ms，2026-11-10 评审放宽，原 45ms；env 可调）与模型名经配置注入（脊柱：模型名禁硬编码，gpt-4o 系 2027-01-14 关停需 alias 可换）。
 - [x] `src/weiliao_agent/session/manager.py` -- 新增 `write_intent(session_id, turn, classification)`：`SET {prefix}{sid}:intent:{turn} {model_dump_json()} EX ttl`；docstring 更新为完成口径。
 - [x] `src/weiliao_agent/filters/intent_router.py` -- 构造可选注入 `intent_writer: Callable[[str, int, IntentClassification], None] | None`；分类成功后 `turn` 非 None 且 writer 存在时调用，try 包裹 fail-safe；分类成功/失败各补 trace 事件调用。
 - [x] `src/weiliao_agent/observability/tracing.py` -- 新增 `record_classification`（tag/confidence/source/latency_ms）与 `record_classification_failure`（reason），fail-safe 吞异常。
@@ -83,8 +83,9 @@ context:
 
 ## Implementation Notes
 
-- 超时守卫双保险：ChatOpenAI 客户端级 timeout=45ms（Design Notes 口径）+
-  调用侧 `future.result(timeout)`（同一预算）——测试替身延迟亦可触发
+- 超时守卫双保险：ChatOpenAI 客户端级 timeout=解析后预算（Design Notes
+  口径；默认 800ms）+ 调用侧 `future.result(timeout)`（同一预算，超时另
+  对未启动任务 `future.cancel()` 防队列积压——2026-11-10 评审补丁）——测试替身延迟亦可触发
   `reason=timeout` 失败事件，守卫先行返回不傻等（超时的 LLM 线程无法
   中止，实例级 ThreadPoolExecutor 上限 8 防御线程膨胀）。
 - ChatOpenAI 客户端惰性构造（首次 classify）：组合根导入不依赖 OpenAI
@@ -134,13 +135,28 @@ context:
 
 分组路由：G1（B6+V1+V2，组合根默认链路无测试锁定）/ G2（B5+E4+V4，测试污染主模块）/ G3（E3+V3，eval live 不 fail-closed）/ G4（B1，死代码）/ G5（E1，confidence 访问逃逸）/ G6（E2，空 env 崩溃）→ 全部 patch；无 intent_gap / bad_spec，不触发回环。
 
+### Review Findings
+
+（2026-11-10 Epic 级 code review：四层原始 16 项合并去重后 15 项，本分录 2 项 decision + 1 项 defer + 7 项 patch；spec-2-1 / spec-2-3 各 1 项。测试基线：842 passed, 4 skipped）
+
+- [x] [Review][Decision→Patch] 45ms 硬超时与真实 LLM 网络 RTT 物理不相容（high；blind-hunter 层） [`src/weiliao_agent/classifiers/llm_zero_shot.py:38` `DEFAULT_TIMEOUT_SECONDS = 0.045`] — 已回 96ec504 核实：timeout 仅构造参数可调，无 env 注入路径；真实部署下分类确定性超时 UNKNOWN → 追问/hard trigger 整体失效，fail-closed 把全损伪装成正常降级。**裁决（2026-11-10）：选 A 放宽硬预算**——`DEFAULT_TIMEOUT_SECONDS` 0.045 → 0.8（300–800ms 区间上沿，仍在全链路 P99 < 3s / AD-9 的 1.8s LLM 预算内），同时新增 `WEILIAO_INTENT_TIMEOUT_SECONDS` env 注入（构造参数 > env > 默认）并加正值校验；P99 < 50ms 分类延迟 NFR 明示为不可达缺口，epic-2-context 与 spec-2-2 延迟口径同步修订；`latency_ms` 埋点保留，真实 P99 待 Story 7.2 压测设施实测回填（deferred-work 已有 6-3 挂账）。**已修复（2026-11-10）：代码 + `.env.example` / README 声明 + `scripts/loadtest_intent_chain.py` FR1_P99_BUDGET_MS 50→800 一并落地，全套件 859 例绿。**
+- [x] [Review][Decision→Defer] session_id 无格式约束可致 Redis key 命名空间碰撞（low；blind-hunter 层） [`src/weiliao_agent/models/envelope.py:40` + `src/weiliao_agent/session/manager.py` `KEY_PREFIX`] — 信封仅 `min_length=1` 无字符集约束；`session_id="a:intent:1"` 的会话 hash key 与会话 `"a"` 的 turn 1 意图 string key 逐字节同串 → `WRONGTYPE` 持续 fail-closed 降级，TTL 内自我维持。**裁决（2026-11-10）：选 A 接受风险，defer**——理由：仅构造输入可达、后果为 fail-closed 降级非越权，加 charset 校验需先确认上游 SpringBoot session_id 字符集；已记录 deferred-work.md，settle：部署形态落地、确认上游 session_id 字符集后复审。
+- [x] [Review][Defer] 失败路径观测仅存在于 Langfuse——未配置 Langfuse 的部署中分类全损事故完全静默（medium；blind-hunter 层） [`src/weiliao_agent/observability/tracing.py` `record_classification_failure`] — defer，pre-existing（1.5 既定替身/无 client no-op 模式）：2.1 评审 defer 的「分类失败路径静默」未真正关闭，只是兑现物本身在无 client 时为 no-op；代码库多处已用 stdlib logging（main/pipeline/http 等），tracing 失败路径无一处 logger。settle 路径：随可观测部署工作（1.5 deferred 同路径）统一决定失败事件是否加 logger 兜底；与上一条 45ms 决策联动——若选 D（默认降级），分类失败日志成为必选项。已记录 deferred-work.md。
+- [x] [Review][Patch] 超时丢弃的 LLM 任务不 cancel、executor 无界队列——超时风暴下积压内存 + 恢复后僵尸洪峰（medium；blind-hunter+edge-case-hunter 两层同根因合并） [`src/weiliao_agent/classifiers/llm_zero_shot.py` `classify()`] — `future.result(timeout)` 超时后仅抛异常，不 cancel future：排队中任务无法取消（`_MAX_WORKERS=8` 只防线程膨胀不防队列膨胀），积压速率=RPS、消化速率=8/调用时长；LLM 恢复后队列中数百条针对已应答消息的陈旧分类一次性执行（无效 token 消耗洪峰），期间真实消息分类吞吐接近归零。修法：FutureTimeoutError 路径加 `future.cancel()`（对未启动任务有效，一行）；可选 `threading.BoundedSemaphore(_MAX_WORKERS)` submit 前限流。**已修复（2026-11-10）：`classify()` FutureTimeoutError 路径加 `future.cancel()`（最小修法；BoundedSemaphore 限流未采纳——cancel 已覆盖排队中任务，信号量属未实证复杂度，同 E5 裁决口径）。**
+- [x] [Review][Patch] eval harness `_load_csv` 不容忍 UTF-8 BOM（low；edge-case-hunter 层） [`tests/eval_intent_classifier.py` `_load_csv`] — Excel/WPS 另存 CSV 普遍带 BOM，首列名解析为 `"\ufefftext"` 致 `SystemExit("CSV must have columns text,label")`（报错有误导性）；目标使用路径（运营导出语料跑验收门）必踩。修法：改 `encoding="utf-8-sig"`。**已修复（2026-11-10）。**
+- [x] [Review][Patch] eval 门禁逻辑零自动化验证（low；verification-gap 层，经变异论证实证） [`tests/eval_intent_classifier.py` `_evaluate`] — 全仓无任何测试 import 该模块（文件名非 `test_` 前缀不在收集路径）；变异：`>= GATE_ACCURACY` 改 `>`、删 coverage 条件、`MIN_EVAL_ROWS` 改 10、deferred 分支 `return 0` 改 `return 1`——全套件全绿。该门禁是 AC「≥90%·≥1000 真实验收门」（deferred 至语料就绪）的唯一执行体。修法：单测 import 模块 + stub 分类器走 `_evaluate` 四分支（999 行 deferred / 1000 行单类 coverage 不足 deferred / acc=0.85 exit 1 / acc=0.92 exit 0）+ `_load_csv` 非法行过滤两例，全程无网络。**已修复（2026-11-10）：新建 `tests/test_eval_intent_classifier.py` 6 例（四分支 + BOM/非法行 + 缺列拒绝）。**
+- [x] [Review][Patch] `intent.classification_failure` 事件 level/event 判别字段无断言（low；verification-gap 层） [`src/weiliao_agent/observability/tracing.py` + `tests/test_classifier.py` / `tests/test_intent.py`] — 对照 `intent.followup_hard_trigger` 的 `level=="WARNING"` 有断言（test_intent.py），三处失败事件断言只查 name 与 metadata["reason"]；变异删 `level="ERROR"` 或 event 字段全套件绿，下游按级别告警的观测配置静默失效。修法：三处各补一行 `assert failure[0]["level"] == "ERROR"`（及一处 event 字段），零新测试成本。**已修复（2026-11-10）：三处补 level 断言（writer 失败 / 分类超时 / recorder 失败）；event 判别字段断言未加——`name` 与 `metadata["event"]` 同面冗余，name 已断言，按最小修法收口。**
+- [x] [Review][Patch] `create_classifier` 规范化与 env 空串回落无测试（low；verification-gap 层） [`src/weiliao_agent/classifiers/__init__.py` + `src/weiliao_agent/main.py`] — `name.strip().lower()` 归一化与 `os.environ.get(...) or "llm_zero_shot"` 空串回落均只有文档承诺、无测试锁定（变异删除归一化/改 `.get(default)` 形式全套件绿）。修法：两个参数化用例 `create_classifier(" LLM_ZERO_SHOT ")` / `create_classifier(" None ")` + 一个 `setenv("")` 组合根 reload 用例断言装配出 `LlmZeroShotClassifier`。**已修复（2026-11-10）：test_session.py 补 4 例（规范化参数化 ×2 + none 归一化 ×2 + 空 env 组合根回落）。**
+- [x] [Review][Patch] 组合根显式过滤器链构成无测试钉住（low；verification-gap 层） [`src/weiliao_agent/main.py`] — diff 将 `PipelineOrchestrator()` 默认链改为显式清单（生产链权威），既有组合根测试只断言行为不命名链构成；变异删除/重排任一过滤器全套件绿——risk_review 是合规闸挂点，生产链与默认链悄然分叉无信号。修法：组合根测试补一条经 `pipeline` 只读属性断言过滤器名清单（注意：工作树 HEAD 链成员已含后续 Epic 过滤器，断言以 HEAD 实际清单为准）。**已修复（2026-11-10）：`test_main_composition_root_filter_chain_is_pinned` 经 create_app 间谍捕获编排器，断言 HEAD 实际链六成员与顺序（coreference → intent_router → cache_lookup → llm_generate → risk_review → response_assembler）。**
+- [x] [Review][Patch] eval harness `ALL_TAGS` 手抄 9 类枚举，未按 2.1 既定模式派生（low；acceptance-auditor 层） [`tests/eval_intent_classifier.py:25`] — 2.1 评审已将 test_intent.py 同类问题裁定为 patch 并改 `typing.get_args(IntentTag)` 派生；harness 未套用——`IntentTag` 日后增删类时覆盖率/门禁口径静默漂移（`_load_csv` 的 label 过滤与 GATE coverage 检查均以此为准）。修法：改 `ALL_TAGS: tuple[IntentTag, ...] = typing.get_args(IntentTag)`。**已修复（2026-11-10）。**
+
 ## Design Notes
 
 **writer 注入而非过滤器直写 Redis**：AD-4 要求意图只能经会话管理模块写入。过滤器注入的是 `SessionManager.write_intent` 方法引用（callable），满足单写者且过滤器不持有 Redis 客户端；测试路径不注入即跳过，天然兼容既有 73 例的替身装配。
 
 **trace 可验证口径**：编排器入口 `trace_message` 的 intent 是 preset 值（分类尚未发生），故分类结果只能以事件形式补挂同一 trace_id——这正是 2.1 评审 defer 的「分类失败路径观测挂点」，本 Story 一并兑现（成功事件 + 失败事件 + 写失败事件）。
 
-**LLM 方案延迟守卫**（已选定）：客户端级 timeout 设在预算内（45ms），超时/网络错误一律返回 UNKNOWN + trace 失败事件；不给规则兜底（保持单一来源，避免双实现口径漂移）。置信度取 LLM 结构化输出的自评分数；若模型不自评，由过滤器侧以固定口径回填（如 0.8），不回填 1.0——为 2.3 追问归并保留信号空间。
+**LLM 方案延迟守卫**（已选定；2026-11-10 评审修订）：客户端级 timeout 设在预算内（默认 800ms，原 45ms 与真实网络 RTT 物理不相容，P99 < 50ms NFR 记为不可达缺口），超时/网络错误一律返回 UNKNOWN + trace 失败事件；不给规则兜底（保持单一来源，避免双实现口径漂移）。置信度取 LLM 结构化输出的自评分数；若模型不自评，由过滤器侧以固定口径回填（如 0.8），不回填 1.0——为 2.3 追问归并保留信号空间。
 
 ## Verification
 

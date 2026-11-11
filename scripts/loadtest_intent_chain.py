@@ -1,5 +1,7 @@
 """FR-1 全链压测设施（Story 7.2）：coreference → intent_router 端到端
-P99 < 50ms 实测验收（收口 6.1/6.2/6.3 同根挂账）。
+P99 实测验收（收口 6.1/6.2/6.3 同根挂账；2026-11-10 评审决策：原
+P99 < 50ms 预算与真实 LLM 网络 RTT 物理不相容，记为不可达 NFR 缺口，
+门随分类器硬超时预算放宽至 800ms，见 spec-2-2 Review Findings）。
 
 全链口径：真实 CoreferenceFilter（Story 6.2 规则 resolver——单趟正则
 扫描、微秒级）+ 真实 IntentRouterFilter（llm_zero_shot 分类器，45ms
@@ -10,7 +12,7 @@ P99 < 50ms 实测验收（收口 6.1/6.2/6.3 同根挂账）。
 记录原因并以退出码 0 收场（同 ``tests/eval_intent_classifier.py`` 的
 CLI/退出码风格），绝不虚构 P99 数据冒充验收门。凭据门内测真实延迟：
 含消解指代句（「这套房」「它」类锚定）的消息集逐条过全链，量取
-P99 并判定 < 50ms；分类失败 fail-closed（UNKNOWN）轮次照常计时
+P99 并判定 < 预算；分类失败 fail-closed（UNKNOWN）轮次照常计时
 （FR-1 是端到端延迟口径，非分类质量口径——质量门在
 ``tests/eval_intent_classifier.py``）。
 
@@ -40,8 +42,11 @@ from weiliao_agent.filters.intent_router import IntentRouterFilter
 from weiliao_agent.models.envelope import Envelope
 from weiliao_agent.pipeline import PipelineOrchestrator
 
-# FR-1 验收门：含消解端到端意图分类 P99 < 50ms。
-FR1_P99_BUDGET_MS = 50.0
+# FR-1 验收门：含消解端到端意图分类 P99 < 分类硬超时预算（2026-11-10
+# 评审决策放宽：原 50ms 与真实 LLM 网络 RTT 物理不相容，NFR 记为不可达
+# 缺口；与 llm_zero_shot.DEFAULT_TIMEOUT_SECONDS 默认 800ms 对齐，
+# 可经 WEILIAO_INTENT_TIMEOUT_SECONDS 覆盖后同步调整本常量）。
+FR1_P99_BUDGET_MS = 800.0
 
 # 消息集：覆盖无指代 / 房源指代（「这套房」「它」锚定）/ 长句混合——
 # 消解 resolver 的命中与透传路径都进延迟样本。
@@ -112,9 +117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not os.environ.get("OPENAI_API_KEY"):
         print(
             "SKIP: OPENAI_API_KEY 未配置——FR-1 全链压测需真实 llm_zero_shot "
-            "分类器（45ms 硬超时守卫内测真实延迟）。不虚构 P99 数据："
+            "分类器（800ms 硬超时守卫内测真实延迟）。不虚构 P99 数据："
             "配置凭据后复跑 `uv run python scripts/loadtest_intent_chain.py` "
-            "执行 P99 < 50ms 验收门。",
+            "执行 P99 < 800ms 验收门。",
             file=sys.stderr,
         )
         return 0

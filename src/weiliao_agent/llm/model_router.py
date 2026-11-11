@@ -59,29 +59,31 @@ DEFAULT_WINDOW_SECONDS = 60.0
 # 名单用；未知标签 fail-fast 拒绝装配）。
 KNOWN_INTENTS: frozenset[str] = frozenset(get_args(IntentTag))
 
-# 单次路由判定的 outcome 类型（transition 只取 recovered）。
+# 单次路由判定的 outcome 类型（transition 取 tightened/recovered 迁移）。
 RoutingOutcome = Literal["primary", "mini", "forced_mini"]
 
 # 路由事件 outcome 词表（trace 事件 / 指标快照共用）。primary/mini 为常规
-# 路由结果，forced_mini 为收紧期强制结果，recovered 为收紧→恢复迁移事件。
+# 路由结果，forced_mini 为收紧期强制结果，recovered/tightened 为迁移事件
+# （tightened 为进入收紧瞬间的 ERROR 级锚点，code review Epic 4 补丁）。
 OUTCOME_PRIMARY: RoutingOutcome = "primary"
 OUTCOME_MINI: RoutingOutcome = "mini"
 OUTCOME_FORCED_MINI: RoutingOutcome = "forced_mini"
 OUTCOME_RECOVERED: Literal["recovered"] = "recovered"
+OUTCOME_TIGHTENED: Literal["tightened"] = "tightened"
 
 
 @dataclass(frozen=True)
 class RoutingDecision:
     """一次路由判定结果：选定的 client + trace outcome + 迁移事件。
 
-    ``transition`` 仅在「收紧期 → 窗口回落恢复」的判定瞬间为
-    ``recovered``（调用方据此补记 recovered 事件）；其余为 None。
-    收紧（forced_mini）本身即 outcome，无需独立迁移字段。
+    ``transition`` 在状态迁移瞬间非 None：进入收紧为 ``tightened``
+    （ERROR 级成本异常锚点）、收紧期回落恢复为 ``recovered``（调用方
+    据此补记迁移事件）；其余为 None。
     """
 
     client: OpenAiGenerationClient
     outcome: RoutingOutcome
-    transition: Literal["recovered"] | None = None
+    transition: Literal["recovered", "tightened"] | None = None
 
 
 def _resolve_alias(client: OpenAiGenerationClient, *, param: str) -> str:
@@ -184,6 +186,22 @@ class ModelRouter:
         with self._lock:
             return self._tightened
 
+    def peek_model(self, intent: IntentTag | None) -> str:
+        """纯读预览本次将使用的模型 alias（code review Epic 4 补丁）。
+
+        与 ``select`` 不同：不做窗口剔除、状态迁移或记账，无任何副作用，
+        供熔断器按 alias 分键在生成前预览键位。判定口径与 select 的
+        模型选择一致（收紧期 mini、名单内 mini、其余主模型）；与 select
+        的瞬时竞态（预览后紧跟着恢复迁移）方向 fail-safe，可忽略。
+        """
+        with self._lock:
+            tightened = self._tightened
+        if tightened:
+            return self._mini_client.model
+        if intent is not None and intent in self._simple_intents:
+            return self._mini_client.model
+        return self._primary_client.model
+
     def select(self, intent: IntentTag | None) -> RoutingDecision:
         """按 intent 与护栏状态选定生成 client（判定本身不计数）。
 
@@ -195,15 +213,20 @@ class ModelRouter:
         with self._lock:
             total = self._prune_and_total()
             if total >= self._budget_tokens:
+                transition: Literal["recovered", "tightened"] | None = None
                 if not self._tightened:
-                    # 收紧迁移：只记一次超限与状态（持续收紧期不重复计数）。
+                    # 收紧迁移：只记一次超限与状态（持续收紧期不重复计数）；
+                    # transition=tightened 供调用方补记 ERROR 级迁移事件。
                     self._tightened = True
                     self._set_metrics_tightened(True)
                     self._record_over_limit()
+                    transition = OUTCOME_TIGHTENED
                 return RoutingDecision(
-                    client=self._mini_client, outcome=OUTCOME_FORCED_MINI
+                    client=self._mini_client,
+                    outcome=OUTCOME_FORCED_MINI,
+                    transition=transition,
                 )
-            transition: Literal["recovered"] | None = None
+            transition = None
             if self._tightened:
                 # 恢复迁移：累计 < 阈值即回到常规路由（无迟滞带）。
                 self._tightened = False

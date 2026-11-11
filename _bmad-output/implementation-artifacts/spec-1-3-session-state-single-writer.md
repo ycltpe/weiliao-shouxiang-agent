@@ -79,6 +79,13 @@ context:
 - Given Redis 连接失败或超时，当消息到达入口，则买家收到兜底应答且携带 trace_id，HTTP 非 5xx
 - Given 会话过期瞬间有消息在管道中，当该消息处理中 key 过期，则以入管道时快照为准继续处理，不中断在途消息
 
+### Review Findings
+
+- [x] [Review][Patch] `read_snapshot` 对损坏 hash（turn 非数字 / last_message_at 非法 ISO）直接 `int()`/`fromisoformat` 抛 ValueError，"防御非本模块写入"承诺不完整，应 try 后返回 None [src/weiliao_agent/session/manager.py:378,384]
+- [x] [Review][Patch] 构造器无 `ttl_seconds` 校验，`<=0` 时 Redis 立即删 key，turn 恒重置为 1、会话序号重复 [src/weiliao_agent/session/manager.py `__init__`]
+- [x] [Review][Patch] `begin_turn` 公共 API 自身不校验 tz-aware（时区校验只在信封层），非 HTTP 调用方传入 naive datetime 会读回无偏移时间戳，跨跳比较崩溃/事件乱序 [src/weiliao_agent/session/manager.py]
+- [x] [Review][Patch] 并发原子性（AC-2）仅在 fakeredis 全局串行下验证，真实 Redis 竞态回归不可检测；需补容器化集成测试（`pytest -m integration`），断言并发 begin_turn turn 集合恰为 1..N、increment_followup 计数精确 [tests/test_session.py:117,136]
+
 ## Implementation Notes
 
 ## Spec Change Log

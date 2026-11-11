@@ -44,6 +44,7 @@ Fail-safe（冻结区）：Redis 故障（``RedisError``）一律不抛——``g
 与 corrupted 为 ERROR 级；stage 词表：set / get / invalidate）。
 """
 
+import json
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -188,11 +189,43 @@ class L0CacheClient:
         *,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
     ) -> None:
+        if ttl_seconds <= 0:
+            msg = f"ttl_seconds must be positive, got {ttl_seconds}"
+            raise ValueError(msg)
         self._client = client
         self._ttl_seconds = ttl_seconds
         self._get_script = client.register_script(_LUA_GET)
         self._set_script = client.register_script(_LUA_SET)
         self._invalidate_script = client.register_script(_LUA_INVALIDATE)
+
+    def tombstone_version(self, house_id: str) -> float | None:
+        """只读读取现存墓碑版本（无副作用诊断探针）。
+
+        供 Story 3.2 消费者区分「守卫拒写」与「Redis 故障」：与以
+        ``invalidate`` 作探针不同，本方法不新建墓碑——瞬断恢复场景下
+        副作用式探针新立的墓碑（版本恰等于事件版本）会反噬后续重试
+        写入、致事实丢失（2026-11-11 评审 P1 修复）。返回 None 归并
+        「无现存墓碑 / 墓碑无版本信息 / Redis 故障」三种情形（fail-safe：
+        Redis 故障由调用方后续写入重试自行暴露并记 failure，本探针
+        不重复记事件）。
+        """
+        try:
+            raw = self._client.get(self._tombstone_key(house_id))
+        except redis.RedisError:
+            return None
+        if raw is None:
+            return None
+        try:
+            tomb = json.loads(self._decode(raw))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(tomb, dict):
+            return None
+        version = tomb.get("fact_version")
+        # bool 是 int 子类：True/False 作版本无意义，归并「无版本信息」。
+        if isinstance(version, bool) or not isinstance(version, (int, float)):
+            return None
+        return version
 
     def get(
         self,
@@ -354,7 +387,7 @@ class L0CacheClient:
 
     def _decode_pair(
         self, raw: Any, stage: str, trace_id: str | None
-    ) -> tuple[int | None, str | None]:
+    ) -> tuple[float | None, str | None]:
         """解析 get Lua 返回的 ``{墓碑标记, 卡片 payload}`` 二元组。
 
         墓碑标记为 ``v:<版本>`` 或空值；卡片为空值视为 miss。形状不符
@@ -364,13 +397,17 @@ class L0CacheClient:
         if not isinstance(raw, (list, tuple)) or len(raw) != 2:
             self._record_corrupted("unexpected_eval_result", stage, trace_id)
             return None, None
-        tomb_version: int | None = None
+        tomb_version: float | None = None
         tomb_raw, card_raw = raw
         if tomb_raw:
             try:
                 marker = self._decode(cast("str | bytes", tomb_raw))
                 if marker.startswith("v:"):
-                    tomb_version = int(marker[2:])
+                    # float 解析与 _LUA_SET 的 tonumber 对齐：浮点版本
+                    # （如手工修复写入的 v:2.5）参与版本比较而非按损坏
+                    # fail-open——读开写闭裁决相反会卡死「读得到但写
+                    # 不进」窗口（2026-11-11 评审 P2 修复）。
+                    tomb_version = float(marker[2:])
                 else:
                     self._record_corrupted(
                         "malformed_tombstone_version", stage, trace_id

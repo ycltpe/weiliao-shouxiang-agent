@@ -42,7 +42,9 @@ _FORBIDDEN_EXPRESSIONS: tuple[str, ...] = tuple(
 # 自称兜底正则：固定子串之外的变体（如「我是这套房子的经纪人」——
 # 「这套房子的」超出手工枚举）由「我是/作为 + ≤8 字符 + 经纪人」收敛，
 # 保持 fail-closed。
-_SELF_CLAIM_PATTERN = re.compile(r"(?:我是|作为).{0,8}经纪人")
+# DOTALL：`.` 须跨换行——「我是\n这套房的经纪人」类换行变体同属自称，
+# fail-closed 确定性校验层不容缝隙（code review Epic 4 补丁）。
+_SELF_CLAIM_PATTERN = re.compile(r"(?:我是|作为).{0,8}经纪人", re.DOTALL)
 _SELF_CLAIM_REASON = "forbidden_expression:self_claim_regex"
 
 # 内部标注 / 分段标记：prompt 三段固定标记泄漏即未通过。

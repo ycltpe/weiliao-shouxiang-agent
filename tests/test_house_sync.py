@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from typing import Any, cast
 import fakeredis
 import pytest
 from aiokafka.errors import KafkaConnectionError
+from conftest import _FakeLangfuse
 from fastapi.testclient import TestClient
 
 import weiliao_agent.main as main_module
@@ -27,7 +28,6 @@ import weiliao_agent.workers.house_sync as house_sync_module
 from weiliao_agent.cache import L0CacheClient
 from weiliao_agent.models import FactCard
 from weiliao_agent.observability import metrics as metrics_module
-from weiliao_agent.observability import tracing
 from weiliao_agent.workers import HouseSyncConsumer, KafkaMessageSource
 from weiliao_agent.workers.house_sync import ALL_INTENTS, Message
 
@@ -85,19 +85,12 @@ class InMemorySource:
         return commit
 
 
-class _FakeLangfuse:
-    """Langfuse client 替身：记录全部事件调用（同 test_l0_cache 先例）。"""
-
-    def __init__(self) -> None:
-        self.events: list[dict[str, Any]] = []
-
-    def create_event(self, **kwargs: Any) -> None:
-        self.events.append(kwargs)
 
 
 class _FlakyL0:
     """L0 故障替身：set/invalidate 返回 False（Redis 故障 fail-safe 语义），
-    get 返回 None（miss 语义）——驱动「不提交 offset + failure 事件」分支。"""
+    get 返回 None（miss 语义）、tombstone_version 返回 None（故障归并）
+    ——驱动「重试仍失败 → 不提交 offset + failure 事件」分支。"""
 
     def set(self, *args: Any, **kwargs: Any) -> bool:
         return False
@@ -108,6 +101,9 @@ class _FlakyL0:
     def invalidate(self, *args: Any, **kwargs: Any) -> bool:
         return False
 
+    def tombstone_version(self, house_id: str) -> float | None:
+        return None
+
 
 @pytest.fixture
 def redis_client() -> fakeredis.FakeRedis:
@@ -117,14 +113,6 @@ def redis_client() -> fakeredis.FakeRedis:
 @pytest.fixture
 def l0(redis_client: fakeredis.FakeRedis) -> L0CacheClient:
     return L0CacheClient(redis_client)
-
-
-@pytest.fixture
-def fake_langfuse() -> Iterator[_FakeLangfuse]:
-    client = _FakeLangfuse()
-    tracing.set_langfuse_client(client)
-    yield client
-    tracing.set_langfuse_client(None)
 
 
 def _now_payload(event_type: str, house_id: str, fact_version: int, **extra: Any) -> bytes:
@@ -140,10 +128,16 @@ def _now_payload(event_type: str, house_id: str, fact_version: int, **extra: Any
 
 
 def _upsert(
-    house_id: str, fact_version: int, *, stale: bool = False, age_ms: int = 0
+    house_id: str,
+    fact_version: int,
+    *,
+    stale: bool = False,
+    age_ms: int = 0,
+    occurred_at: datetime | None = None,
 ) -> _RecordedMessage:
-    age = timedelta(seconds=10) if stale else timedelta(milliseconds=age_ms)
-    occurred_at = datetime.now(UTC) - age
+    if occurred_at is None:
+        age = timedelta(seconds=10) if stale else timedelta(milliseconds=age_ms)
+        occurred_at = datetime.now(UTC) - age
     return _RecordedMessage(
         json.dumps(
             {
@@ -279,6 +273,7 @@ def test_stale_upsert_invalidate_only_with_alert(
     ]
     assert len(alerts) == 1
     assert alerts[0]["level"] == "ERROR"
+    assert _sync_metadata(alerts[0])["stale"] is True  # 评审补丁：告警落点自带 stale 标记
     assert cast("float", _sync_metadata(alerts[0])["latency_ms"]) > 500
     for intent in ALL_INTENTS:
         assert l0.get(intent, HOUSE_A) is None  # 事件内容未写入，按失效处理
@@ -800,6 +795,7 @@ class _StubKafkaConsumer:
         self.args = args
         self.kwargs = kwargs
         self.commit_calls: list[dict[Any, int]] = []
+        self.records: list[Any] = []
 
     async def start(self) -> None:
         pass
@@ -809,6 +805,13 @@ class _StubKafkaConsumer:
 
     async def commit(self, offsets: dict[Any, int]) -> None:
         self.commit_calls.append(offsets)
+
+    def __aiter__(self) -> Any:
+        return self._iterate()
+
+    async def _iterate(self) -> Any:
+        for record in self.records:
+            yield record
 
 
 def test_kafka_source_construction_and_commit_mapping(
@@ -840,44 +843,110 @@ def test_kafka_source_construction_and_commit_mapping(
     assert position == 42  # {TopicPartition: offset+1} 精确提交单条
 
 
-# ---- 墓碑探针诊断两分支（set=False / get=None 时） ----
+def test_kafka_source_messages_iterates_records_with_payload_and_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 评审补丁：``messages()`` 真实异步生成器曾无任何测试执行（旧 stub
+    # 无 __aiter__）——record 属性读取/Message 组装/commit 映射在真实
+    # 迭代形状下全部未执行，属性名笔误会在生产首条消息即炸。
+    monkeypatch.setattr(house_sync_module, "AIOKafkaConsumer", _StubKafkaConsumer)
+    source = KafkaMessageSource(
+        brokers="localhost:9092",
+        topic="house.sync.trigger",
+        group_id="weiliao-house-sync",
+    )
+    source._consumer.records = [
+        SimpleNamespace(value=b"payload-1", topic="house.sync.trigger", partition=0, offset=7),
+        SimpleNamespace(value=b"payload-2", topic="house.sync.trigger", partition=1, offset=3),
+    ]
+
+    async def scenario() -> list[Message]:
+        received: list[Message] = []
+        async for message in source.messages():
+            received.append(message)
+            await message.commit()
+        return received
+
+    received = asyncio.run(scenario())
+
+    assert [m.payload for m in received] == [b"payload-1", b"payload-2"]
+    assert len(source._consumer.commit_calls) == 2
+    (first, second) = source._consumer.commit_calls
+    (tp1, pos1), = first.items()
+    (tp2, pos2), = second.items()
+    assert (tp1.topic, tp1.partition, pos1) == ("house.sync.trigger", 0, 8)
+    assert (tp2.topic, tp2.partition, pos2) == ("house.sync.trigger", 1, 4)
 
 
-class _ProbeL0:
-    """墓碑探针场景 L0 假件：set 首试恒 False、get 恒 None（墓碑遮蔽）、
-    invalidate 恒 True（探针成功）；set 重试结果由构造参数决定。"""
+# ---- set=False 三段诊断（索引守卫 / 墓碑守卫 / Redis 故障瞬断恢复） ----
 
-    def __init__(self, retry_result: bool) -> None:
-        self._retry_result = retry_result
-        self._set_calls = 0
+
+class _GuardRejectionL0:
+    """墓碑守卫拒写场景 L0 假件：set 恒 False（守卫拒写）、get 恒 None
+    （墓碑遮蔽）、tombstone_version 返回遮蔽版本（≥ 事件版本）——驱动
+    「守卫拒写确认、提交 offset」分支（其余 intent 同判定短路）。"""
+
+    def __init__(self, tomb_version: float) -> None:
+        self._tomb_version = tomb_version
 
     def set(self, *args: Any, **kwargs: Any) -> bool:
-        self._set_calls += 1
-        if self._set_calls % 2 == 0:
-            return self._retry_result
         return False
 
     def get(self, *args: Any, **kwargs: Any) -> FactCard | None:
         return None
 
-    def invalidate(self, *args: Any, **kwargs: Any) -> bool:
-        return True
+    def tombstone_version(self, house_id: str) -> float | None:
+        return self._tomb_version
 
 
-def test_probe_diagnosis_retry_succeeds_marks_probe_retry(
-    fake_langfuse: _FakeLangfuse,
+class _TransientSetFailL0:
+    """瞬断恢复场景 L0 假件：set 首试恒 False（模拟 RedisError 被 fail-safe
+    吞为 False——与守卫拒写在类型上不可区分），重试委托真实
+    L0CacheClient——评审 P1 回归：只读探针不得新建墓碑反噬重试写入
+    （旧副作用式 invalidate 探针实现下本场景静默丢事实、假墓碑遮蔽
+    该房源全部 intent 读取直至 TTL 过期）。"""
+
+    def __init__(self, real: L0CacheClient) -> None:
+        self._real = real
+        self._first_attempt_failed = False
+
+    def set(self, intent: Any, card: Any, **kwargs: Any) -> bool:
+        if not self._first_attempt_failed:
+            self._first_attempt_failed = True
+            return False
+        return self._real.set(intent, card, **kwargs)
+
+    def get(self, intent: Any, house_id: str, **kwargs: Any) -> FactCard | None:
+        return self._real.get(intent, house_id, **kwargs)
+
+    def tombstone_version(self, house_id: str) -> float | None:
+        return self._real.tombstone_version(house_id)
+
+
+def test_transient_set_failure_recovery_writes_card_and_commits(
+    redis_client: fakeredis.FakeRedis, fake_langfuse: _FakeLangfuse
 ) -> None:
+    # 评审 P1 回归：set 首试瞬断（False）→ get None → 只读探针确认无
+    # 现存墓碑 → 重试 set 成功。事实必须落 L0、offset 提交、且 Redis
+    # 不得留下假墓碑（旧实现探针新立版本=事件版本的墓碑、守卫反噬
+    # 重试、事实丢失而 offset 已提交）。
     message = _upsert(HOUSE_A, 5)
     source = InMemorySource([message])
 
     async def scenario() -> None:
         await _consume_until(
-            _consumer(_ProbeL0(retry_result=True), source), lambda: message.committed
+            _consumer(_TransientSetFailL0(L0CacheClient(redis_client)), source),
+            lambda: message.committed,
         )
 
     asyncio.run(scenario())
 
     assert message.committed is True
+    real = L0CacheClient(redis_client)
+    for intent in ALL_INTENTS:
+        card = real.get(intent, HOUSE_A)
+        assert card is not None and card.fact_version == 5
+    assert real.tombstone_version(HOUSE_A) is None  # 无假墓碑残留
     consumed = [
         e for e in _sync_events(fake_langfuse) if e["metadata"]["operation"] == "consumed"
     ]
@@ -886,15 +955,18 @@ def test_probe_diagnosis_retry_succeeds_marks_probe_retry(
     assert _sync_metadata(consumed[0])["version_conflict"] is False
 
 
-def test_probe_diagnosis_retry_rejected_commits_as_conflict(
+def test_tombstone_guard_rejection_commits_as_version_conflict(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
+    # 现存墓碑版本（6）≥ 事件版本（5）：只读探针确认守卫拒写，
+    # offset 正常提交、不重试 set（重试必被同一守卫拒绝）。
     message = _upsert(HOUSE_A, 5)
     source = InMemorySource([message])
 
     async def scenario() -> None:
         await _consume_until(
-            _consumer(_ProbeL0(retry_result=False), source), lambda: message.committed
+            _consumer(_GuardRejectionL0(tomb_version=6), source),
+            lambda: message.committed,
         )
 
     asyncio.run(scenario())
@@ -906,3 +978,70 @@ def test_probe_diagnosis_retry_rejected_commits_as_conflict(
     assert len(consumed) == 1
     assert _sync_metadata(consumed[0])["version_conflict"] is True
     assert "probe_retry" not in _sync_metadata(consumed[0])
+
+
+def test_real_tombstone_guard_rejection_short_circuits(
+    l0: L0CacheClient, fake_langfuse: _FakeLangfuse
+) -> None:
+    # 真实 L0（fakeredis）端到端：预立 v6 墓碑后消费 v5 upsert——
+    # 只读探针读到遮蔽版本即短路提交；卡片不写入、墓碑不被拉低
+    # （tombstone_version 走真实 Lua 写入的 JSON 墓碑解析路径）。
+    l0.invalidate(HOUSE_A, 6)
+    message = _upsert(HOUSE_A, 5)
+    source = InMemorySource([message])
+
+    async def scenario() -> None:
+        await _consume_until(_consumer(l0, source), lambda: message.committed)
+
+    asyncio.run(scenario())
+
+    assert message.committed is True
+    assert l0.get("PRICE_INQUIRY", HOUSE_A) is None
+    assert l0.tombstone_version(HOUSE_A) == 6
+    consumed = [
+        e for e in _sync_events(fake_langfuse) if e["metadata"]["operation"] == "consumed"
+    ]
+    assert _sync_metadata(consumed[0])["version_conflict"] is True
+
+
+@pytest.mark.parametrize("age_ms,expect_stale", [(499, False), (501, True)])
+def test_stale_gate_boundary_pins_500ms_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    l0: L0CacheClient,
+    fake_langfuse: _FakeLangfuse,
+    age_ms: int,
+    expect_stale: bool,
+) -> None:
+    # 评审补丁：500ms 预算旧唯一断言是 now-100ms 构造下的近恒真式，
+    # 判定边界两侧（499 放行 / 501 转失效）无用例。冻结消费时刻时钟、
+    # occurred_at 精确压线（无冻结时处理耗时会令 499ms 用例在慢 CI
+    # 上翻界成 flaky）。
+    occurred_at = datetime.now(UTC) - timedelta(milliseconds=age_ms)
+    frozen_at = occurred_at + timedelta(milliseconds=age_ms)
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return frozen_at
+
+    monkeypatch.setattr(house_sync_module, "datetime", _FrozenDateTime)
+    message = _upsert(HOUSE_A, 5, occurred_at=occurred_at)
+    source = InMemorySource([message])
+
+    async def scenario() -> None:
+        await _consume_until(_consumer(l0, source), lambda: message.committed)
+
+    asyncio.run(scenario())
+
+    assert message.committed is True
+    alerts = [
+        e for e in _sync_events(fake_langfuse) if e["metadata"]["operation"] == "stale_alert"
+    ]
+    if expect_stale:
+        assert len(alerts) == 1
+        assert alerts[0]["level"] == "ERROR"
+        assert _sync_metadata(alerts[0])["stale"] is True
+        assert l0.get("PRICE_INQUIRY", HOUSE_A) is None  # 内容不写入
+    else:
+        assert alerts == []
+        assert l0.get("PRICE_INQUIRY", HOUSE_A) is not None  # 正常 upsert

@@ -173,6 +173,20 @@ def test_budget_exceeded_forces_mini_regardless_of_intent() -> None:
     assert router.select("GREETING").outcome == OUTCOME_FORCED_MINI
 
 
+def test_peek_model_is_pure_and_matches_selection() -> None:
+    # code review Epic 4 补丁：peek 供熔断器分键预览，无副作用——
+    # 连续调用不触发窗口剔除/收紧迁移/记账，判定与 select 一致。
+    clock = _FakeClock()
+    router = _router(clock=clock)
+
+    assert router.peek_model("GREETING") == "gpt-4o-mini"
+    assert router.peek_model("PRICE_INQUIRY") == "gpt-4o"
+    assert router.peek_model(None) == "gpt-4o"
+    # 重复 peek 无副作用：路由计数仍为零（account 才记账）。
+    assert router.peek_model("GREETING") == "gpt-4o-mini"
+    assert router.snapshot()["window_tokens"] == 0
+
+
 def test_forced_mini_recovers_after_window_slide() -> None:
     # 窗口消耗回落到阈值以下：自动恢复常规路由（AC 第 3 条）。
     clock = _FakeClock()

@@ -9,6 +9,7 @@
 """
 
 from collections.abc import Iterator, Mapping
+from types import SimpleNamespace
 from typing import Any, get_args
 
 import pytest
@@ -318,19 +319,27 @@ def _followup_payload(**overrides: Any) -> dict[str, Any]:
 
 
 class _StubFollowupRecorder:
-    """固定双计数返回的 recorder 替身，记录收到的 (session_id, tag, anchor)。"""
+    """固定三计数返回的 recorder 替身，记录收到的 (session_id, tag, anchor)。
 
-    def __init__(self, result: tuple[int, int]) -> None:
+    三计数口径（SessionManager.record_followup）：(per-(tag, anchor),
+    会话追问总数, per-tag 聚合)——is_followup 取前者，硬触发阈值取
+    后者（2026-11-11 裁决 B）。"""
+
+    def __init__(self, result: tuple[int, int, int]) -> None:
         self._result = result
         self.calls: list[tuple[str, IntentTag, str]] = []
 
-    def __call__(self, session_id: str, tag: IntentTag, anchor: str) -> tuple[int, int]:
+    def __call__(
+        self, session_id: str, tag: IntentTag, anchor: str
+    ) -> tuple[int, int, int]:
         self.calls.append((session_id, tag, anchor))
         return self._result
 
 
 class _RaisingFollowupRecorder:
-    def __call__(self, session_id: str, tag: IntentTag, anchor: str) -> tuple[int, int]:
+    def __call__(
+        self, session_id: str, tag: IntentTag, anchor: str
+    ) -> tuple[int, int, int]:
         msg = "redis boom"
         raise redis.RedisError(msg)
 
@@ -339,22 +348,28 @@ class _CountingFollowupRecorder:
     """按 (tag, anchor) 真实累计的 recorder 替身（Redis 语义内存版）。
 
     锚定矩阵用：同 (tag, anchor) 第 2 次起返回追问命中（≥2），会话
-    总数只计命中——与 SessionManager.record_followup 语义对齐。
+    总数只计命中，per-tag 聚合跨锚累计——与 SessionManager.record_followup
+    语义对齐（2026-11-11 裁决 B 三计数口径）。
     """
 
     def __init__(self) -> None:
         self.counts: dict[tuple[IntentTag, str], int] = {}
+        self.tag_counts: dict[IntentTag, int] = {}
         self.session_total = 0
         self.calls: list[tuple[str, IntentTag, str]] = []
 
-    def __call__(self, session_id: str, tag: IntentTag, anchor: str) -> tuple[int, int]:
+    def __call__(
+        self, session_id: str, tag: IntentTag, anchor: str
+    ) -> tuple[int, int, int]:
         self.calls.append((session_id, tag, anchor))
         key = (tag, anchor)
         per_intent = self.counts.get(key, 0) + 1
         self.counts[key] = per_intent
+        per_tag = self.tag_counts.get(tag, 0) + 1
+        self.tag_counts[tag] = per_tag
         if per_intent >= 2:
             self.session_total += 1
-        return per_intent, self.session_total
+        return per_intent, self.session_total, per_tag
 
 
 def _event_names(fake: _FakeLangfuse) -> list[str]:
@@ -364,7 +379,7 @@ def _event_names(fake: _FakeLangfuse) -> list[str]:
 def test_followup_first_occurrence_keeps_envelope_flag_false(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
-    recorder = _StubFollowupRecorder((1, 0))
+    recorder = _StubFollowupRecorder((1, 0, 1))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
         followup_recorder=recorder,
@@ -386,7 +401,7 @@ def test_followup_first_occurrence_keeps_envelope_flag_false(
 def test_followup_second_occurrence_marks_envelope(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
-    recorder = _StubFollowupRecorder((2, 1))
+    recorder = _StubFollowupRecorder((2, 1, 2))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
         followup_recorder=recorder,
@@ -407,7 +422,7 @@ def test_followup_threshold_emits_hard_trigger_event(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
     # 会话追问总数达 3：信号事件含命中条件与计数（判定归 Epic 5）。
-    recorder = _StubFollowupRecorder((2, 3))
+    recorder = _StubFollowupRecorder((2, 3, 2))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="LOCATION", confidence=0.8)),
         followup_recorder=recorder,
@@ -430,7 +445,7 @@ def test_followup_past_threshold_does_not_reemit_hard_trigger(
 ) -> None:
     # 负边界（锁评审 E1）：计数已过 3 的追问命中不重发信号——
     # 若实现退化为 >= 3，本条即红。
-    recorder = _StubFollowupRecorder((3, 4))
+    recorder = _StubFollowupRecorder((3, 4, 3))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
         followup_recorder=recorder,
@@ -448,7 +463,7 @@ def test_followup_first_occurrence_after_threshold_emits_nothing(
 ) -> None:
     # 负边界（锁评审 E2）：会话计数已达标时，新意图首次出现（非追问）
     # 不发信号——若丢失 is_followup 守卫，本条即红。
-    recorder = _StubFollowupRecorder((1, 3))
+    recorder = _StubFollowupRecorder((1, 3, 1))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
         followup_recorder=recorder,
@@ -479,12 +494,109 @@ def test_followup_recorder_failure_fails_safe(fake_langfuse: _FakeLangfuse) -> N
         for e in fake_langfuse.events
         if e["name"] == "intent.classification_failure"
     )
+    assert failure["level"] == "ERROR"  # 评审补丁：失败事件级别锁定
     assert failure["metadata"]["reason"] == "followup_record_failed"
+
+
+# ---------------------------------------------------------------------------
+# 评审补丁（2026-11-10）：NaN confidence 守卫——duck-type 实现的 NaN
+# 不得进 trace metadata（Langfuse 序列化抛错被吞、分类成功事件静默
+# 丢失），一律 fail-closed UNKNOWN 并记失败事件。
+# ---------------------------------------------------------------------------
+
+
+class _NanConfidenceClassifier:
+    """非一致性替身：合法 tag + NaN confidence（duck-type 绕过
+    IntentClassification 的 ge/le 边界校验——守卫的可达路径）。"""
+
+    def classify(self, message: str, context: Mapping[str, Any]) -> Any:
+        return SimpleNamespace(tag="GREETING", confidence=float("nan"))
+
+
+def test_nan_confidence_fails_closed_to_unknown(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    filter_ = IntentRouterFilter(classifier=_NanConfidenceClassifier())
+    envelope = Envelope.model_validate(_followup_payload())
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "UNKNOWN"
+    failure = next(
+        e
+        for e in fake_langfuse.events
+        if e["name"] == "intent.classification_failure"
+    )
+    assert failure["level"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# 评审补丁（2026-11-10）：is_followup 复位矩阵——过滤器为追问判定唯一
+# 权威，payload 预设 True 不得在任何路径透传；追问命中仍单向置位。
+# ---------------------------------------------------------------------------
+
+
+def test_preset_is_followup_reset_on_first_occurrence(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        followup_recorder=_StubFollowupRecorder((1, 0, 1)),
+    )
+    envelope = Envelope.model_validate(_followup_payload(is_followup=True))
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "PRICE_INQUIRY"
+    assert result.is_followup is False
+
+
+def test_preset_is_followup_reset_on_classification_failure(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    filter_ = IntentRouterFilter(classifier=_RaisingClassifier())
+    envelope = Envelope.model_validate(_followup_payload(is_followup=True))
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "UNKNOWN"
+    assert result.is_followup is False
+
+
+def test_preset_is_followup_reset_on_empty_message(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    stub = _StubClassifier(IntentClassification(tag="GREETING", confidence=0.9))
+    filter_ = IntentRouterFilter(classifier=stub)
+    envelope = Envelope.model_validate(
+        _followup_payload(resolved_message="  ", is_followup=True)
+    )
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "UNKNOWN"
+    assert result.is_followup is False
+    assert stub.received_message is None  # 守卫路径分类器零调用
+
+
+def test_preset_is_followup_overridden_by_followup_hit(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # 追问命中仍为唯一置位 True 的路径（复位在判定起点，不破坏 2.3 语义）。
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
+        followup_recorder=_StubFollowupRecorder((2, 1, 2)),
+    )
+    envelope = Envelope.model_validate(_followup_payload(is_followup=True))
+
+    result = filter_.process(envelope)
+
+    assert result.is_followup is True
 
 
 def test_followup_skipped_for_unknown_tag(fake_langfuse: _FakeLangfuse) -> None:
     # UNKNOWN（含占位降级）不参与追问判定：recorder 零调用、零计数副作用。
-    recorder = _StubFollowupRecorder((2, 1))
+    recorder = _StubFollowupRecorder((2, 1, 2))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="UNKNOWN", confidence=0.5)),
         followup_recorder=recorder,
@@ -500,7 +612,7 @@ def test_followup_skipped_for_unknown_tag(fake_langfuse: _FakeLangfuse) -> None:
 
 
 def test_followup_skipped_when_turn_is_none(fake_langfuse: _FakeLangfuse) -> None:
-    recorder = _StubFollowupRecorder((2, 1))
+    recorder = _StubFollowupRecorder((2, 1, 2))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
         followup_recorder=recorder,
@@ -531,7 +643,7 @@ def test_followup_not_recorded_when_classification_fails(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
     # 分类 fail-closed（异常路径）：不调 recorder、不累积追问计数。
-    recorder = _StubFollowupRecorder((2, 1))
+    recorder = _StubFollowupRecorder((2, 1, 2))
     filter_ = IntentRouterFilter(
         classifier=_RaisingClassifier(),
         followup_recorder=recorder,
@@ -733,11 +845,30 @@ def test_recent_intent_writer_skipped_when_turn_is_none(
     assert writer.calls == []
 
 
+def test_recent_intent_writer_skipped_on_unknown_classification(
+    fake_langfuse: _FakeLangfuse,
+) -> None:
+    # 评审裁决（2026-11-11，spec-3-3）：UNKNOWN 是降级信号而非真实
+    # 意图，不落 L1「最近意图」快照——防误导 Epic 4 的 LLM 上下文
+    # 消费方（UNKNOWN 快照此前无任何守卫排除）。
+    writer = _RecordingL1Writer()
+    filter_ = IntentRouterFilter(
+        classifier=_StubClassifier(IntentClassification(tag="UNKNOWN", confidence=0.0)),
+        recent_intent_writer=writer,
+    )
+    envelope = Envelope.model_validate(_followup_payload())
+
+    result = filter_.process(envelope)
+
+    assert result.intent == "UNKNOWN"
+    assert writer.calls == []
+
+
 def test_followup_snapshot_writer_called_with_session_total_on_success(
     fake_langfuse: _FakeLangfuse,
 ) -> None:
     writer = _RecordingL1Writer()
-    recorder = _StubFollowupRecorder((1, 3))
+    recorder = _StubFollowupRecorder((1, 3, 1))
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
         followup_recorder=recorder,
@@ -757,7 +888,7 @@ def test_l1_writer_failure_fails_silently_without_trace_failure(
     # （与 intent_writer 的非对称设计——优化层不记 trace）。
     filter_ = IntentRouterFilter(
         classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
-        followup_recorder=_StubFollowupRecorder((1, 0)),
+        followup_recorder=_StubFollowupRecorder((1, 0, 1)),
         recent_intent_writer=_RaisingL1Writer(),
         followup_snapshot_writer=_RaisingL1Writer(),
     )

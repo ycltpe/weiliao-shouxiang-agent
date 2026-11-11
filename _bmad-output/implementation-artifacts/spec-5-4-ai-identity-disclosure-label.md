@@ -112,3 +112,10 @@ context: []
 - `cd /Users/yechen/PycharmProjects/test && uv run pytest tests/ -q` -- expected: 全部通过（含新增用例，无回归）
 - `uv run ruff check src tests` -- expected: 零告警
 - `uv run mypy src` -- expected: 零告警（仓库 mypy strict 口径，仅扫 src）
+
+### Review Findings
+
+（2026-11-10 Epic 5 级 code review，全局统计见 spec-5-1 分录头。本分录 1 项 patch + 1 项 defer。）
+
+- [x] [Review][Patch] epic-5-context 与 spec-5-4 拍板结论矛盾未同步（low；acceptance-auditor 层） [`_bmad-output/implementation-artifacts/epic-5-context.md`] — epic 上下文要求「转人工后标识消失并切换为经纪人身份，无残留」，而 spec-5-4 决策 Q1-B 拍板转人工文案（含 5.3 闸门回复）**携带** AI 前缀，实现按 5.4 执行（`handoff_gate_result` 与 `_handoff_result` 均返回前缀文案）；epic-5-context.md 未更新消解该矛盾，后续 Epic 若按上下文字面口径验收会产生误判。修法：更新 epic-5-context.md 的披露口径段落，记录 5.4 Q1-B 拍板（转人工文案携标，「标识消失」由后续经纪人消息自然接替实现）。
+- [x] [Review][Defer] 零宽字符（U+200B）/BOM（U+FEFF）组成的草稿判空漏检，携标下发无正文消息（low；edge-case-hunter 层） [`src/weiliao_agent/filters/base.py:12`、`src/weiliao_agent/filters/response_assembler.py:27`] — `is_blank_draft` 仅 `str.strip()`，剥不掉零宽/BOM；LLM 产出恰好为 `"\u200b"` 的草稿会走加前缀分支，买家收到「【AI 助手】」+ 不可见字符的空消息。spec frontmatter 已挂账 defer。settle：随 4.7 deferred 条目一并拍板（strip 字符集扩展）。

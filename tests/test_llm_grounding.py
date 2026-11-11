@@ -65,6 +65,10 @@ def test_self_claim_regex_catches_unlisted_variants() -> None:
     assert verify_grounding("我是这套房子的经纪人，随时看房。") == (
         "forbidden_expression:self_claim_regex"
     )
+    # code review Epic 4 补丁：换行变体同属自称（DOTALL），不得绕过。
+    assert verify_grounding("我是\n这套房的经纪人，随时看房。") == (
+        "forbidden_expression:self_claim_regex"
+    )
     # 普通文本不误伤。
     assert verify_grounding("您好，房源信息可以咨询平台客服。") is None
 

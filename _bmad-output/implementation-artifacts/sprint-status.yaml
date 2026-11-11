@@ -48,43 +48,43 @@ tracking_system: file-system
 story_location: "{project-root}/_bmad-output/implementation-artifacts"
 
 development_status:
-  epic-1: in-progress
-  1-1-项目骨架与信封模型: review
-  1-2-管道过滤器编排与统一错误兜底: review
-  1-3-会话状态单写者管理: review
-  1-4-健康检查端点: review
-  1-5-Langfuse-全链路追踪脚手架: review
+  epic-1: done
+  1-1-项目骨架与信封模型: done
+  1-2-管道过滤器编排与统一错误兜底: done
+  1-3-会话状态单写者管理: done
+  1-4-健康检查端点: done
+  1-5-Langfuse-全链路追踪脚手架: done
   epic-1-retrospective: optional
-  epic-2: in-progress
-  2-1-意图标签模型与分类器接口: review
-  2-2-意图分类默认实现: review
+  epic-2: done
+  2-1-意图标签模型与分类器接口: done
+  2-2-意图分类默认实现: done
   2-3-重复追问识别: done
   epic-2-retrospective: optional
-  epic-3: in-progress
-  3-1-事实卡片-Schema-与-L0-缓存客户端: review
-  3-2-Kafka-房源事件同步消费者: review
-  3-3-L1-进程内缓存与分层查找顺序: review
-  3-4-重复追问禁走缓存与命中率指标: review
+  epic-3: done
+  3-1-事实卡片-Schema-与-L0-缓存客户端: done
+  3-2-Kafka-房源事件同步消费者: done
+  3-3-L1-进程内缓存与分层查找顺序: done
+  3-4-重复追问禁走缓存与命中率指标: done
   epic-3-retrospective: optional
-  epic-4: in-progress
-  4-1-模板兜底应答库: review
-  4-2-LLM-子图与-OpenAI-客户端: review
-  4-3-事实卡片-Grounding-受控生成: review
-  4-4-后置风控双审核: review
-  4-5-OpenAI-故障降级与步进恢复: review
-  4-6-模型路由与成本护栏: review
-  4-7-空草稿拦截与兜底承接: backlog
+  epic-4: done
+  4-1-模板兜底应答库: done
+  4-2-LLM-子图与-OpenAI-客户端: done
+  4-3-事实卡片-Grounding-受控生成: done
+  4-4-后置风控双审核: done
+  4-5-OpenAI-故障降级与步进恢复: done
+  4-6-模型路由与成本护栏: done
+  4-7-空草稿拦截与兜底承接: done
   epic-4-retrospective: optional
-  epic-5: in-progress
-  5-1-硬触发条件判定: review
-  5-2-Kafka-转人工单向指令: review
-  5-3-转人工原子终态与买家安抚通知: review
-  5-4-AI-身份披露标识: review
-  5-5-转人工后会话响应路径关闭: backlog
+  epic-5: done
+  5-1-硬触发条件判定: done
+  5-2-Kafka-转人工单向指令: done
+  5-3-转人工原子终态与买家安抚通知: done
+  5-4-AI-身份披露标识: done
+  5-5-转人工后会话响应路径关闭: done
   epic-5-retrospective: optional
   epic-6: done
-  6-1-指代消解过滤器接口与管道接入: review
-  6-2-房源指代归一化默认实现: review
+  6-1-指代消解过滤器接口与管道接入: done
+  6-2-房源指代归一化默认实现: done
   6-3-下游消费接入与追问判定-retrofit: done
   epic-6-retrospective: optional
   epic-7: done

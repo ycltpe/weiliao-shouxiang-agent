@@ -85,6 +85,10 @@ context:
 - [x] [Review][Patch] `record_followup` docstring 阈值措辞矛盾（low；验收审计层发现，已读码证实） [`src/weiliao_agent/session/manager.py:161`] — docstring 写「据会话总数 ≥3 产出 hard trigger 信号」，与实现的恰为 3 穿越语义（`== 3`）矛盾，会误导 Epic 5 消费方；改为「恰为 3（第 3 次追问穿越）」。**已修复（2026-11-03）。**
 - [x] [Review][Defer] 并发计数精确性仅 fakeredis 验证 [`tests/test_session.py:452`] — deferred, pre-existing（fakeredis server 级全局串行，与首次评审 deferred 条目及 Story 1.3 条目同根因；已记录 deferred-work.md，settle：部署形态落地后补真实 Redis 集成测试）。
 
+（2026-11-10 Epic 级 code review 追加：四层原始 16 项合并去重后 15 项，本分录 1 项 patch；2 项 decision + 1 项 defer + 7 项 patch 见 spec-2-2，1 项 patch 见 spec-2-1。驳回 3 项：消息守卫边界两则已被 Story 6.3 终态口径取代（回退删除 + `not message.strip()` 守卫）；`followup_count` 污染穿越问题与 2026-11-03 已裁决条目同根因（选 A 维持 docstring 警告，风险接受）；超长消息无长度守卫属规格未定义行为、成本面归 Epic 4-6 成本护栏。）
+
+- [x] [Review][Patch] `is_followup` 可被 payload 预设 True 并在所有非追问路径透传，过滤器从不复位（low；acceptance-auditor 层） [`src/weiliao_agent/filters/intent_router.py` `process()`] — 成功路径 `Envelope.model_validate({**envelope.model_dump(), "intent": ...})` 原样保留 payload 预设值；置位仅 `model_copy(update={"is_followup": True})` 单向，从不写 False；空文本/分类异常 fail-closed 路径同样透传原信封。payload 携带 `"is_followup": true` 即可在首次出现 / recorder 失败 fail-safe / 分类失败 UNKNOWN 路径使信封标记为 True，绕过过滤器判定。影响方向保守（误标只致 Epic 3 禁走 L0 缓存），无安全事故，但违 spec-2-3 Code Map「判定后写回」口径。修法：过滤器判定入口统一复位 `is_followup=False`（如成功路径 model_validate 前 / 失败路径 model_copy 置 UNKNOWN 时并列置 False），补一条 preset True 被复位的用例。**已修复（2026-11-10）：三条决策路径（成功/异常/空文本）统一复位；未注入分类器的 1.2 占位路径按冻结契约不动（无判定行为，逐字节锁定）；补 4 条复位矩阵用例（首现复位 / 分类失败复位 / 空消息复位 / 追问命中仍置 True）。**
+
 ## Implementation Notes
 
 - Lua 脚本内做条件自增：`per_intent >= 2` 才 `HINCRBY followup_count`，

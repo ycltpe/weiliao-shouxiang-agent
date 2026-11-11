@@ -17,12 +17,16 @@ from unittest import mock
 import fakeredis
 import pytest
 import redis
+from conftest import _FakeLangfuse
 from fastapi.testclient import TestClient
 
 from weiliao_agent.adapters.http import create_app
+from weiliao_agent.cache.l0_client import L0CacheClient
+from weiliao_agent.classifiers import create_classifier
 from weiliao_agent.classifiers.llm_zero_shot import LlmZeroShotClassifier, _LlmIntentOutput
 from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
 from weiliao_agent.models.fact_card import FactCard
+from weiliao_agent.observability import metrics as metrics_module
 from weiliao_agent.session import SessionManager, SessionSnapshot
 from weiliao_agent.session.manager import DEFAULT_TTL_SECONDS, KEY_PREFIX
 
@@ -393,11 +397,15 @@ def test_record_followup_first_occurrence_does_not_increment_session_count(
 ) -> None:
     manager.begin_turn(SESSION_ID, TS_1)
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+    per_intent, session_count, per_tag = manager.record_followup(
+        SESSION_ID, "PRICE_INQUIRY", "none"
+    )
 
-    assert (per_intent, session_count) == (1, 0)  # 首次出现非追问，总数不自增
+    # 首次出现非追问，总数不自增；per-tag 聚合随首现累计。
+    assert (per_intent, session_count, per_tag) == (1, 0, 1)
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"1"
+    assert client.hget(key, "followup_tag:PRICE_INQUIRY") == b"1"
     assert client.hget(key, "followup_count") == b"0"
     assert client.ttl(key) == DEFAULT_TTL_SECONDS  # EXPIRE 随脚本刷新
 
@@ -408,11 +416,14 @@ def test_record_followup_second_occurrence_marks_followup(
     manager.begin_turn(SESSION_ID, TS_1)
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+    per_intent, session_count, per_tag = manager.record_followup(
+        SESSION_ID, "PRICE_INQUIRY", "none"
+    )
 
-    assert (per_intent, session_count) == (2, 1)  # 追问 #1：per-intent ≥2 命中
+    assert (per_intent, session_count, per_tag) == (2, 1, 2)  # 追问 #1：per-intent ≥2 命中
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
+    assert client.hget(key, "followup_tag:PRICE_INQUIRY") == b"2"
     assert client.hget(key, "followup_count") == b"1"
 
 
@@ -421,10 +432,10 @@ def test_record_followup_same_tag_reaches_threshold_at_fourth_message(
 ) -> None:
     # 语义钉死：追问 #3 = 同意图第 4 次消息（≥3 信号触发时刻）。
     manager.begin_turn(SESSION_ID, TS_1)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (1, 0)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (2, 1)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (3, 2)
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (4, 3)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (1, 0, 1)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (2, 1, 2)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (3, 2, 3)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (4, 3, 4)
     assert client.hget(f"{KEY_PREFIX}{SESSION_ID}", "followup_count") == b"3"
 
 
@@ -437,9 +448,9 @@ def test_record_followup_counts_across_intents(
     manager.record_followup(SESSION_ID, "AVAILABILITY", "none")
     manager.record_followup(SESSION_ID, "LOCATION", "none")
 
-    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (2, 1)
-    assert manager.record_followup(SESSION_ID, "AVAILABILITY", "none") == (2, 2)
-    assert manager.record_followup(SESSION_ID, "LOCATION", "none") == (2, 3)
+    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none") == (2, 1, 2)
+    assert manager.record_followup(SESSION_ID, "AVAILABILITY", "none") == (2, 2, 2)
+    assert manager.record_followup(SESSION_ID, "LOCATION", "none") == (2, 3, 2)
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
     assert client.hget(key, "followup:AVAILABILITY:none") == b"2"
@@ -454,10 +465,12 @@ def test_record_followup_isolates_per_intent_counters(
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING", "none")
+    per_intent, session_count, per_tag = manager.record_followup(
+        SESSION_ID, "GREETING", "none"
+    )
 
     # GREETING 首次出现：per-intent 独立计数，会话总数只计 PRICE_INQUIRY 的命中。
-    assert (per_intent, session_count) == (1, 1)
+    assert (per_intent, session_count, per_tag) == (1, 1, 1)
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:GREETING:none") == b"1"
     assert client.hget(key, "followup:PRICE_INQUIRY:none") == b"2"
@@ -507,8 +520,10 @@ def test_concurrent_record_followup_counts_exactly(
     per_intents = sorted(r[0] for r in results)
     assert per_intents == list(range(1, threads + 1))
     assert all(r[1] == r[0] - 1 for r in results)  # 会话总数 = per-intent - 1
+    assert all(r[2] == r[0] for r in results)  # 单锚下 per-tag 聚合 = per-anchor
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:PRICE_INQUIRY:none") == str(threads).encode()
+    assert client.hget(key, "followup_tag:PRICE_INQUIRY") == str(threads).encode()
     assert client.hget(key, "followup_count") == str(threads - 1).encode()
 
 
@@ -525,13 +540,14 @@ def test_record_followup_same_anchor_counts_to_two(
     manager.begin_turn(SESSION_ID, TS_1)
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
 
-    per_intent, session_count = manager.record_followup(
+    per_intent, session_count, per_tag = manager.record_followup(
         SESSION_ID, "PRICE_INQUIRY", "house:h1"
     )
 
-    assert (per_intent, session_count) == (2, 1)
+    assert (per_intent, session_count, per_tag) == (2, 1, 2)
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:PRICE_INQUIRY:house:h1") == b"2"
+    assert client.hget(key, "followup_tag:PRICE_INQUIRY") == b"2"
     assert client.hget(key, "followup_count") == b"1"
 
 
@@ -544,14 +560,18 @@ def test_record_followup_different_anchors_do_not_accumulate(
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
 
-    per_intent, session_count = manager.record_followup(
+    per_intent, session_count, per_tag = manager.record_followup(
         SESSION_ID, "PRICE_INQUIRY", "house:h2"
     )
 
-    assert (per_intent, session_count) == (1, 1)  # h2 首次：非追问
+    # h2 首次：非追问（per-anchor 独立）；per-tag 聚合跨锚累计到 3
+    # （2026-11-11 裁决 B：硬触发阈值取 per-tag 聚合，「同一意图 ≥3」
+    # 不再被锚定细键稀释）。
+    assert (per_intent, session_count, per_tag) == (1, 1, 3)
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:PRICE_INQUIRY:house:h1") == b"2"
     assert client.hget(key, "followup:PRICE_INQUIRY:house:h2") == b"1"
+    assert client.hget(key, "followup_tag:PRICE_INQUIRY") == b"3"
 
 
 def test_record_followup_sentinel_anchor_matches_legacy_per_tag_shape(
@@ -562,9 +582,11 @@ def test_record_followup_sentinel_anchor_matches_legacy_per_tag_shape(
     manager.begin_turn(SESSION_ID, TS_1)
     manager.record_followup(SESSION_ID, "GREETING", "none")
 
-    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING", "none")
+    per_intent, session_count, per_tag = manager.record_followup(
+        SESSION_ID, "GREETING", "none"
+    )
 
-    assert (per_intent, session_count) == (2, 1)
+    assert (per_intent, session_count, per_tag) == (2, 1, 2)
     key = f"{KEY_PREFIX}{SESSION_ID}"
     assert client.hget(key, "followup:GREETING:none") == b"2"
 
@@ -577,8 +599,8 @@ def test_record_followup_anchor_key_does_not_collide_with_sentinel(
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
     manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
-    anchored, _ = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
-    sentinel, _ = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
+    anchored, _, _ = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "house:h1")
+    sentinel, _, _ = manager.record_followup(SESSION_ID, "PRICE_INQUIRY", "none")
 
     assert (anchored, sentinel) == (2, 2)  # 两键各计各的，互不影响
     key = f"{KEY_PREFIX}{SESSION_ID}"
@@ -664,6 +686,61 @@ def test_main_composition_root_defaults_to_llm_classifier(
     assert isinstance(main_module._classifier, LlmZeroShotClassifier)
 
 
+@pytest.mark.parametrize("name", [" LLM_ZERO_SHOT ", "\tllm_zero_shot\n"])
+def test_create_classifier_normalizes_whitespace_and_case(name: str) -> None:
+    # 评审补丁：strip().lower() 归一化只有 docstring 承诺、无测试锁定
+    # （变异删除归一化全套件绿）。
+    assert isinstance(create_classifier(name), LlmZeroShotClassifier)
+
+
+@pytest.mark.parametrize("name", [" None ", "NONE"])
+def test_create_classifier_normalizes_none_name(name: str) -> None:
+    assert create_classifier(name) is None
+
+
+def test_main_composition_root_empty_env_classifier_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 评审补丁：WEILIAO_INTENT_CLASSIFIER=""（docker-compose 空值惯用
+    # 写法）经 or 回落默认 LLM 实现——只有代码注释承诺、无测试锁定。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setenv("WEILIAO_INTENT_CLASSIFIER", "")
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+    assert isinstance(main_module._classifier, LlmZeroShotClassifier)
+
+
+def test_main_composition_root_filter_chain_is_pinned(
+    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
+) -> None:
+    # 评审补丁：组合根显式过滤器链是生产链权威，但构成无测试钉住
+    # （变异删除/重排任一过滤器全套件绿）。经 create_app 间谍捕获
+    # 编排器，断言链成员与顺序（HEAD 实际清单，含后续 Epic 过滤器）。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    captured: dict[str, Any] = {}
+    real_create_app = create_app
+
+    def _spy(orchestrator: Any = None, *args: Any, **kwargs: Any) -> Any:
+        captured["orchestrator"] = orchestrator
+        return real_create_app(orchestrator, *args, **kwargs)
+
+    monkeypatch.setattr("weiliao_agent.adapters.http.create_app", _spy)
+    importlib.reload(importlib.import_module("weiliao_agent.main"))
+
+    assert captured["orchestrator"] is not None
+    assert captured["orchestrator"].filter_names == (
+        "coreference",
+        "intent_router",
+        "cache_lookup",
+        "llm_generate",
+        "risk_review",
+        "response_assembler",
+    )
+
+
 class _FakeStructuredModel:
     """``with_structured_output`` 同接口替身：返回固定结构化输出。"""
 
@@ -732,6 +809,70 @@ def test_main_composition_root_records_followup_to_redis(
     assert fake.hget(key, "followup:PRICE_INQUIRY:house:house-001") == b"2"
     assert fake.hget(key, "followup_count") == b"1"
     assert fake.ttl(key) == DEFAULT_TTL_SECONDS
+
+
+def test_main_composition_root_followup_bypasses_l0(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_langfuse: _FakeLangfuse,
+    _restore_main_module: Any,
+) -> None:
+    # 评审补丁（spec-3-4）：「同 session 同 intent 第 2 条消息 100% 禁走
+    # L0」此前只在两个孤立单测 seam 验证——intent_router 的 recorder
+    # 注入若被移除或 cache_lookup 的 bypass 分支被接线层绕过，接缝回归
+    # 全绿入库。本条经组合根全链走真实第 2 条消息：L0 get 零调用 +
+    # bypassed 计数 + Langfuse bypass 事件三断言锁定。
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
+    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
+    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
+    classifier = main_module._classifier
+    assert isinstance(classifier, LlmZeroShotClassifier)
+    classifier._structured_model = _FakeStructuredModel(
+        _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.91)
+    )
+    get_calls = 0
+    real_get = L0CacheClient.get
+
+    def _counting_get(
+        self: L0CacheClient, intent: Any, house_id: str, **kwargs: Any
+    ) -> Any:
+        nonlocal get_calls
+        get_calls += 1
+        return real_get(self, intent, house_id, **kwargs)
+
+    monkeypatch.setattr(L0CacheClient, "get", _counting_get)
+    collector = metrics_module.reset_cache_metrics()
+    http = TestClient(main_module.app)
+    # trace_id 必须 32-hex 口径（_recordable 守卫）事件才可挂 Langfuse。
+    payload = {
+        **_valid_payload(),
+        "message": "你好，这套房多少钱？",
+        "trace_id": "ab" * 16,
+    }
+
+    try:
+        first = http.post("/v1/messages", json=payload)
+        assert first.status_code == 200
+        assert get_calls >= 1  # 首条消息走 L0 查询（miss）
+
+        get_calls = 0
+        second = http.post(
+            "/v1/messages",
+            json={**payload, "timestamp": TS_2.isoformat()},
+        )
+
+        assert second.status_code == 200
+        assert get_calls == 0  # 第 2 条同 intent：100% 禁走 L0（组合根全链）
+        assert collector.snapshot()["bypassed"] == 1
+        bypass_events = [
+            e
+            for e in fake_langfuse.events
+            if e["metadata"].get("event") == "cache_event"
+            and e["metadata"].get("operation") == "bypass"
+        ]
+        assert bypass_events  # Langfuse bypass 事件可观测（trace 口径）
+    finally:
+        metrics_module.reset_cache_metrics()
 
 
 def test_main_composition_root_writes_coref_audit_to_redis(
@@ -874,3 +1015,25 @@ def test_read_handoff_status_returns_corrupt_value_verbatim(
     manager.begin_turn(SESSION_ID, TS_1)
     client.hset(f"{KEY_PREFIX}{SESSION_ID}", "handoff_status", "garbage-value")
     assert manager.read_handoff_status(SESSION_ID) == "garbage-value"
+
+
+def test_begin_turn_refreshes_transcript_ttl(
+    manager: SessionManager, client: fakeredis.FakeRedis
+) -> None:
+    # Epic 5 code review 补丁：转写 list TTL 与会话 hash 对齐——
+    # 空闲近 TTL 后新消息触发转人工时，「最近 3 轮」上下文必须仍可
+    # 读（原实现下转写 key 从上轮记录时刻独立倒计时，会先过期）。
+    transcript_key = f"{KEY_PREFIX}{SESSION_ID}:transcript"
+    manager.record_transcript(
+        SESSION_ID,
+        turn=1,
+        buyer_message="房子还有吗",
+        agent_reply="还有的",
+        timestamp=TS_1,
+    )
+    client.expire(transcript_key, 60)  # 模拟转写 key 中途 TTL 被压短
+
+    manager.begin_turn(SESSION_ID, TS_2)
+
+    assert client.ttl(transcript_key) == DEFAULT_TTL_SECONDS
+    assert len(manager.read_transcript(SESSION_ID, 5)) == 1

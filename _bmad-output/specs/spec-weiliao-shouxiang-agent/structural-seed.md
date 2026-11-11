@@ -25,5 +25,7 @@
 | CAP-1/2/3 意图识别与路由（FR-1/2/3） | `filters/intent_router`（含硬触发评估模块） | AD-1, AD-2, AD-3, AD-12 |
 | CAP-4/5 缓存与事实卡片（FR-4/5） | `cache/`, `workers/house_sync` | AD-4, AD-5, AD-6 |
 | CAP-6/7/8 LLM 生成与风控（FR-6/7/8） | `llm/`, `filters/risk_review` | AD-2, AD-8, AD-9 |
+| CAP-12 转人工后响应路径关闭（FR-12） | 编排器入口（handoff_status 短路）+ `session/`（权威状态读取） | AD-4, AD-7 |
+| CAP-13 模型路由与成本护栏 | `llm/`（路由与预算）、`observability/`（成本追踪） | AD-9 |
 | CAP-9 AI 身份披露（FR-9） | `filters/response_assembler` | AD-10 |
 | CAP-10 会话状态管理（FR-10） | `session/` | AD-4 |

@@ -212,3 +212,30 @@ def test_handoff_status_reader_wired_to_session_manager() -> None:
     )
     assert result.returncode == 0, result.stderr.decode()
     assert result.stdout.decode().splitlines() == ["True"]
+
+
+# ---- Story 5.1：评估器/标记器组合根接线（Epic 5 code review 验证
+# 缺口补丁：5.2/5.5 已有接线内省测试，5.1 独缺这一对——删掉 main.py
+# 注入行，本测试即红） ----
+
+
+def test_handoff_assessor_and_marker_wired_to_intent_router() -> None:
+    result = _import_main(
+        {},
+        program=(
+            "import weiliao_agent.main as m; "
+            "from weiliao_agent.filters.intent_router import IntentRouterFilter; "
+            "from weiliao_agent.pipeline import PipelineOrchestrator; "
+            "route = next(r for r in m.app.routes "
+            "             if getattr(r, 'path', '') == '/v1/messages'); "
+            "cells = route.endpoint.__closure__ or (); "
+            "orch = next(c.cell_contents for c in cells "
+            "            if isinstance(c.cell_contents, PipelineOrchestrator)); "
+            "router = next(f for f in orch._filters "
+            "              if isinstance(f, IntentRouterFilter)); "
+            "print(router._handoff_assessor is m._handoff_assessor); "
+            "print(router._handoff_marker == m._session_manager.mark_handoff)"
+        ),
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.decode().splitlines() == ["True", "True"]

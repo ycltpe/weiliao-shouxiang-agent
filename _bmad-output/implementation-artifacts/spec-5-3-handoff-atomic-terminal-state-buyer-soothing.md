@@ -99,3 +99,11 @@ context: []
 - `cd /Users/yechen/PycharmProjects/test && uv run pytest tests/ -q` -- expected: 全部通过（含新增用例，无回归）
 - `uv run ruff check src tests` -- expected: 零告警
 - `uv run mypy src` -- expected: 零告警（仓库 mypy strict 口径，仅扫 src）
+
+### Review Findings
+
+（2026-11-10 Epic 5 级 code review，全局统计见 spec-5-1 分录头。本分录 1 项 decision + 1 项 patch + 1 项 defer。）
+
+- [x] [Review][Patch] `mark_handoff` 写失败后会话并非终态——买家被告知已转接却继续收到 AI 应答（high；blind-hunter + edge-case-hunter 双层独立命中，主审已读码确认）【2026-11-11 裁决：A——重试 + 高级别告警 + 本地日志，本轮仍回安抚文案，终态尽力达、观测补齐】 [`src/weiliao_agent/filters/intent_router.py:319-335`、`src/weiliao_agent/pipeline.py:235-270`、`src/weiliao_agent/adapters/http.py:188-208`] — marker 异常仅 `tracing.record_handoff_mark_failed` 一个 Langfuse 事件，无本地日志、无重试；5.3/5.5 两道闸门只认 Redis 权威值，写失败时 `handoff_status` 滞留 `"none"`——买家下一条消息正常走完整 AI 管道，正是 Epic 5 要消灭的人机混答；红线消息还会二次触发、重复发送转交指令；未配置 Langfuse 时该失效完全不可见。既有测试 `test_router_marker_failure_fails_safe` 只锁定「本轮应答不降级」，未覆盖后续轮的终态失效。修法（A）：marker 调用加有界重试（同过滤器预算内，如 2 次重试 + 短退避），最终失败时补本地 ERROR/WARNING 日志（session_id + handoff_id + 异常类型，可检索可告警）并保留 Langfuse 事件；本轮应答口径不变。
+- [x] [Review][Patch] 测试跨文件私有导入遗留（low；acceptance-auditor + verification-gap 双层） [`tests/test_handoff_transcript.py:14-16`] — `from test_handoff_command import _FakeTransport, _HandoffFilter` 仍引用另一测试文件的私有对象；5.3 Review Triage 已将同类耦合裁决 patch（内联替身）但本 diff 未执行。修法：内联最小替身，消除测试间私有耦合。
+- [x] [Review][Defer] `begin_turn` 对 Redis 损坏数值字段无防御，非 RedisError 异常逃逸为买家侧 5xx（low；edge-case-hunter 层） [`src/weiliao_agent/session/manager.py:227-235`、`src/weiliao_agent/adapters/http.py:185-189`] — 会话 hash 被外部写入损坏值时（如 `followup_count="abc"` → Lua `tonumber` 得 nil → Python `int(None)` TypeError；`turn="abc"` → HINCRBY 抛 RedisError 已被收敛），ValueError/TypeError 不属 RedisError 族，穿透 fail-closed 兜底为 500。http.py 注释明示「编程错误照常上抛」为仓库刻意惯例，5.3 已对称处理 handoff_status 未知值但数值字段未对称。settle：拍板损坏数据语义（loud failure vs 防御归零），随 Redis 数据治理决策。

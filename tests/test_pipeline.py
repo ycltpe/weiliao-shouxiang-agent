@@ -235,6 +235,32 @@ def test_final_assembly_consumes_approved_draft_with_ai_prefix() -> None:
     assert result.reply == f"{AI_DISCLOSURE_PREFIX}这套房源目前在售。"
 
 
+def test_final_assembly_does_not_duplicate_existing_ai_prefix() -> None:
+    # code review Epic 4 补丁：LLM 草稿自带【AI 助手】前缀时（prompt 要求
+    # 保持 AI 身份，grounding/审核均不拦截此前缀），编排器最终返回点不得
+    # 盲加前缀产出双标文案——前缀在全链恰好出现一次。
+    log: list[str] = []
+    orchestrator = PipelineOrchestrator(
+        filters=[
+            _RecordingFilter("intent_router", log),
+            _RecordingFilter("risk_review", log),
+            ResponseAssemblerFilter(),
+        ]
+    )
+    envelope = Envelope.model_validate(
+        {
+            **_valid_payload(),
+            "generated_reply": f"{AI_DISCLOSURE_PREFIX}这套房源目前在售。",
+        }
+    )
+
+    result = orchestrator.run(envelope)
+
+    assert result.degraded is False
+    assert result.reply.count(AI_DISCLOSURE_PREFIX) == 1
+    assert result.reply == f"{AI_DISCLOSURE_PREFIX}这套房源目前在售。"
+
+
 def test_final_assembly_falls_back_when_no_approved_draft() -> None:
     log: list[str] = []
     orchestrator = PipelineOrchestrator(

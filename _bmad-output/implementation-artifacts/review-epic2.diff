@@ -1,0 +1,2392 @@
+diff --git a/src/weiliao_agent/adapters/http.py b/src/weiliao_agent/adapters/http.py
+index 4f9d80d..533d939 100644
+--- a/src/weiliao_agent/adapters/http.py
++++ b/src/weiliao_agent/adapters/http.py
+@@ -21,11 +21,15 @@ from pydantic import ValidationError
+ from weiliao_agent.filters.templates import render_placeholder
+ from weiliao_agent.health import is_ready
+ from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.models.intent import IntentTag
+ from weiliao_agent.pipeline import PipelineOrchestrator, PipelineResult
+ from weiliao_agent.session import SessionManager
+ 
+ 
+-def _fallback_result(intent: str | None = None, trace_id: str | None = None) -> PipelineResult:
++def _fallback_result(
++    intent: IntentTag | None = None,
++    trace_id: str | None = None,
++) -> PipelineResult:
+     """构造 fail-closed 兜底应答：兜底文案 + 新生成 trace_id。"""
+     return PipelineResult(
+         reply=render_placeholder(intent),
+diff --git a/src/weiliao_agent/classifiers/__init__.py b/src/weiliao_agent/classifiers/__init__.py
+new file mode 100644
+index 0000000..170948b
+--- /dev/null
++++ b/src/weiliao_agent/classifiers/__init__.py
+@@ -0,0 +1,46 @@
++"""意图分类器包（Story 2.2）：包级统一工厂按配置名构造实现。
++
++组合根唯一装配入口：``create_classifier(name)`` 按
++``WEILIAO_INTENT_CLASSIFIER`` 取值构造实现；实现切换只动配置与本
++工厂，路由链路代码零感知（spec AC 第 4 条）。合法值：
++
++- ``llm_zero_shot``（默认）：LLM zero-shot 实现
++  （weiliao_agent.classifiers.llm_zero_shot）；
++- ``none``：不装配分类器——过滤器保留 Story 1.2 占位行为（意图缺失
++  置 UNKNOWN），用于无 LLM 凭据环境的降级运行。
++
++非法值 fail-fast：抛 ``ValueError``，组合根（main.py 导入期）拒绝启动。
++"""
++
++from weiliao_agent.classifiers.llm_zero_shot import (
++    IntentClassificationError,
++    LlmZeroShotClassifier,
++)
++from weiliao_agent.filters.intent_router import IntentClassifier
++
++__all__ = [
++    "IntentClassificationError",
++    "IntentClassifier",
++    "LlmZeroShotClassifier",
++    "create_classifier",
++]
++
++# 合法配置名 -> 构造说明（工厂 docstring 同步维护）。
++_KNOWN_NAMES = ("llm_zero_shot", "none")
++
++
++def create_classifier(name: str) -> IntentClassifier | None:
++    """按配置名构造分类器实现；非法值 fail-fast（ValueError）。
++
++    返回 None 表示不装配分类器（"none"），过滤器走占位行为。
++    """
++    normalized = name.strip().lower()
++    if normalized == "none":
++        return None
++    if normalized == "llm_zero_shot":
++        return LlmZeroShotClassifier()
++    msg = (
++        f"unknown intent classifier: {name!r} "
++        f"(expected one of: {', '.join(_KNOWN_NAMES)})"
++    )
++    raise ValueError(msg)
+diff --git a/src/weiliao_agent/classifiers/llm_zero_shot.py b/src/weiliao_agent/classifiers/llm_zero_shot.py
+new file mode 100644
+index 0000000..25413cb
+--- /dev/null
++++ b/src/weiliao_agent/classifiers/llm_zero_shot.py
+@@ -0,0 +1,161 @@
++"""LLM zero-shot 意图分类默认实现（Story 2.2，OQ-1 选 B）。
++
++ChatOpenAI 结构化输出（单一标签 + 自评置信度），满足 AD-3「单一标签 +
++置信度」契约；实现实例无分类状态，可安全复用 2.1 的线程池执行模型
++（组合根单例注入过滤器，过滤器跑在编排器线程池内）。
++
++硬超时守卫（spec Design Notes）：客户端级 timeout 设在预算内
++（默认 45ms，经构造参数/环境配置注入），并以调用侧
++``future.result(timeout)`` 双保险——超时/网络错误/结构化输出校验
++失败一律抛 ``IntentClassificationError``（自报 ``reason`` 供过滤器
++trace 归因），由过滤器 fail-closed 为 UNKNOWN，不给规则兜底（保持
++单一来源，避免双实现口径漂移）。
++
++置信度口径：取 LLM 结构化输出的自评分数；模型不自评（confidence 缺省）
++时以固定口径 0.8 回填——不回填 1.0，为 Story 2.3 追问归并保留信号
++空间。模型名经配置注入（脊柱：模型名禁硬编码，gpt-4o 系 2027-01-14
++关停需 alias 可换）：构造参数 > ``WEILIAO_INTENT_MODEL`` 环境变量 >
++默认 alias（gpt-4o-mini）。
++"""
++
++import os
++from collections.abc import Mapping
++from concurrent.futures import ThreadPoolExecutor
++from concurrent.futures import TimeoutError as FutureTimeoutError
++from typing import Any
++
++from langchain_core.messages import HumanMessage, SystemMessage
++from pydantic import BaseModel, ValidationError
++
++from weiliao_agent.models.intent import IntentClassification, IntentTag
++
++# 默认模型 alias（gpt-4o 系 2027-01-14 API 关停前可经配置整体迁移，
++# 脊柱 Stack 表迁移路径见 Deferred）；可被构造参数/环境变量覆盖。
++DEFAULT_MODEL_ALIAS = "gpt-4o-mini"
++
++# 分类延迟硬预算：P99 < 50ms 端到端口径（含前置指代消解）的实现内守卫，
++# 不依赖编排器 deadline 兜底。
++DEFAULT_TIMEOUT_SECONDS = 0.045
++
++# 模型不自评置信度时的固定回填值（spec Design Notes，不回填 1.0）。
++FALLBACK_CONFIDENCE = 0.8
++
++# 超时的 LLM 调用无法中止（执行线程待其自行结束），并发上限防御
++# 超时风暴下的线程膨胀；调用侧守卫先行返回，不傻等。
++_MAX_WORKERS = 8
++
++
++class IntentClassificationError(Exception):
++    """分类失败统一异常：自报 ``reason`` 供过滤器 trace 失败归因。
++
++    reason 取值：``timeout``（硬预算耗尽）/ ``invalid_output``（结构化
++    输出校验拒绝）/ 底层异常类型名（网络错误等）。
++    """
++
++    def __init__(self, reason: str, detail: str = "") -> None:
++        super().__init__(detail or reason)
++        self.reason = reason
++
++
++class _LlmIntentOutput(BaseModel):
++    """LLM 结构化输出 schema：单标签 + 可缺省自评置信度。"""
++
++    tag: IntentTag
++    confidence: float | None = None
++
++
++class LlmZeroShotClassifier:
++    """默认意图分类器：ChatOpenAI 结构化输出 + 硬超时守卫。
++
++    ``structured_model`` 可注入与 ``with_structured_output`` 同接口的
++    替身（``.invoke(messages)`` 返回 ``_LlmIntentOutput``），供无网络
++    单测覆盖超时守卫与输出解析；生产路径缺省经 ``WEILIAO_INTENT_MODEL``
++    惰性构造 ChatOpenAI（首次 classify 才建客户端——组合根导入不依赖
++    OpenAI 凭据可用性）。
++    """
++
++    # trace 实现来源自报值（过滤器 record_classification 消费）。
++    source = "llm_zero_shot"
++
++    def __init__(
++        self,
++        model: str | None = None,
++        *,
++        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
++        structured_model: Any = None,
++    ) -> None:
++        self._model = model or os.environ.get(
++            "WEILIAO_INTENT_MODEL", DEFAULT_MODEL_ALIAS
++        )
++        self._timeout_seconds = timeout_seconds
++        self._structured_model = structured_model
++        self._executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        """对单条消息输出单一意图标签与置信度（超时/失败抛统一异常）。"""
++        future = self._executor.submit(self._classify_once, message, context)
++        try:
++            return future.result(timeout=self._timeout_seconds)
++        except FutureTimeoutError:
++            # 硬预算耗尽：执行线程无法中止，待其自行结束（不傻等）。
++            msg = f"llm classification exceeded {self._timeout_seconds * 1000:.0f}ms"
++            raise IntentClassificationError("timeout", msg) from None
++        except IntentClassificationError:
++            raise
++        except Exception as exc:
++            raise IntentClassificationError(type(exc).__name__, str(exc)) from exc
++
++    def _classify_once(
++        self, message: str, context: Mapping[str, Any]
++    ) -> IntentClassification:
++        output = self._structured().invoke(_prompt(message, context))
++        confidence = output.confidence
++        if confidence is None:
++            confidence = FALLBACK_CONFIDENCE
++        try:
++            return IntentClassification(tag=output.tag, confidence=confidence)
++        except ValidationError as exc:
++            # 结构化输出绕开 Literal 的兜底防线：置信度越界等在此拒绝。
++            raise IntentClassificationError("invalid_output", str(exc)) from exc
++
++    def _structured(self) -> Any:
++        """惰性构造生产模型（注入替身优先）；OpenAI 凭据缺失等初始化
++        异常在首次调用时抛出，由过滤器 fail-closed 承接。"""
++        if self._structured_model is not None:
++            return self._structured_model
++        from langchain_openai import ChatOpenAI
++
++        chat = ChatOpenAI(
++            model=self._model,
++            timeout=self._timeout_seconds,
++            max_retries=0,
++            temperature=0,
++        )
++        self._structured_model = chat.with_structured_output(_LlmIntentOutput)
++        return self._structured_model
++
++
++def _prompt(message: str, context: Mapping[str, Any]) -> list[Any]:
++    """zero-shot prompt：9 类标签清单 + 会话上下文 + 单标签/置信度口径。
++
++    保持短小（延迟预算 45ms）：标签清单为唯一权威枚举说明，示例省略——
++    结构化输出 schema 本身即约束。
++    """
++    tags = (
++        "GREETING（打招呼寒暄）/ PRICE_INQUIRY（价格询问）/ "
++        "AVAILABILITY（在租在售、看房可得性）/ LOCATION（位置交通）/ "
++        "PHOTO_REQUEST（图片索取）/ NEGOTIATION（砍价议价）/ "
++        "LOAN_POLICY（贷款政策）/ COMPLAINT（投诉不满）/ UNKNOWN（无法判断）"
++    )
++    system_message = (
++        "你是房产微聊意图分类器。将买家消息分类为以下唯一意图之一："
++        f"{tags}。"
++        "输出 JSON：tag（意图标签）与 confidence（0.0-1.0 自评置信度）。"
++        "只输出最高置信度的一个标签；确实无法判断时输出 UNKNOWN。"
++    )
++    human_message = (
++        f"会话上下文：session_id={context.get('session_id', '')}, "
++        f"house_id={context.get('house_id', '')}, turn={context.get('turn', '')}\n"
++        f"买家消息：{message}"
++    )
++    return [SystemMessage(content=system_message), HumanMessage(content=human_message)]
+diff --git a/src/weiliao_agent/filters/intent_router.py b/src/weiliao_agent/filters/intent_router.py
+index 3eed16c..b96d623 100644
+--- a/src/weiliao_agent/filters/intent_router.py
++++ b/src/weiliao_agent/filters/intent_router.py
+@@ -1,19 +1,196 @@
+-"""意图路由过滤器（占位实现，Story 1.2）。
++"""意图路由过滤器（Story 1.2 占位行为；Story 2.1 分类器接口边界；Story 2.2
++写回钩子与分类 trace 事件）。
+ 
+-真实意图分类与硬触发评估（AD-3/AD-12）由后续 Epic 填充。本 Story
+-最小行为：意图缺失时按 fail-closed 口径置为 UNKNOWN，其余透传。
++占位行为（未注入分类器）：意图缺失时按 fail-closed 口径置为 UNKNOWN，
++其余透传（既有测试逐字节锁定）。
++
++Story 2.1：定义 ``IntentClassifier`` Protocol（AD-3 单意图路由——输入
++消息文本 + 会话上下文，输出单一标签 + 置信度）并经构造参数注入。实现
++选型（规则引擎 / LLM zero-shot / 微调模型，Story 2.2）保持任意继承
++结构即可替换，路由链路代码零感知。分类异常 fail-closed 为 UNKNOWN，
++过滤器自身不向上抛（过滤器契约，见 filters/base.py）。
++
++Story 2.2：可选注入 ``intent_writer``（AD-4 单写者——组合根注入
++``SessionManager.write_intent`` 方法引用，过滤器不持有 Redis 客户端）：
++分类成功、``turn`` 非 None 且 writer 存在时调用，try 包裹 fail-safe——
++写失败应答不降级、信封保留分类结果、trace 记
++reason=intent_write_failed 失败事件。分类成功/失败各补 trace 事件
++（标签/置信度/来源/延迟；失败含 reason），失败观测不区分实现来源。
++
++Story 2.3：可选注入 ``followup_recorder``（AD-4 单写者——组合根注入
++``SessionManager.record_followup`` 方法引用）：分类成功、``turn`` 非
++None、recorder 存在且 tag 非 UNKNOWN 时调用，对 (session, intent) 计数
++做 Redis 原子自增（Lua 单 roundtrip，过滤器不持有 Redis 客户端）；
++per-intent 计数 ≥2 时信封 ``is_followup=True``（Epic 3 cache_lookup
++消费），会话追问总数达 3 时经 ``record_followup_hard_trigger`` 产出
++hard trigger 信号事件（判定与转人工归 Epic 5 的 AD-12 模块）。
++UNKNOWN 不参与追问判定（计数与标记均跳过，降级路径零副作用；AD-11：
++追问判定只以分类器输出的意图标签为准，禁止对消息文本做相似度比对）。
++recorder 异常 try 包裹 fail-safe：应答不降级、信封保留分类结果、
++``is_followup`` 保持默认 False、trace 记 reason=followup_record_failed
++失败事件，过滤器自身不向上抛。
+ """
+ 
++import time
++from collections.abc import Callable, Mapping
++from typing import Any, Protocol
++
+ from weiliao_agent.filters.base import Filter
+ from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.models.intent import IntentClassification, IntentTag
++from weiliao_agent.observability import tracing
++
++
++class IntentClassifier(Protocol):
++    """意图分类器接口边界（AD-3 单意图路由）。
++
++    接口仅承诺「消息文本 + 会话上下文 → 单一标签 + 置信度」；context
++    具体形态由实现自定（本过滤器当前供给 session_id / house_id / turn /
++    trace_id 的只读映射），实现方按组合根装配时的约定消费，切换实现
++    无需改动路由链路代码（AC 第 4 条）。
++    """
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        """对单条消息输出单一意图标签与置信度。"""
++        ...
+ 
+ 
+ class IntentRouterFilter(Filter):
+-    """占位意图路由：缺失意图默认 UNKNOWN，信封其余字段透传。"""
++    """意图路由：注入分类器时写回分类标签，未注入时保留占位行为。"""
+ 
+     name = "intent_router"
+ 
++    def __init__(
++        self,
++        classifier: IntentClassifier | None = None,
++        intent_writer: Callable[[str, int, IntentClassification], None] | None = None,
++        followup_recorder: Callable[[str, IntentTag], tuple[int, int]] | None = None,
++    ) -> None:
++        self._classifier = classifier
++        self._intent_writer = intent_writer
++        self._followup_recorder = followup_recorder
++
+     def process(self, envelope: Envelope) -> Envelope:
+-        if envelope.intent is None:
++        if self._classifier is None:
++            # 占位行为（Story 1.2，既有测试锁定）：缺失意图置 UNKNOWN。
++            if envelope.intent is None:
++                return envelope.model_copy(update={"intent": "UNKNOWN"})
++            return envelope
++        # 消解后消息（resolved_message）就位后即为分类器唯一输入（AD-11）；
++        # 指代消解过滤器交付前，退化为买家原文（message）。
++        message = (
++            envelope.resolved_message
++            if envelope.resolved_message is not None
++            else envelope.message
++        )
++        if not message:
++            # 分类器契约要求非空消息文本：None 与空串一律 fail-closed
++            # UNKNOWN，不调用分类器。
++            return envelope.model_copy(update={"intent": "UNKNOWN"})
++        context: Mapping[str, Any] = {
++            "session_id": envelope.session_id,
++            "house_id": envelope.house_id,
++            "turn": envelope.turn,
++            "trace_id": envelope.trace_id,
++        }
++        started = time.monotonic()
++        try:
++            classification = self._classifier.classify(message, context)
++            # 写回经 model_validate 全量校验（非 model_copy 旁路）：
++            # 非一致性分类器（如以 model_construct 绕过校验返回枚举外
++            # tag）在此拒绝；tag 提取同置 try 内，返回 None 或无 .tag
++            # 对象的 AttributeError 同样降级，过滤器自身不向上抛。
++            classified = Envelope.model_validate(
++                {**envelope.model_dump(), "intent": classification.tag}
++            )
++            # confidence 提取同置 try 内（2.1 防御口径）：非一致性分类器
++            # （有 .tag 无 .confidence）的 AttributeError 同样 fail-closed，
++            # 不得逃逸 process()。
++            confidence = classification.confidence
++        except Exception as exc:
++            # 分类异常 fail-closed：UNKNOWN，过滤器自身不向上抛。
++            tracing.record_classification_failure(
++                envelope.trace_id, reason=_failure_reason(exc)
++            )
+             return envelope.model_copy(update={"intent": "UNKNOWN"})
+-        return envelope
++        # 分类成功：trace 事件（来源取实现自报 source，缺省类名）。
++        latency_ms = (time.monotonic() - started) * 1000
++        tracing.record_classification(
++            envelope.trace_id,
++            tag=classification.tag,
++            confidence=confidence,
++            source=_classifier_source(self._classifier),
++            latency_ms=latency_ms,
++        )
++        if envelope.turn is not None and self._intent_writer is not None:
++            try:
++                self._intent_writer(envelope.session_id, envelope.turn, classification)
++            except Exception:
++                # 写回失败 fail-safe：应答不降级、信封保留分类结果，
++                # trace 记失败事件（绝不二次影响买家应答）。
++                tracing.record_classification_failure(
++                    envelope.trace_id, reason="intent_write_failed"
++                )
++        is_followup = self._record_followup(envelope, classification.tag)
++        if not is_followup:
++            return classified
++        return classified.model_copy(update={"is_followup": True})
++
++    def _record_followup(self, envelope: Envelope, tag: IntentTag) -> bool:
++        """追问识别落点（Story 2.3）：原子计数、信封标记、trace 挂点。
++
++        返回是否追问命中（per-intent ≥2）。前置条件不满足（turn 为
++        None、未注入 recorder、tag 为 UNKNOWN）一律跳过：不调 recorder、
++        不累积计数、信封 ``is_followup`` 保持默认 False。recorder 异常
++        fail-safe 收敛在本方法内，不外抛。
++        """
++        if (
++            envelope.turn is None
++            or self._followup_recorder is None
++            or tag == "UNKNOWN"
++        ):
++            return False
++        try:
++            per_intent_count, session_followup_count = self._followup_recorder(
++                envelope.session_id, tag
++            )
++        except Exception:
++            # 记录失败 fail-safe：应答不降级、信封保留分类结果、
++            # is_followup 保持默认 False，trace 记失败事件。
++            tracing.record_classification_failure(
++                envelope.trace_id, reason="followup_record_failed"
++            )
++            return False
++        is_followup = per_intent_count >= 2
++        tracing.record_followup(
++            envelope.trace_id,
++            tag=tag,
++            per_intent_count=per_intent_count,
++            session_followup_count=session_followup_count,
++            is_followup=is_followup,
++        )
++        if is_followup and session_followup_count == 3:
++            # 仅产触发信号（trace 事件 + Redis 权威值）：判定与转人工
++            # 归 Epic 5 的 AD-12 评估模块，本 Story 不写信封 handoff 字段。
++            # == 3 而非 >= 3：HINCRBY 步长恒为 1，恰在穿越 3 的本次
++            # 追问命中发一次信号；并发下恰一条消息得 3，不重复触发。
++            tracing.record_followup_hard_trigger(
++                envelope.trace_id, count=session_followup_count
++            )
++        return is_followup
++
++
++def _failure_reason(exc: Exception) -> str:
++    """trace 失败归因：实现自报 reason（如 timeout）优先，缺省异常类型名。"""
++    reason = getattr(exc, "reason", None)
++    if isinstance(reason, str) and reason:
++        return reason
++    return type(exc).__name__
++
++
++def _classifier_source(classifier: IntentClassifier) -> str:
++    """trace 实现来源：分类器自报 source 属性优先，缺省类名。"""
++    source = getattr(classifier, "source", None)
++    if isinstance(source, str) and source:
++        return source
++    return type(classifier).__name__
+diff --git a/src/weiliao_agent/filters/templates.py b/src/weiliao_agent/filters/templates.py
+index af114f4..d2103fa 100644
+--- a/src/weiliao_agent/filters/templates.py
++++ b/src/weiliao_agent/filters/templates.py
+@@ -7,12 +7,14 @@
+ Story 4.1 完整模板库替换时继承该约定。
+ """
+ 
++from weiliao_agent.models.intent import IntentTag
++
+ # 固定 AI 身份披露前缀（AD-10）：买家可见文本 100% 携带。
+ AI_DISCLOSURE_PREFIX = "【AI 助手】"
+ 
+ # 9 类意图各一条预审核安全文案；均为不承诺具体事实的安抚/记录口径，
+ # 占位过滤器输出视为已审核，允许直接下发买家。
+-_INTENT_PLACEHOLDERS: dict[str, str] = {
++_INTENT_PLACEHOLDERS: dict[IntentTag, str] = {
+     "GREETING": "您好，已收到您的消息。请问您对这套房想了解哪方面的信息？",
+     "PRICE_INQUIRY": "您咨询的价格问题已为您记录，确认后第一时间回复您。",
+     "AVAILABILITY": "房源在售情况正在为您核实，稍后回复您确认结果。",
+@@ -28,10 +30,12 @@ _INTENT_PLACEHOLDERS: dict[str, str] = {
+ _GENERIC_PLACEHOLDER = "系统繁忙，已为您记录消息，经纪人稍后回复您。"
+ 
+ 
+-def render_placeholder(intent: str | None) -> str:
++def render_placeholder(intent: IntentTag | None) -> str:
+     """按意图标签渲染买家可见占位文案，统一携带 AI 身份披露前缀。
+ 
+-    intent 为 None 或不在 9 类枚举内时回退通用兜底文案。
++    intent 为 None 时回退通用兜底文案；类型层已收窄为 9 类枚举
++    （Story 2.1），运行时经 dict.get 仍对枚举外字符串 fail-closed
++    到通用兜底（与信封未知枚举口径一致）。
+     """
+     body = _GENERIC_PLACEHOLDER
+     if intent:
+diff --git a/src/weiliao_agent/main.py b/src/weiliao_agent/main.py
+index a9766da..c51b008 100644
+--- a/src/weiliao_agent/main.py
++++ b/src/weiliao_agent/main.py
+@@ -1,7 +1,17 @@
+-"""应用入口：装配编排器、SessionManager 与 HTTP 端点，供 uvicorn 启动。
++"""应用入口：装配编排器、SessionManager、意图分类器与 HTTP 端点。
+ 
+ 启动方式：``uvicorn weiliao_agent.main:app --reload``。
+ ``/health`` 由 create_app 装配（Story 1.4，NFR-7）。
++
++Story 2.2 组合根：``WEILIAO_INTENT_CLASSIFIER`` 选分类器实现
++（默认 ``llm_zero_shot``；``none`` 保留占位行为），非法值由工厂
++fail-fast——导入期抛 ``ValueError``，服务拒绝启动。意图写回经
++``SessionManager.write_intent`` 方法引用注入（AD-4 单写者），路由
++链路代码零改动。
++
++Story 2.3 组合根：追问识别经 ``SessionManager.record_followup``
++方法引用注入（AD-4 单写者），过滤器不持有 Redis 客户端；路由链路
++其余装配不动。
+ """
+ 
+ import os
+@@ -9,6 +19,11 @@ import os
+ import redis
+ 
+ from weiliao_agent.adapters.http import create_app
++from weiliao_agent.classifiers import create_classifier
++from weiliao_agent.filters.cache_lookup import CacheLookupFilter
++from weiliao_agent.filters.intent_router import IntentRouterFilter
++from weiliao_agent.filters.response_assembler import ResponseAssemblerFilter
++from weiliao_agent.filters.risk_review import RiskReviewFilter
+ from weiliao_agent.pipeline import PipelineOrchestrator
+ from weiliao_agent.session import SessionManager
+ 
+@@ -21,4 +36,22 @@ _redis_client = redis.Redis.from_url(
+     socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+ )
+ 
+-app = create_app(PipelineOrchestrator(), SessionManager(_redis_client))
++_session_manager = SessionManager(_redis_client)
++# 空串等空值回落默认实现（文档承诺），仅显式非法值 fail-fast。
++_classifier = create_classifier(os.environ.get("WEILIAO_INTENT_CLASSIFIER") or "llm_zero_shot")
++
++app = create_app(
++    PipelineOrchestrator(
++        filters=[
++            IntentRouterFilter(
++                classifier=_classifier,
++                intent_writer=_session_manager.write_intent,
++                followup_recorder=_session_manager.record_followup,
++            ),
++            CacheLookupFilter(),
++            RiskReviewFilter(),
++            ResponseAssemblerFilter(),
++        ]
++    ),
++    _session_manager,
++)
+diff --git a/src/weiliao_agent/models/__init__.py b/src/weiliao_agent/models/__init__.py
+index 9549013..b5fe329 100644
+--- a/src/weiliao_agent/models/__init__.py
++++ b/src/weiliao_agent/models/__init__.py
+@@ -1 +1,5 @@
+ """Pydantic 模型：信封、事实卡片、意图标签（Literal）。"""
++
++from weiliao_agent.models.intent import IntentClassification, IntentTag
++
++__all__ = ["IntentClassification", "IntentTag"]
+diff --git a/src/weiliao_agent/models/envelope.py b/src/weiliao_agent/models/envelope.py
+index 96a5591..01f1b3f 100644
+--- a/src/weiliao_agent/models/envelope.py
++++ b/src/weiliao_agent/models/envelope.py
+@@ -13,10 +13,15 @@
+   payload 携带值原样流经管道与响应，但仅 32-hex 值可作为 Langfuse
+   trace id 被消费，非 32-hex 值跳过追踪（见 observability.tracing）；
+   空串仍拒绝；
+-- ``turn``（会话内绝对消息序号，由会话管理在入管道前赋值）与
+-  ``intent``（由分类器填写）允许为 None，但非 None 时类型必须正确；
+-- ``intent`` 本 Story 为 ``str | None``，9 类 Literal 枚举在 Story 2.1
+-  定义后收窄，未知值届时 fail-closed 到模板兜底；
++- ``turn``（会话内绝对消息序号，由会话管理在入管道前赋值）允许为 None，
++  但非 None 时类型必须正确；
++- ``intent`` 已收窄为 ``IntentTag | None``（Story 2.1，9 类 Literal 枚举，
++  权威定义在 models.intent，由分类器填写）：未知值经 ``model_validate``
++  拒绝即 fail-closed 到模板兜底；
++- ``is_followup``（Story 2.3，重复追问标记）：同一 session 内同一意图第
++  2 次起为 True，由 intent_router 经注入的会话单写者回调判定后写回；
++  默认 False（含分类 fail-closed / 记录失败 fail-safe 路径）。Epic 3 的
++  cache_lookup 据此禁走 L0 缓存；
+ - ``message`` / ``resolved_message`` / ``coref`` / ``media_type`` 为架构
+   预留字段，本 Story 仅定义、不消费，默认 None。
+ """
+@@ -26,6 +31,8 @@ from typing import Any
+ 
+ from pydantic import BaseModel, Field, field_validator
+ 
++from weiliao_agent.models.intent import IntentTag
++
+ 
+ class Envelope(BaseModel):
+     """管道内传递的标准化消息信封。"""
+@@ -37,7 +44,11 @@ class Envelope(BaseModel):
+     # 回填），其余校验规则不动（空串仍 min_length=1 拒绝）。
+     trace_id: str | None = Field(default=None, min_length=1)
+     turn: int | None = None
+-    intent: str | None = None
++    intent: IntentTag | None = None
++    # Story 2.3：Follow-up Query 标记（同意图第 2 次起为 True，Epic 3
++    # cache_lookup 消费）；默认 False——分类 fail-closed 与追问记录失败
++    # fail-safe 路径均不置位。
++    is_followup: bool = False
+     # 以下四字段为架构预留，本 Story 不参与验收；coref 将在 CorefRef
+     # 模型（models/，AD-11）定义后收窄为 list[CorefRef]。
+     message: str | None = None
+diff --git a/src/weiliao_agent/models/intent.py b/src/weiliao_agent/models/intent.py
+new file mode 100644
+index 0000000..a38c6a6
+--- /dev/null
++++ b/src/weiliao_agent/models/intent.py
+@@ -0,0 +1,33 @@
++"""意图标签与分类结果模型（Story 2.1）—— 数据格式约定的唯一权威定义。
++
++9 类意图标签为单一 ``Literal`` 类型枚举（架构一致性约定「数据格式」），
++全链路经 ``model_validate`` 校验：未知值校验拒绝即 fail-closed，由端点层
++既有 ``ValidationError`` 兜底承载为模板兜底应答。
++
++``IntentClassification`` 为分类器输出的统一口径：单一标签 + 置信度
++（AD-3 单意图路由；置信度不进信封——六字段契约不变）。
++"""
++
++from typing import Literal
++
++from pydantic import BaseModel, Field
++
++# 9 类意图固定枚举（顺序按 Epic 2 AC）：全链路唯一权威定义。
++IntentTag = Literal[
++    "GREETING",
++    "PRICE_INQUIRY",
++    "AVAILABILITY",
++    "LOCATION",
++    "PHOTO_REQUEST",
++    "NEGOTIATION",
++    "LOAN_POLICY",
++    "COMPLAINT",
++    "UNKNOWN",
++]
++
++
++class IntentClassification(BaseModel):
++    """单条意图分类结果：单一标签 + 置信度（0.0–1.0，含边界）。"""
++
++    tag: IntentTag
++    confidence: float = Field(ge=0.0, le=1.0)
+diff --git a/src/weiliao_agent/observability/tracing.py b/src/weiliao_agent/observability/tracing.py
+index 7e6d6f9..e999d8b 100644
+--- a/src/weiliao_agent/observability/tracing.py
++++ b/src/weiliao_agent/observability/tracing.py
+@@ -15,9 +15,22 @@ Fail-safe 约定（spec Boundaries）：本模块所有公开入口对 Langfuse
+ （无 ``LANGFUSE_PUBLIC_KEY`` 等环境变量）时 SDK 进入 disabled 态，全部
+ 记录 no-op，管道行为与 Story 1.4 逐字节一致（仅多一条禁用 warning）。
+ 
++意图分类事件（Story 2.2）：编排器入口 ``trace_message`` 的 intent 是
++preset 值（分类尚未发生），分类结果只能经 ``record_classification`` /
++``record_classification_failure`` 事件补挂同一 trace_id——含分类失败
++与写回失败两类失败事件（2.1 评审 defer 的分类失败观测挂点）。
++
+ 记录一律在主线程编排器侧、以 ``TraceContext(trace_id=...)`` 显式挂到
+ 消息 trace：过滤器在 ThreadPoolExecutor 线程内执行，不做 OTel 跨线程
+ context 传播（spec Never 约束）。
++
++追问识别事件（Story 2.3）：分类成功后 intent_router 经注入的会话单写者
++回调记录 (session, intent) 计数，``record_followup`` 补挂追问事件
++（tag / per_intent_count / session_followup_count / is_followup）；
++会话追问总数达 3 时 ``record_followup_hard_trigger`` 产出 hard trigger
++信号事件（命中条件=追问≥3，判定与转人工归 Epic 5 的 AD-12 模块）。
++记录失败经 ``record_classification_failure``（reason=
++``followup_record_failed``）观测，fail-safe 口径不变。
+ """
+ 
+ import re
+@@ -250,6 +263,118 @@ def record_delivery(
+         client.update_current_span(metadata={"delivered_text": reply})
+ 
+ 
++def record_classification(
++    trace_id: str | None,
++    *,
++    tag: str,
++    confidence: float,
++    source: str,
++    latency_ms: float,
++) -> None:
++    """意图分类成功事件：标签/置信度/实现来源/延迟补挂消息 trace。
++
++    fail-safe 口径同 ``record_degradation``：记录本身再抛异常也吞掉。
++    """
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    with suppress(Exception):
++        client.create_event(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="intent.classification",
++            metadata={
++                "event": "intent_classification",
++                "tag": tag,
++                "confidence": confidence,
++                "source": source,
++                "latency_ms": round(latency_ms, 3),
++            },
++        )
++
++
++def record_classification_failure(trace_id: str | None, *, reason: str) -> None:
++    """意图分类/写回失败事件（reason=timeout / intent_write_failed 等）。
++
++    失败事件记录本身再抛异常也吞掉（绝不二次影响买家应答）。
++    """
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    with suppress(Exception):
++        client.create_event(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="intent.classification_failure",
++            level="ERROR",
++            metadata={
++                "event": "intent_classification_failure",
++                "reason": reason[:_STATUS_MESSAGE_LIMIT],
++            },
++        )
++
++
++def record_followup(
++    trace_id: str | None,
++    *,
++    tag: str,
++    per_intent_count: int,
++    session_followup_count: int,
++    is_followup: bool,
++) -> None:
++    """追问记录事件（Story 2.3）：per-intent / 会话总数 / 标记补挂消息 trace。
++
++    fail-safe 口径同 ``record_classification``：记录本身再抛异常也吞掉。
++    """
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    with suppress(Exception):
++        client.create_event(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="intent.followup",
++            metadata={
++                "event": "intent_followup",
++                "tag": tag,
++                "per_intent_count": per_intent_count,
++                "session_followup_count": session_followup_count,
++                "is_followup": is_followup,
++            },
++        )
++
++
++def record_followup_hard_trigger(trace_id: str | None, *, count: int) -> None:
++    """追问 ≥3 hard trigger 信号事件（Story 2.3）：判定归 Epic 5（AD-12）。
++
++    本事件仅为触发信号（Langfuse 可检索），不写信封 handoff 字段；
++    判定方读 Redis 权威值而非任何快照。fail-safe 口径同上。
++    """
++    if not _recordable(trace_id):
++        return
++    client = _client_or_none()
++    if client is None:
++        return
++    assert trace_id is not None  # _recordable 已排除 None，供 mypy 收窄
++    with suppress(Exception):
++        client.create_event(
++            trace_context=TraceContext(trace_id=trace_id),
++            name="intent.followup_hard_trigger",
++            level="WARNING",
++            metadata={
++                "event": "followup_hard_trigger",
++                "hit_condition": "followup>=3",
++                "count": count,
++            },
++        )
++
++
+ def record_generation(
+     trace_id: str | None,
+     *,
+diff --git a/src/weiliao_agent/session/manager.py b/src/weiliao_agent/session/manager.py
+index 4abf234..a98a2d8 100644
+--- a/src/weiliao_agent/session/manager.py
++++ b/src/weiliao_agent/session/manager.py
+@@ -13,9 +13,18 @@ roundtrip（读旧态/初始化/自增/刷新时间戳/EXPIRE 一次完成），
+ 过期竞态语义：调用方（入口适配器）在消息入管道前取快照，处理中途 key
+ 过期不中断在途消息；key 被 TTL 清除后重新发起即从零初始化（turn=1）。
+ 
+-本 Story 不实现（接口边界已按 Epic 2/3/5 约定，届时补写方法）：
+-``write_intent`` / ``write_coref`` / ``mark_handoff``，以及 per-turn
+-工件键（如 ``:intent:{turn}``）的落盘。
++Story 2.2 已交付：``write_intent`` 将分类结果写入 per-turn 键
++``weiliao:session:{session_id}:intent:{turn}``（JSON：
++``IntentClassification.model_dump_json()``，TTL 与会话一致），单写者
++口径不变。
++
++Story 2.3 已交付：``record_followup`` 经 Lua 单 roundtrip 原子维护
++per-intent 追问计数（会话 hash 字段 ``followup:{TAG}``）与会话追问
++总数 ``followup_count``（仅追问命中——per-intent ≥2——时自增），并
++随脚本刷新 EXPIRE；返回 ``(per_intent_count, followup_count)`` 双计数。
++追问判定的权威值只存 Redis（AD-4），UNKNOWN 不参与计数（调用方
++口径）。仍待后续交付：``write_coref``（指代消解 Story）、
++``mark_handoff``（Epic 5）及 ``:coref:{turn}`` 键落盘。
+ """
+ 
+ from dataclasses import dataclass
+@@ -24,6 +33,8 @@ from typing import cast
+ 
+ import redis
+ 
++from weiliao_agent.models.intent import IntentClassification, IntentTag
++
+ # 会话状态 key 前缀（架构一致性约定）。
+ KEY_PREFIX = "weiliao:session:"
+ 
+@@ -59,6 +70,26 @@ redis.call('EXPIRE', key, ttl_seconds)
+ return count
+ """
+ 
++_LUA_RECORD_FOLLOWUP = """
++local key = KEYS[1]
++local tag_field = ARGV[1]
++local ttl_seconds = tonumber(ARGV[2])
++local per_intent = redis.call('HINCRBY', key, tag_field, 1)
++local session_count = 0
++if per_intent >= 2 then
++  -- 追问命中（同意图第 2 次起）才自增会话追问总数；否则只读出现值，
++  -- 不得为首次出现创建 followup_count 字段（语义钉死：非 turn 序号）。
++  session_count = redis.call('HINCRBY', key, 'followup_count', 1)
++else
++  local existing = redis.call('HGET', key, 'followup_count')
++  if existing then
++    session_count = tonumber(existing)
++  end
++end
++redis.call('EXPIRE', key, ttl_seconds)
++return {per_intent, session_count}
++"""
++
+ 
+ @dataclass(frozen=True)
+ class SessionSnapshot:
+@@ -87,6 +118,7 @@ class SessionManager:
+         self._ttl_seconds = ttl_seconds
+         self._begin_turn_script = client.register_script(_LUA_BEGIN_TURN)
+         self._increment_followup_script = client.register_script(_LUA_INCREMENT_FOLLOWUP)
++        self._record_followup_script = client.register_script(_LUA_RECORD_FOLLOWUP)
+ 
+     def begin_turn(self, session_id: str, timestamp: datetime) -> SessionSnapshot:
+         """入管道前快照：初始化/自增 turn、刷新 TTL 与 ``last_message_at``。
+@@ -113,13 +145,61 @@ class SessionManager:
+         )
+ 
+     def increment_followup(self, session_id: str) -> int:
+-        """追问计数 Redis 原子自增并刷新 TTL；返回权威值（Epic 2 消费）。"""
++        """追问计数 Redis 原子自增并刷新 TTL；返回权威值（Epic 2 消费）。
++
++        警告（Story 2.3 语义钉死）：本原语无条件自增 ``followup_count``，
++        而 Epic 2 追问计数的权威语义为「仅追问命中（per-intent ≥2）时
++        自增」。追问识别必须只经 ``record_followup``——本方法不得用于
++        追问计数，否则会把普通消息混入权威计数、污染 ≥3 信号。
++        """
+         count = self._increment_followup_script(
+             keys=[self._key(session_id)],
+             args=[self._ttl_seconds],
+         )
+         return int(cast("int | str | bytes", count))
+ 
++    def record_followup(self, session_id: str, tag: IntentTag) -> tuple[int, int]:
++        """追问识别原子记录（Story 2.3，AD-4）：per-intent 计数 + 会话总数。
++
++        Lua 单 roundtrip：``HINCRBY followup:{TAG}`` 维护 per-intent 计数；
++        仅当 per-intent ≥2（追问命中）时自增会话 ``followup_count``——
++        否则恒等于 turn 序号，「≥3」会在第 3 条普通消息误触发；EXPIRE
++        随脚本刷新，TTL 与会话一致。返回 ``(per_intent_count,
++        session_followup_count)`` 双计数，调用方据 per-intent ≥2 判定
++        ``is_followup``、据会话总数 ≥3 产出 hard trigger 信号。
++
++        调用方口径（intent_router）：仅分类成功、turn 非 None 且 tag 非
++        UNKNOWN 时调用；UNKNOWN 与本模块 1.3 的 ``increment_followup``
++        原语均不参与本计数。写失败不吞异常：调用方经 try 包裹 fail-safe。
++        """
++        raw = self._record_followup_script(
++            keys=[self._key(session_id)],
++            args=[f"followup:{tag}", self._ttl_seconds],
++        )
++        per_intent, session_count = cast(
++            "tuple[object, object]", tuple(cast("list[object]", raw))
++        )
++        return (
++            int(cast("int | str | bytes", per_intent)),
++            int(cast("int | str | bytes", session_count)),
++        )
++
++    def write_intent(
++        self,
++        session_id: str,
++        turn: int,
++        classification: IntentClassification,
++    ) -> None:
++        """分类结果单写者落盘（Story 2.2，AD-4）：per-turn 键 + 会话 TTL。
++
++        ``SET weiliao:session:{session_id}:intent:{turn} {model_dump_json()} EX
++        ttl_seconds`` 单 roundtrip；键独立于会话 hash，TTL 与会话一致
++        （30 分钟默认）。写失败不吞异常：调用方（过滤器）经 try 包裹
++        fail-safe，应答不降级。
++        """
++        key = f"{self._key(session_id)}:intent:{turn}"
++        self._client.set(key, classification.model_dump_json(), ex=self._ttl_seconds)
++
+     def read_snapshot(self, session_id: str) -> SessionSnapshot | None:
+         """只读当前会话快照；key 不存在（已过期）或为缺 turn /
+         ``last_message_at`` 的不完整 hash 时返回 None（防御非本模块写入）。"""
+diff --git a/tests/eval_intent_classifier.py b/tests/eval_intent_classifier.py
+new file mode 100644
+index 0000000..b7ecb50
+--- /dev/null
++++ b/tests/eval_intent_classifier.py
+@@ -0,0 +1,365 @@
++"""意图分类评测 harness（Story 2.2，≥90%·≥1000 真实验收门 deferred）。
++
++用法：
++
++- ``uv run python tests/eval_intent_classifier.py``：内置合成种子集
++  （9 类，每类数十条）冒烟。无 ``OPENAI_API_KEY`` 时以离线规则冒烟
++  替身跑 harness 机制（覆盖率/混淆矩阵/报告），有 key 时加 ``--live``
++  以真实 LLM 分类器跑种子集。
++- ``uv run python tests/eval_intent_classifier.py eval.csv [--live]``：
++  读标注 CSV（列：text,label）逐条分类，输出 9 类覆盖率、准确率与
++  混淆对。语料 ≥1000 条且覆盖 9 类时执行真实验收门（准确率 ≥90%，
++  不达标 exit 1）；语料未就绪时打印 deferred 说明并 exit 0。
++"""
++
++import argparse
++import csv
++import os
++import sys
++from collections.abc import Mapping, Sequence
++from typing import Any
++
++from weiliao_agent.filters.intent_router import IntentClassifier
++from weiliao_agent.models.intent import IntentClassification, IntentTag
++
++ALL_TAGS: tuple[IntentTag, ...] = (
++    "GREETING",
++    "PRICE_INQUIRY",
++    "AVAILABILITY",
++    "LOCATION",
++    "PHOTO_REQUEST",
++    "NEGOTIATION",
++    "LOAN_POLICY",
++    "COMPLAINT",
++    "UNKNOWN",
++)
++
++MIN_EVAL_ROWS = 1000
++GATE_ACCURACY = 0.9
++
++# 合成种子集：每类数十条，冒烟 harness 机制与分类器接线（真实验收
++# 以人工标注语料复跑本 harness 为准）。
++SEEDS: dict[IntentTag, list[str]] = {
++    "GREETING": [
++        "你好",
++        "您好",
++        "在吗",
++        "在吗在吗",
++        "早上好",
++        "晚上好",
++        "hi",
++        "hello",
++        "在吗？回复一下",
++        "你好，看到消息了吗",
++        "您好，打扰了",
++        "在？",
++        "亲，在吗",
++        "你好呀",
++        "在不在",
++    ],
++    "PRICE_INQUIRY": [
++        "这套房多少钱",
++        "总价多少",
++        "单价多少一平",
++        "什么价位",
++        "报价是多少",
++        "多少钱一个月",
++        "租金怎么算",
++        "这个房子卖多少钱",
++        "首付要多少",
++        "全款多少能拿下",
++        "这套房的底价是多少",
++        "挂牌价是多少",
++        "预算 300 万这个房子够吗",
++        "物业费怎么收",
++        "税费大概多少",
++    ],
++    "AVAILABILITY": [
++        "房子还在吗",
++        "现在还能看房吗",
++        "这周方便看房吗",
++        "房子卖出去了吗",
++        "还在售吗",
++        "现在租出去了吗",
++        "什么时候可以入住",
++        "今天能去看房吗",
++        "房东现在方便签约吗",
++        "这房源真实在售吗",
++        "明天上午能看房吗",
++        "这房子还空着吗",
++        "有钥匙随时能看吗",
++        "周末可以看房吗",
++        "还在租吗",
++    ],
++    "LOCATION": [
++        "房子在哪个位置",
++        "离地铁远吗",
++        "到陆家嘴通勤多久",
++        "周边有学校吗",
++        "附近有什么商场",
++        "小区地址发我一下",
++        "靠不靠江",
++        "在几层",
++        "朝向怎么样",
++        "小区停车方便吗",
++        "附近公交车多吗",
++        "是哪个学区",
++        "离医院近不近",
++        "在哪个区",
++        "周边环境吵不吵",
++    ],
++    "PHOTO_REQUEST": [
++        "能发几张照片看看吗",
++        "有户型图吗",
++        "发个实拍视频",
++        "房间照片发一下",
++        "有室内图吗",
++        "阳台照片有吗",
++        "厨房和卫生间拍一下",
++        "可以视频看房吗",
++        "发一下房源图片",
++        "VR 链接有吗",
++        "想看下客厅的照片",
++        "有没有装修好的图",
++        "再发几张卧室照片",
++        "小区环境照片有吗",
++        "发几张白天的照片",
++    ],
++    "NEGOTIATION": [
++        "价格能便宜点吗",
++        "能不能再降十万",
++        "房东好说话吗能谈吗",
++        "最低什么价",
++        "预算不够能优惠吗",
++        "中介费能打折吗",
++        "要是全款能便宜多少",
++        "再便宜点就定了",
++        "价格有点贵能商量吗",
++        "能不能分期",
++        "租金能优惠两百吗",
++        "大刀小刀都行，能谈吗",
++        "隔壁同户型便宜多了",
++        "再降 5 万我今天签约",
++        "诚心买，给个最低价",
++    ],
++    "LOAN_POLICY": [
++        "贷款首付比例是多少",
++        "能贷款吗",
++        "利率现在多少",
++        "支持公积金贷款吗",
++        "商贷和公积金差多少",
++        "二套房政策是什么",
++        "月供大概多少",
++        "贷款年限最长多久",
++        "征信有逾期能贷吗",
++        "组合贷可以办吗",
++        "现在的房贷政策怎么样",
++        "认房认贷吗",
++        "外地户口能贷款吗",
++        "提前还款有违约金吗",
++        "三成首付贷款够吗",
++    ],
++    "COMPLAINT": [
++        "你们服务太差了",
++        "回复也太慢了吧",
++        "说好安排看房根本没去",
++        "信息都是假的吧",
++        "价格跟挂的不一样，投诉",
++        "什么态度啊",
++        "再这样我投诉了",
++        "说好昨天回电也没有回",
++        "照片和实际差太多了吧",
++        "中介太不靠谱了",
++        "我要差评",
++        "发布的信息半天没人理啊",
++        "你们这是在浪费我时间",
++        "房源都下架了还挂着骗人",
++        "太让人失望了",
++    ],
++    "UNKNOWN": [
++        "在吗？我家猫会后空翻",
++        "今天天气怎么样",
++        "你会写诗吗",
++        "帮我算一下 1+1",
++        "附近哪家火锅好吃",
++        "你是真人吗",
++        "给我讲个笑话",
++        "房价以后会涨吗",
++        "你觉得这个小区怎么样啊随便聊聊",
++        "在忙吗",
++        "你好厉害",
++        "谢谢",
++        "好的",
++        "嗯嗯",
++        "收到",
++    ],
++}
++
++
++class _SmokeStubClassifier:
++    """离线冒烟替身（非交付实现）：关键词规则，仅验证 harness 机制。
++
++    真实分类验收必须 ``--live``（真实 LLM 分类器）或标注 CSV 复跑。
++    """
++
++    source = "smoke_stub"
++
++    _KEYWORDS: Mapping[IntentTag, tuple[str, ...]] = {
++        "GREETING": ("你好", "您好", "在吗", "早上好", "晚上好", "hi", "hello", "在？", "在不在"),
++        # LOAN 先于 PRICE：「首付比例」「组合贷」类表述归贷款政策，价格
++        # 问句不含贷款关键词时回落 PRICE。
++        "LOAN_POLICY": (
++            "贷款", "利率", "公积金", "商贷", "月供", "征信", "认贷", "还款", "政策", "组合贷",
++        ),
++        "NEGOTIATION": ("便宜", "降", "优惠", "打折", "分期", "商量", "最低", "大刀"),
++        "PRICE_INQUIRY": (
++            "多少钱", "价位", "价格", "首付", "单价", "租金", "报价", "税", "物业", "总价", "底价",
++            "预算",
++        ),
++        "AVAILABILITY": (
++            "在售", "在租", "看房", "卖出", "租出", "入住", "空着", "钥匙", "签约",
++        ),
++        "LOCATION": (
++            "位置", "地铁", "通勤", "地址", "朝向", "层", "学校", "商场", "医院", "公交", "区",
++            "停车", "江",
++        ),
++        "PHOTO_REQUEST": ("照片", "户型图", "视频", "图片", "图", "vr", "拍", "实拍"),
++        "COMPLAINT": (
++            "差", "慢", "投诉", "假", "态度", "不靠谱", "差评", "骗", "失望", "浪费", "回电",
++            "没人理", "没去",
++        ),
++    }
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        text = message.lower()
++        for tag, keywords in self._KEYWORDS.items():
++            if any(keyword in text for keyword in keywords):
++                return IntentClassification(tag=tag, confidence=0.8)
++        return IntentClassification(tag="UNKNOWN", confidence=0.6)
++
++
++class _LiveClassifier:
++    """真实 LLM 分类器封装：单条失败 fail-closed UNKNOWN（置信度 0.0）。
++
++    超时/网络/解析失败不中断整个评测——该条按 UNKNOWN 计（误判计入
++    混淆矩阵，不抛异常逃逸）。
++    """
++
++    def __init__(self) -> None:
++        from weiliao_agent.classifiers.llm_zero_shot import LlmZeroShotClassifier
++
++        self._inner = LlmZeroShotClassifier()
++        self.source = self._inner.source
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        try:
++            return self._inner.classify(message, context)
++        except Exception:
++            return IntentClassification(tag="UNKNOWN", confidence=0.0)
++
++
++def _evaluate(classifier: IntentClassifier, rows: Sequence[tuple[str, IntentTag]]) -> int:
++    """逐条分类并打印报告；返回进程退出码。"""
++    per_tag: dict[str, dict[str, int]] = {
++        tag: {"support": 0, "correct": 0} for tag in ALL_TAGS
++    }
++    confusion: dict[tuple[str, str], int] = {}
++    correct = 0
++    for text, expected in rows:
++        per_tag[expected]["support"] += 1
++        predicted = classifier.classify(text, {}).tag
++        if predicted == expected:
++            correct += 1
++            per_tag[expected]["correct"] += 1
++        else:
++            key = (expected, predicted)
++            confusion[key] = confusion.get(key, 0) + 1
++
++    coverage = sum(1 for tag in ALL_TAGS if per_tag[tag]["support"] > 0)
++    accuracy = correct / len(rows) if rows else 0.0
++
++    print(f"classifier_source={_source_of(classifier)} rows={len(rows)}")
++    print(f"coverage={coverage}/9 accuracy={accuracy:.3f} ({correct}/{len(rows)})")
++    for tag in ALL_TAGS:
++        stats = per_tag[tag]
++        if stats["support"] == 0:
++            print(f"  {tag:<15} support=0 (missing)")
++            continue
++        print(
++            f"  {tag:<15} support={stats['support']:<4} "
++            f"correct={stats['correct']:<4} "
++            f"recall={stats['correct'] / stats['support']:.3f}"
++        )
++    if confusion:
++        print("top_confusions:")
++        for (expected, predicted), count in sorted(
++            confusion.items(), key=lambda item: -item[1]
++        )[:10]:
++            print(f"  {expected} -> {predicted}: {count}")
++
++    if len(rows) >= MIN_EVAL_ROWS and coverage == len(ALL_TAGS):
++        # 真实验收门：规模 ≥1000 且 9 类全覆盖时执行。
++        if accuracy >= GATE_ACCURACY:
++            print(f"GATE PASS: accuracy {accuracy:.3f} >= {GATE_ACCURACY}")
++            return 0
++        print(f"GATE FAIL: accuracy {accuracy:.3f} < {GATE_ACCURACY}")
++        return 1
++    print(
++        f"GATE DEFERRED: need >={MIN_EVAL_ROWS} rows and 9/9 coverage "
++        f"to enforce accuracy >={GATE_ACCURACY} (spec OQ-1 选 B)"
++    )
++    return 0
++
++
++def _source_of(classifier: IntentClassifier) -> str:
++    source = getattr(classifier, "source", None)
++    return source if isinstance(source, str) and source else type(classifier).__name__
++
++
++def _load_csv(path: str) -> list[tuple[str, IntentTag]]:
++    rows: list[tuple[str, IntentTag]] = []
++    with open(path, newline="", encoding="utf-8") as handle:
++        reader = csv.DictReader(handle)
++        if reader.fieldnames is None or not {"text", "label"} <= set(reader.fieldnames):
++            msg = f"CSV must have columns text,label; got {reader.fieldnames}"
++            raise SystemExit(msg)
++        for line in reader:
++            text = (line.get("text") or "").strip()
++            label = (line.get("label") or "").strip().upper()
++            if not text or label not in ALL_TAGS:
++                continue  # 非法行跳过（fail-closed，不进评测基数）
++            rows.append((text, label))  # type: ignore[arg-type]
++    return rows
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("csv", nargs="?", help="标注语料 CSV（列：text,label）")
++    parser.add_argument(
++        "--live",
++        action="store_true",
++        help="以真实 LLM 分类器跑种子集/语料（需 OPENAI_API_KEY）",
++    )
++    args = parser.parse_args(argv)
++
++    live = args.live or bool(args.csv)
++    if live and not os.environ.get("OPENAI_API_KEY"):
++        print("OPENAI_API_KEY not set: cannot run live LLM evaluation", file=sys.stderr)
++        return 2
++    classifier: IntentClassifier = _LiveClassifier() if live else _SmokeStubClassifier()
++
++    if args.csv:
++        rows = _load_csv(args.csv)
++        if not rows:
++            print("no valid rows in CSV", file=sys.stderr)
++            return 2
++    else:
++        rows = [(text, tag) for tag in ALL_TAGS for text in SEEDS[tag]]
++        if not live:
++            print("offline smoke mode (stub classifier; use --live for real LLM)")
++
++    return _evaluate(classifier, rows)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_classifier.py b/tests/test_classifier.py
+new file mode 100644
+index 0000000..1f943ac
+--- /dev/null
++++ b/tests/test_classifier.py
+@@ -0,0 +1,312 @@
++"""Story 2.2 默认分类器实现 I/O 矩阵单测。
++
++覆盖 spec I/O & Edge-Case Matrix：
++合法消息分类（信封写回 + writer 调用 + trace 成功事件）/ Redis 写入
++失败 fail-safe（应答不降级、信封保留分类、trace 记 intent_write_failed）/
++turn=None 或未注入 writer 跳过写回 / LLM 实现超时守卫（reason=timeout
++失败事件）/ 配置切换工厂（合法值装配、非法值 fail-fast）/ 置信度缺省
++回填 0.8 / 结构化输出校验拒绝。
++"""
++
++import time
++from collections.abc import Mapping
++from typing import Any
++
++import pytest
++
++from weiliao_agent.classifiers import create_classifier
++from weiliao_agent.classifiers.llm_zero_shot import (
++    IntentClassificationError,
++    LlmZeroShotClassifier,
++    _LlmIntentOutput,
++)
++from weiliao_agent.filters.intent_router import IntentRouterFilter
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.models.intent import IntentClassification
++from weiliao_agent.observability import tracing
++
++TRACE_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
++
++
++def _envelope(turn: int | None = 1, message: str = "你好，这套房多少钱？") -> Envelope:
++    return Envelope.model_validate(
++        {
++            "session_id": "sess-001",
++            "house_id": "house-001",
++            "turn": turn,
++            "timestamp": "2026-10-31T10:00:00+08:00",
++            "trace_id": TRACE_ID,
++            "message": message,
++        }
++    )
++
++
++class _StubClassifier:
++    """返回固定分类结果的测试替身。"""
++
++    source = "stub"
++
++    def __init__(self, classification: IntentClassification) -> None:
++        self._classification = classification
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        return self._classification
++
++
++class _RecordingWriter:
++    """记录写回调用的 writer 替身；可配置抛 redis 错误。"""
++
++    def __init__(self, *, fail: bool = False) -> None:
++        self.calls: list[tuple[str, int, IntentClassification]] = []
++        self._fail = fail
++
++    def __call__(
++        self, session_id: str, turn: int, classification: IntentClassification
++    ) -> None:
++        if self._fail:
++            import redis
++
++            msg = "Connection refused"
++            raise redis.ConnectionError(msg)
++        self.calls.append((session_id, turn, classification))
++
++
++class _FakeEventLangfuse:
++    """只记录 create_event 的最小 Langfuse 替身（trace 事件断言用）。"""
++
++    def __init__(self, *, raise_on_event: bool = False) -> None:
++        self.events: list[dict[str, Any]] = []
++        self.raise_on_event = raise_on_event
++
++    def create_event(self, **kwargs: Any) -> None:
++        if self.raise_on_event:
++            msg = "sdk event boom"
++            raise RuntimeError(msg)
++        self.events.append(kwargs)
++
++
++@pytest.fixture(autouse=True)
++def _reset_langfuse_client() -> Any:
++    tracing.set_langfuse_client(None)
++    yield
++    tracing.set_langfuse_client(None)
++
++
++def test_classification_success_writes_back_and_calls_writer() -> None:
++    fake = _FakeEventLangfuse()
++    tracing.set_langfuse_client(fake)  # type: ignore[arg-type]
++    writer = _RecordingWriter()
++    classification = IntentClassification(tag="PRICE_INQUIRY", confidence=0.93)
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(classification), intent_writer=writer
++    )
++
++    result = filter_.process(_envelope())
++
++    assert result.intent == "PRICE_INQUIRY"
++    assert writer.calls == [("sess-001", 1, classification)]
++    # trace 成功事件：标签/置信度/来源/延迟。
++    (event,) = fake.events
++    assert event["name"] == "intent.classification"
++    metadata = event["metadata"]
++    assert metadata["tag"] == "PRICE_INQUIRY"
++    assert metadata["confidence"] == 0.93
++    assert metadata["source"] == "stub"
++    assert isinstance(metadata["latency_ms"], float)
++
++
++def test_writer_failure_fails_safe_and_records_trace_event() -> None:
++    fake = _FakeEventLangfuse()
++    tracing.set_langfuse_client(fake)  # type: ignore[arg-type]
++    writer = _RecordingWriter(fail=True)
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
++        intent_writer=writer,
++    )
++
++    result = filter_.process(_envelope())  # 不向上抛，应答不降级
++
++    assert result.intent == "GREETING"  # 信封保留分类结果
++    failure = [e for e in fake.events if e["name"] == "intent.classification_failure"]
++    assert len(failure) == 1
++    assert failure[0]["metadata"]["reason"] == "intent_write_failed"
++
++
++def test_turn_none_skips_writer_but_classifies() -> None:
++    writer = _RecordingWriter()
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
++        intent_writer=writer,
++    )
++
++    result = filter_.process(_envelope(turn=None))
++
++    assert result.intent == "GREETING"
++    assert writer.calls == []  # 无 turn 即无 per-turn 键可写
++
++
++def test_writer_not_injected_skips_write_but_classifies() -> None:
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="LOCATION", confidence=0.7))
++    )
++
++    result = filter_.process(_envelope())
++
++    assert result.intent == "LOCATION"  # 既有替身装配路径天然兼容
++
++
++def test_classification_failure_records_reason_and_degrades() -> None:
++    fake = _FakeEventLangfuse()
++    tracing.set_langfuse_client(fake)  # type: ignore[arg-type]
++
++    class _TimeoutClassifier:
++        def classify(
++            self, message: str, context: Mapping[str, Any]
++        ) -> IntentClassification:
++            raise IntentClassificationError("timeout", "exceeded 45ms budget")
++
++    filter_ = IntentRouterFilter(classifier=_TimeoutClassifier())
++
++    result = filter_.process(_envelope())
++
++    assert result.intent == "UNKNOWN"  # 过滤器契约：不向上抛
++    failure = [e for e in fake.events if e["name"] == "intent.classification_failure"]
++    assert len(failure) == 1
++    assert failure[0]["metadata"]["reason"] == "timeout"
++
++
++def test_trace_event_failure_is_swallowed() -> None:
++    # SDK create_event 抛错：分类与写回结果不受影响（fail-safe 口径）。
++    fake = _FakeEventLangfuse(raise_on_event=True)
++    tracing.set_langfuse_client(fake)  # type: ignore[arg-type]
++    writer = _RecordingWriter()
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
++        intent_writer=writer,
++    )
++
++    result = filter_.process(_envelope())
++
++    assert result.intent == "GREETING"
++    assert writer.calls  # 写回不受 trace 失败影响
++
++
++def test_non_recordable_trace_id_skips_events() -> None:
++    fake = _FakeEventLangfuse()
++    tracing.set_langfuse_client(fake)  # type: ignore[arg-type]
++    writer = _RecordingWriter()
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
++        intent_writer=writer,
++    )
++    envelope = _envelope().model_copy(update={"trace_id": "trace-001"})
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "GREETING"
++    assert writer.calls  # 写回不依赖 trace
++    assert fake.events == []
++
++
++class _FakeStructuredModel:
++    """``with_structured_output`` 同接口替身：可配置延迟与返回/抛错。"""
++
++    def __init__(
++        self,
++        output: _LlmIntentOutput | None = None,
++        *,
++        delay_seconds: float = 0.0,
++        raise_exc: Exception | None = None,
++    ) -> None:
++        self._output = output
++        self._delay = delay_seconds
++        self._raise = raise_exc
++
++    def invoke(self, messages: Any) -> _LlmIntentOutput:
++        if self._delay:
++            time.sleep(self._delay)
++        if self._raise is not None:
++            raise self._raise
++        assert self._output is not None
++        return self._output
++
++
++def test_llm_classifier_returns_structured_output() -> None:
++    classifier = LlmZeroShotClassifier(
++        structured_model=_FakeStructuredModel(
++            _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.88)
++        )
++    )
++
++    result = classifier.classify("这套房多少钱？", {"session_id": "s1"})
++
++    assert result == IntentClassification(tag="PRICE_INQUIRY", confidence=0.88)
++
++
++def test_llm_classifier_backfills_confidence_when_model_omits_it() -> None:
++    # 模型不自评：固定口径回填 0.8（不回填 1.0，为追问归并保留信号空间）。
++    classifier = LlmZeroShotClassifier(
++        structured_model=_FakeStructuredModel(_LlmIntentOutput(tag="GREETING"))
++    )
++
++    result = classifier.classify("你好", {})
++
++    assert result.confidence == 0.8
++
++
++def test_llm_classifier_hard_timeout_guard() -> None:
++    classifier = LlmZeroShotClassifier(
++        timeout_seconds=0.02,
++        structured_model=_FakeStructuredModel(
++            _LlmIntentOutput(tag="GREETING", confidence=0.9), delay_seconds=0.5
++        ),
++    )
++
++    started = time.monotonic()
++    with pytest.raises(IntentClassificationError) as exc_info:
++        classifier.classify("你好", {})
++    elapsed = time.monotonic() - started
++
++    assert exc_info.value.reason == "timeout"
++    assert elapsed < 0.4  # 守卫先行返回，不傻等 LLM 调用
++
++
++def test_llm_classifier_wraps_underlying_errors() -> None:
++    classifier = LlmZeroShotClassifier(
++        structured_model=_FakeStructuredModel(raise_exc=RuntimeError("api down"))
++    )
++
++    with pytest.raises(IntentClassificationError) as exc_info:
++        classifier.classify("你好", {})
++
++    assert exc_info.value.reason == "RuntimeError"
++
++
++def test_llm_classifier_rejects_out_of_range_model_confidence() -> None:
++    classifier = LlmZeroShotClassifier(
++        structured_model=_FakeStructuredModel(
++            _LlmIntentOutput(tag="GREETING", confidence=1.5)
++        )
++    )
++
++    with pytest.raises(IntentClassificationError) as exc_info:
++        classifier.classify("你好", {})
++
++    assert exc_info.value.reason == "invalid_output"
++
++
++def test_llm_classifier_source_and_factory_default() -> None:
++    classifier = create_classifier("llm_zero_shot")
++
++    assert isinstance(classifier, LlmZeroShotClassifier)
++    assert classifier is not None
++    assert classifier.source == "llm_zero_shot"
++
++
++def test_factory_none_returns_placeholder_mode() -> None:
++    assert create_classifier("none") is None
++
++
++def test_factory_rejects_unknown_name() -> None:
++    with pytest.raises(ValueError, match="unknown intent classifier"):
++        create_classifier("rules_engine")
+diff --git a/tests/test_intent.py b/tests/test_intent.py
+new file mode 100644
+index 0000000..d41201a
+--- /dev/null
++++ b/tests/test_intent.py
+@@ -0,0 +1,454 @@
++"""意图标签模型与分类器接口 I/O 矩阵单测（Story 2.1）。
++
++覆盖 spec I/O & Edge-Case Matrix 六场景：
++合法标签入信封（9 类逐个）/ 未知意图值拒绝（模型层 + 端点层 fail-closed）/
++注入分类器写回 / 分类异常降级 UNKNOWN / 未注入默认占位行为 / 置信度越界
++拒绝；另覆盖分类器输入口径（resolved_message 优先、无文本 fail-closed）。
++"""
++
++from collections.abc import Iterator, Mapping
++from typing import Any, get_args
++
++import pytest
++import redis
++from fastapi.testclient import TestClient
++from pydantic import ValidationError
++
++from weiliao_agent.adapters.http import create_app
++from weiliao_agent.filters.intent_router import IntentRouterFilter
++from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX, render_placeholder
++from weiliao_agent.models.envelope import Envelope
++from weiliao_agent.models.intent import IntentClassification, IntentTag
++from weiliao_agent.observability import tracing
++
++# 与 models/intent.py 的 Literal 权威定义同源派生，防手抄漂移。
++ALL_TAGS: tuple[IntentTag, ...] = get_args(IntentTag)
++
++
++def _valid_payload(intent: Any = "PRICE_INQUIRY") -> dict[str, Any]:
++    return {
++        "session_id": "sess-001",
++        "house_id": "house-001",
++        "turn": 1,
++        "intent": intent,
++        "timestamp": "2026-10-31T10:00:00+08:00",
++        "trace_id": "trace-001",
++        "message": "你好，这套房多少钱？",
++    }
++
++
++@pytest.mark.parametrize("tag", ALL_TAGS)
++def test_envelope_accepts_each_of_nine_intent_tags(tag: IntentTag) -> None:
++    envelope = Envelope.model_validate(_valid_payload(intent=tag))
++
++    assert envelope.intent == tag
++
++
++def test_envelope_rejects_unknown_intent_value() -> None:
++    with pytest.raises(ValidationError):
++        Envelope.model_validate(_valid_payload(intent="DISCOUNT"))
++
++
++def test_endpoint_unknown_intent_fails_closed_with_generic_fallback() -> None:
++    client = TestClient(create_app())
++
++    response = client.post("/v1/messages", json=_valid_payload(intent="DISCOUNT"))
++
++    assert response.status_code == 200  # 非 5xx，不进入管道
++    body = response.json()
++    assert body["degraded"] is True
++    assert body["failed_filter"] is None
++    assert body["reply"] == render_placeholder(None)  # 通用兜底文案
++    assert body["reply"].startswith(AI_DISCLOSURE_PREFIX)
++    assert body["trace_id"]  # 新生成 trace_id
++    assert body["trace_id"] != "trace-001"
++
++
++class _StubClassifier:
++    """返回固定分类结果的测试替身，记录收到的消息文本与会话上下文。"""
++
++    def __init__(self, classification: IntentClassification) -> None:
++        self._classification = classification
++        self.received_message: str | None = None
++        self.received_context: Mapping[str, Any] | None = None
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        self.received_message = message
++        self.received_context = context
++        return self._classification
++
++
++class _RaisingClassifier:
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        msg = "classifier boom"
++        raise RuntimeError(msg)
++
++
++class _ConstructBypassClassifier:
++    """非一致性替身：经 model_construct 绕过校验返回枚举外 tag。"""
++
++    def classify(self, message: str, context: Mapping[str, Any]) -> IntentClassification:
++        return IntentClassification.model_construct(tag="DISCOUNT", confidence=0.9)
++
++
++def test_injected_classifier_writes_back_tag_and_passes_through_envelope() -> None:
++    stub = _StubClassifier(IntentClassification(tag="GREETING", confidence=0.9))
++    filter_ = IntentRouterFilter(classifier=stub)
++    envelope = Envelope.model_validate(_valid_payload(intent=None))
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "GREETING"
++    # 信封其余字段透传。
++    assert result.session_id == envelope.session_id
++    assert result.house_id == envelope.house_id
++    assert result.turn == envelope.turn
++    assert result.trace_id == envelope.trace_id
++    assert result.timestamp == envelope.timestamp
++    # 分类器收到的输入：消息文本（原文，消解后消息未就位）+ 会话上下文。
++    assert stub.received_message == "你好，这套房多少钱？"
++    assert stub.received_context is not None
++    assert stub.received_context["session_id"] == "sess-001"
++    assert stub.received_context["house_id"] == "house-001"
++    assert stub.received_context["turn"] == 1
++    assert stub.received_context["trace_id"] == "trace-001"
++
++
++def test_injected_classifier_overrides_preset_intent() -> None:
++    # 分类器为权威：注入后一律以分类结果覆盖信封既有 intent。
++    stub = _StubClassifier(IntentClassification(tag="GREETING", confidence=0.9))
++    filter_ = IntentRouterFilter(classifier=stub)
++    envelope = Envelope.model_validate(_valid_payload(intent="PRICE_INQUIRY"))
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "GREETING"
++
++
++def test_injected_classifier_prefers_resolved_message_over_raw_message() -> None:
++    stub = _StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.8))
++    filter_ = IntentRouterFilter(classifier=stub)
++    envelope = Envelope.model_validate(_valid_payload())
++    envelope = envelope.model_copy(update={"resolved_message": "这套房（house_id: h1）多少钱"})
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "PRICE_INQUIRY"
++    # AD-11：消解后消息就位后即分类器唯一输入。
++    assert stub.received_message == "这套房（house_id: h1）多少钱"
++
++
++def test_classifier_exception_degrades_to_unknown_without_raising() -> None:
++    filter_ = IntentRouterFilter(classifier=_RaisingClassifier())
++    envelope = Envelope.model_validate(_valid_payload(intent=None))
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "UNKNOWN"
++    # 信封其余字段透传（fail-closed 仅作用于 intent），与 happy path 口径一致。
++    assert result.session_id == envelope.session_id
++    assert result.house_id == envelope.house_id
++    assert result.turn == envelope.turn
++    assert result.trace_id == envelope.trace_id
++    assert result.timestamp == envelope.timestamp
++
++
++def test_nonconforming_classifier_tag_fails_closed_to_unknown() -> None:
++    # 非一致性分类器经 model_construct 写入枚举外 tag：写回前的
++    # model_validate 全量校验拒绝，fail-closed UNKNOWN。
++    filter_ = IntentRouterFilter(classifier=_ConstructBypassClassifier())
++    envelope = Envelope.model_validate(_valid_payload(intent=None))
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "UNKNOWN"
++
++
++def test_injected_classifier_without_any_message_text_fails_closed() -> None:
++    stub = _StubClassifier(IntentClassification(tag="GREETING", confidence=0.9))
++    filter_ = IntentRouterFilter(classifier=stub)
++    payload = _valid_payload(intent=None)
++    del payload["message"]
++    envelope = Envelope.model_validate(payload)
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "UNKNOWN"
++    assert stub.received_message is None  # 无文本不调分类器
++
++
++def test_empty_message_text_fails_closed_without_calling_classifier() -> None:
++    # 空串与 None 同口径：信封允许空串（无 min_length），守卫不得被绕过。
++    stub = _StubClassifier(IntentClassification(tag="GREETING", confidence=0.9))
++    filter_ = IntentRouterFilter(classifier=stub)
++    payload = _valid_payload(intent=None)
++    payload["message"] = ""
++    envelope = Envelope.model_validate(payload)
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "UNKNOWN"
++    assert stub.received_message is None  # 空文本不调分类器
++
++
++def test_default_filter_preserves_placeholder_behavior() -> None:
++    filter_ = IntentRouterFilter()
++
++    missing = Envelope.model_validate(_valid_payload(intent=None))
++    assert filter_.process(missing).intent == "UNKNOWN"
++
++    preset = Envelope.model_validate(_valid_payload(intent="PRICE_INQUIRY"))
++    assert filter_.process(preset).intent == "PRICE_INQUIRY"
++
++
++@pytest.mark.parametrize("confidence", [1.5, -0.1])
++def test_classification_confidence_out_of_bounds_rejected(confidence: float) -> None:
++    with pytest.raises(ValidationError):
++        IntentClassification(tag="GREETING", confidence=confidence)
++
++
++@pytest.mark.parametrize("confidence", [0.0, 1.0])
++def test_classification_confidence_boundary_accepted(confidence: float) -> None:
++    classification = IntentClassification(tag="GREETING", confidence=confidence)
++
++    assert classification.confidence == confidence
++
++
++# ---------------------------------------------------------------------------
++# Story 2.3 追问识别矩阵：recorder 注入、信封标记写回、fail-safe、
++# UNKNOWN / turn=None 跳过、达阈值 hard trigger trace 事件。
++# ---------------------------------------------------------------------------
++
++_TRACE_ID_HEX = "ab" * 16  # 32 位小写十六进制（Langfuse 可记录口径）
++
++
++class _FakeLangfuse:
++    """最小 Langfuse 替身：只记录 create_event 事件（trace 断言用）。"""
++
++    def __init__(self) -> None:
++        self.events: list[dict[str, Any]] = []
++
++    def create_event(self, **kwargs: Any) -> None:
++        self.events.append(kwargs)
++
++
++@pytest.fixture
++def fake_langfuse() -> Iterator[_FakeLangfuse]:
++    previous = tracing._client_or_none()  # 快照先前 client，teardown 恢复
++    client = _FakeLangfuse()
++    tracing.set_langfuse_client(client)
++    yield client
++    tracing.set_langfuse_client(previous)
++
++
++def _followup_payload(**overrides: Any) -> dict[str, Any]:
++    payload = _valid_payload(intent=None)
++    payload["trace_id"] = _TRACE_ID_HEX
++    payload.update(overrides)
++    return payload
++
++
++class _StubFollowupRecorder:
++    """固定双计数返回的 recorder 替身，记录收到的 (session_id, tag)。"""
++
++    def __init__(self, result: tuple[int, int]) -> None:
++        self._result = result
++        self.calls: list[tuple[str, IntentTag]] = []
++
++    def __call__(self, session_id: str, tag: IntentTag) -> tuple[int, int]:
++        self.calls.append((session_id, tag))
++        return self._result
++
++
++class _RaisingFollowupRecorder:
++    def __call__(self, session_id: str, tag: IntentTag) -> tuple[int, int]:
++        msg = "redis boom"
++        raise redis.RedisError(msg)
++
++
++def _event_names(fake: _FakeLangfuse) -> list[str]:
++    return [event["name"] for event in fake.events]
++
++
++def test_followup_first_occurrence_keeps_envelope_flag_false(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    recorder = _StubFollowupRecorder((1, 0))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "PRICE_INQUIRY"  # 信封保留分类结果
++    assert result.is_followup is False  # per-intent=1：首次非追问
++    assert recorder.calls == [("sess-001", "PRICE_INQUIRY")]
++    assert "intent.followup" in _event_names(fake_langfuse)
++    event = next(e for e in fake_langfuse.events if e["name"] == "intent.followup")
++    assert event["metadata"]["per_intent_count"] == 1
++    assert event["metadata"]["session_followup_count"] == 0
++    assert event["metadata"]["is_followup"] is False
++
++
++def test_followup_second_occurrence_marks_envelope(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    recorder = _StubFollowupRecorder((2, 1))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "PRICE_INQUIRY"
++    assert result.is_followup is True  # per-intent ≥2：追问命中
++    # 信封其余字段透传。
++    assert result.session_id == envelope.session_id
++    assert result.turn == envelope.turn
++    assert "intent.followup_hard_trigger" not in _event_names(fake_langfuse)
++
++
++def test_followup_threshold_emits_hard_trigger_event(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    # 会话追问总数达 3：信号事件含命中条件与计数（判定归 Epic 5）。
++    recorder = _StubFollowupRecorder((2, 3))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="LOCATION", confidence=0.8)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.is_followup is True
++    event = next(
++        e for e in fake_langfuse.events if e["name"] == "intent.followup_hard_trigger"
++    )
++    assert event["level"] == "WARNING"
++    assert event["metadata"]["hit_condition"] == "followup>=3"
++    assert event["metadata"]["count"] == 3
++
++
++def test_followup_past_threshold_does_not_reemit_hard_trigger(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    # 负边界（锁评审 E1）：计数已过 3 的追问命中不重发信号——
++    # 若实现退化为 >= 3，本条即红。
++    recorder = _StubFollowupRecorder((3, 4))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.is_followup is True
++    assert "intent.followup_hard_trigger" not in _event_names(fake_langfuse)
++
++
++def test_followup_first_occurrence_after_threshold_emits_nothing(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    # 负边界（锁评审 E2）：会话计数已达标时，新意图首次出现（非追问）
++    # 不发信号——若丢失 is_followup 守卫，本条即红。
++    recorder = _StubFollowupRecorder((1, 3))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="GREETING", confidence=0.9)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.is_followup is False
++    assert "intent.followup_hard_trigger" not in _event_names(fake_langfuse)
++
++
++def test_followup_recorder_failure_fails_safe(fake_langfuse: _FakeLangfuse) -> None:
++    # recorder 抛 redis.RedisError：不应答降级、信封保留分类结果、
++    # is_followup 保持默认 False、trace 记失败事件、过滤器不向上抛。
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
++        followup_recorder=_RaisingFollowupRecorder(),
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "PRICE_INQUIRY"
++    assert result.is_followup is False
++    failure = next(
++        e
++        for e in fake_langfuse.events
++        if e["name"] == "intent.classification_failure"
++    )
++    assert failure["metadata"]["reason"] == "followup_record_failed"
++
++
++def test_followup_skipped_for_unknown_tag(fake_langfuse: _FakeLangfuse) -> None:
++    # UNKNOWN（含占位降级）不参与追问判定：recorder 零调用、零计数副作用。
++    recorder = _StubFollowupRecorder((2, 1))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="UNKNOWN", confidence=0.5)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "UNKNOWN"
++    assert result.is_followup is False
++    assert recorder.calls == []
++    assert "intent.followup" not in _event_names(fake_langfuse)
++
++
++def test_followup_skipped_when_turn_is_none(fake_langfuse: _FakeLangfuse) -> None:
++    recorder = _StubFollowupRecorder((2, 1))
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload(turn=None))
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "PRICE_INQUIRY"
++    assert result.is_followup is False
++    assert recorder.calls == []
++
++
++def test_followup_skipped_without_recorder(fake_langfuse: _FakeLangfuse) -> None:
++    filter_ = IntentRouterFilter(
++        classifier=_StubClassifier(IntentClassification(tag="PRICE_INQUIRY", confidence=0.9)),
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "PRICE_INQUIRY"
++    assert result.is_followup is False  # 默认 False，无 recorder 不报错
++    assert "intent.followup" not in _event_names(fake_langfuse)
++
++
++def test_followup_not_recorded_when_classification_fails(
++    fake_langfuse: _FakeLangfuse,
++) -> None:
++    # 分类 fail-closed（异常路径）：不调 recorder、不累积追问计数。
++    recorder = _StubFollowupRecorder((2, 1))
++    filter_ = IntentRouterFilter(
++        classifier=_RaisingClassifier(),
++        followup_recorder=recorder,
++    )
++    envelope = Envelope.model_validate(_followup_payload())
++
++    result = filter_.process(envelope)
++
++    assert result.intent == "UNKNOWN"
++    assert result.is_followup is False
++    assert recorder.calls == []
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 5b6bc55..3b0a41e 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -7,6 +7,8 @@
+ """
+ 
+ import importlib
++import json
++import sys
+ from concurrent.futures import ThreadPoolExecutor
+ from datetime import UTC, datetime, timedelta
+ from typing import Any, cast
+@@ -17,10 +19,19 @@ import redis
+ from fastapi.testclient import TestClient
+ 
+ from weiliao_agent.adapters.http import create_app
++from weiliao_agent.classifiers.llm_zero_shot import LlmZeroShotClassifier, _LlmIntentOutput
+ from weiliao_agent.filters.templates import AI_DISCLOSURE_PREFIX
+ from weiliao_agent.session import SessionManager, SessionSnapshot
+ from weiliao_agent.session.manager import DEFAULT_TTL_SECONDS, KEY_PREFIX
+ 
++
++@pytest.fixture
++def _restore_main_module() -> Any:
++    """reload 类测试的清理：弹出 main 模块，防 FakeRedis 绑定的过期
++    状态（app/_classifier）被后续导入该模块的测试读到。"""
++    yield
++    sys.modules.pop("weiliao_agent.main", None)
++
+ TS_1 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=UTC)
+ TS_2 = datetime(2026, 10, 31, 10, 1, 0, tzinfo=UTC)
+ SESSION_ID = "sess-001"
+@@ -236,7 +247,9 @@ def test_endpoint_backfills_turn_before_pipeline(
+     assert seen_turns == [1, 2]
+ 
+ 
+-def test_main_composition_root_wires_session_manager(monkeypatch: pytest.MonkeyPatch) -> None:
++def test_main_composition_root_wires_session_manager(
++    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
++) -> None:
+     # 组合根冒烟：main.py 是生产唯一注入 SessionManager 的位置。patch
+     # Redis.from_url 为 fakeredis 后导入 main，端点须完成 turn 回填。
+     fake = fakeredis.FakeRedis()
+@@ -270,3 +283,283 @@ def test_in_flight_message_continues_with_snapshot_after_key_expiry(
+ 
+     assert envelope.turn == 1  # 在途消息持有入管道时快照，不随 key 过期而失效
+     assert result.degraded is False  # 处理不中断，正常出管道
++
++
++def test_write_intent_stores_per_turn_json_with_session_ttl(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    from weiliao_agent.models.intent import IntentClassification
++
++    manager.begin_turn(SESSION_ID, TS_1)
++
++    manager.write_intent(SESSION_ID, 1, IntentClassification(tag="PRICE_INQUIRY", confidence=0.9))
++
++    key = f"{KEY_PREFIX}{SESSION_ID}:intent:1"
++    raw = cast("bytes", client.get(key))
++    stored = json.loads(raw.decode())
++    assert stored == {"tag": "PRICE_INQUIRY", "confidence": 0.9}
++    # 序列化口径即 model_dump_json()，且 TTL 与会话一致。
++    assert client.ttl(key) == DEFAULT_TTL_SECONDS
++    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
++
++
++def test_write_intent_uses_distinct_key_per_turn(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    from weiliao_agent.models.intent import IntentClassification
++
++    manager.write_intent(SESSION_ID, 1, IntentClassification(tag="GREETING", confidence=0.9))
++    manager.write_intent(SESSION_ID, 2, IntentClassification(tag="LOCATION", confidence=0.7))
++
++    first = json.loads(cast("bytes", client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:1")).decode())
++    second = json.loads(cast("bytes", client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:2")).decode())
++    assert first["tag"] == "GREETING"
++    assert second["tag"] == "LOCATION"
++
++
++def test_write_intent_does_not_touch_session_hash(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # per-turn 键独立于会话 hash：意图写入不得残留/改写 turn 等权威字段。
++    from weiliao_agent.models.intent import IntentClassification
++
++    manager.write_intent(SESSION_ID, 3, IntentClassification(tag="UNKNOWN", confidence=0.5))
++
++    assert client.hgetall(f"{KEY_PREFIX}{SESSION_ID}") == {}
++    assert client.get(f"{KEY_PREFIX}{SESSION_ID}:intent:3") is not None
++
++
++def test_record_followup_first_occurrence_does_not_increment_session_count(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++
++    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++
++    assert (per_intent, session_count) == (1, 0)  # 首次出现非追问，总数不自增
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert client.hget(key, "followup:PRICE_INQUIRY") == b"1"
++    assert client.hget(key, "followup_count") == b"0"
++    assert client.ttl(key) == DEFAULT_TTL_SECONDS  # EXPIRE 随脚本刷新
++
++
++def test_record_followup_second_occurrence_marks_followup(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++
++    per_intent, session_count = manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++
++    assert (per_intent, session_count) == (2, 1)  # 追问 #1：per-intent ≥2 命中
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
++    assert client.hget(key, "followup_count") == b"1"
++
++
++def test_record_followup_same_tag_reaches_threshold_at_fourth_message(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # 语义钉死：追问 #3 = 同意图第 4 次消息（≥3 信号触发时刻）。
++    manager.begin_turn(SESSION_ID, TS_1)
++    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (1, 0)
++    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (2, 1)
++    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (3, 2)
++    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (4, 3)
++    assert client.hget(f"{KEY_PREFIX}{SESSION_ID}", "followup_count") == b"3"
++
++
++def test_record_followup_counts_across_intents(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # 「≥3 无论意图类型」：跨意图累计第 3 次追问命中（各意图第 2 次）。
++    manager.begin_turn(SESSION_ID, TS_1)
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++    manager.record_followup(SESSION_ID, "AVAILABILITY")
++    manager.record_followup(SESSION_ID, "LOCATION")
++
++    assert manager.record_followup(SESSION_ID, "PRICE_INQUIRY") == (2, 1)
++    assert manager.record_followup(SESSION_ID, "AVAILABILITY") == (2, 2)
++    assert manager.record_followup(SESSION_ID, "LOCATION") == (2, 3)
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
++    assert client.hget(key, "followup:AVAILABILITY") == b"2"
++    assert client.hget(key, "followup:LOCATION") == b"2"
++    assert client.hget(key, "followup_count") == b"3"
++
++
++def test_record_followup_isolates_per_intent_counters(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++
++    per_intent, session_count = manager.record_followup(SESSION_ID, "GREETING")
++
++    # GREETING 首次出现：per-intent 独立计数，会话总数只计 PRICE_INQUIRY 的命中。
++    assert (per_intent, session_count) == (1, 1)
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert client.hget(key, "followup:GREETING") == b"1"
++    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
++
++
++def test_record_followup_refreshes_ttl(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    manager.begin_turn(SESSION_ID, TS_1)
++    client.expire(f"{KEY_PREFIX}{SESSION_ID}", 60)  # 模拟中途 TTL 被压短
++
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++
++    assert client.ttl(f"{KEY_PREFIX}{SESSION_ID}") == DEFAULT_TTL_SECONDS
++
++
++def test_record_followup_before_begin_turn_preserves_counts(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # record_followup 先执行（hash 已存在但无 turn 字段）：begin_turn
++    # 不得误判为新会话而把 per-intent / followup_count 清零。
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++    manager.record_followup(SESSION_ID, "PRICE_INQUIRY")
++
++    snapshot = manager.begin_turn(SESSION_ID, TS_1)
++
++    assert snapshot.turn == 1
++    assert snapshot.followup_count == 1
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert client.hget(key, "followup:PRICE_INQUIRY") == b"2"
++
++
++def test_concurrent_record_followup_counts_exactly(
++    manager: SessionManager, client: fakeredis.FakeRedis
++) -> None:
++    # 并发同 session 同 intent：per-intent 与会话总数均精确不丢不重。
++    manager.begin_turn(SESSION_ID, TS_1)
++    threads = 50
++    with ThreadPoolExecutor(max_workers=threads) as pool:
++        results = list(
++            pool.map(
++                lambda _i: manager.record_followup(SESSION_ID, "PRICE_INQUIRY"),
++                range(threads),
++            )
++        )
++
++    per_intents = sorted(r[0] for r in results)
++    assert per_intents == list(range(1, threads + 1))
++    assert all(r[1] == r[0] - 1 for r in results)  # 会话总数 = per-intent - 1
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert client.hget(key, "followup:PRICE_INQUIRY") == str(threads).encode()
++    assert client.hget(key, "followup_count") == str(threads - 1).encode()
++
++
++def test_main_composition_root_rejects_unknown_classifier(
++    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
++) -> None:
++    # 非法配置值 fail-fast：组合根导入期拒绝启动。
++    fake = fakeredis.FakeRedis()
++    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
++    monkeypatch.setenv("WEILIAO_INTENT_CLASSIFIER", "rules_engine")
++
++    with pytest.raises(ValueError, match="unknown intent classifier"):
++        importlib.reload(importlib.import_module("weiliao_agent.main"))
++
++
++def test_main_composition_root_switch_to_none_classifier(
++    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
++) -> None:
++    # 配置切换路由链路零改动：none 装配占位过滤器，消息正常出管道
++    # （意图置 UNKNOWN），turn 仍由组合根 SessionManager 回填。
++    fake = fakeredis.FakeRedis()
++    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
++    monkeypatch.setenv("WEILIAO_INTENT_CLASSIFIER", "none")
++    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
++
++    http = TestClient(main_module.app)
++    response = http.post("/v1/messages", json=_valid_payload())
++
++    assert response.status_code == 200
++    assert response.json()["degraded"] is False
++    stored_turn = fake.hget(f"{KEY_PREFIX}{SESSION_ID}", "turn")
++    assert int(cast("bytes", stored_turn)) == 1
++
++
++def test_main_composition_root_defaults_to_llm_classifier(
++    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
++) -> None:
++    # env 未设（或空串）时组合根装配默认 LLM zero-shot 实现——锁定
++    # main.py 的默认接线不被误删/误改。
++    fake = fakeredis.FakeRedis()
++    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
++    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
++    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
++
++    assert isinstance(main_module._classifier, LlmZeroShotClassifier)
++
++
++class _FakeStructuredModel:
++    """``with_structured_output`` 同接口替身：返回固定结构化输出。"""
++
++    def __init__(self, output: _LlmIntentOutput) -> None:
++        self._output = output
++
++    def invoke(self, messages: Any) -> _LlmIntentOutput:
++        return self._output
++
++
++def test_main_composition_root_writes_intent_to_redis(
++    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
++) -> None:
++    # 默认链路端到端：分类结果经组合根注入的 write_intent 落盘 per-turn
++    # 键，JSON 含 tag 与 confidence（fakeredis 无 LLM 网络）。
++    fake = fakeredis.FakeRedis()
++    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
++    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
++    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
++    classifier = main_module._classifier
++    assert isinstance(classifier, LlmZeroShotClassifier)
++    classifier._structured_model = _FakeStructuredModel(
++        _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.91)
++    )
++    http = TestClient(main_module.app)
++    payload = {**_valid_payload(), "message": "你好，这套房多少钱？"}
++
++    response = http.post("/v1/messages", json=payload)
++
++    assert response.status_code == 200
++    assert response.json()["degraded"] is False
++    raw = fake.get(f"{KEY_PREFIX}{SESSION_ID}:intent:1")
++    assert raw is not None
++    stored = json.loads(cast("bytes", raw).decode())
++    assert stored == {"tag": "PRICE_INQUIRY", "confidence": 0.91}
++
++
++def test_main_composition_root_records_followup_to_redis(
++    monkeypatch: pytest.MonkeyPatch, _restore_main_module: Any
++) -> None:
++    # 默认链路端到端（Story 2.3 验收）：同一 session 同一意图第 2 条消息
++    # 经组合根注入的 record_followup 落盘——followup:TAG=2、followup_count=1。
++    fake = fakeredis.FakeRedis()
++    monkeypatch.setattr(redis.Redis, "from_url", lambda *args, **kwargs: fake)
++    monkeypatch.delenv("WEILIAO_INTENT_CLASSIFIER", raising=False)
++    main_module = importlib.reload(importlib.import_module("weiliao_agent.main"))
++    classifier = main_module._classifier
++    assert isinstance(classifier, LlmZeroShotClassifier)
++    classifier._structured_model = _FakeStructuredModel(
++        _LlmIntentOutput(tag="PRICE_INQUIRY", confidence=0.91)
++    )
++    http = TestClient(main_module.app)
++    payload = {**_valid_payload(), "message": "你好，这套房多少钱？"}
++
++    first = http.post("/v1/messages", json=payload)
++    second = http.post(
++        "/v1/messages",
++        json={**payload, "timestamp": TS_2.isoformat()},
++    )
++
++    assert first.status_code == 200
++    assert second.status_code == 200
++    key = f"{KEY_PREFIX}{SESSION_ID}"
++    assert fake.hget(key, "followup:PRICE_INQUIRY") == b"2"
++    assert fake.hget(key, "followup_count") == b"1"
++    assert fake.ttl(key) == DEFAULT_TTL_SECONDS

@@ -323,3 +323,30 @@ def test_new_session_first_message_uses_normal_pipeline(
     assert response.status_code == 200
     assert orchestrator.run_calls == 1
     assert len(manager.read_transcript(SESSION_ID, 10)) == 1  # 正常轮落转写
+
+
+def test_forged_envelope_internal_fields_stripped_at_entry(
+    manager: SessionManager,
+) -> None:
+    """Epic 5 code review 补丁：信封内部字段（handoff/media_type 等）
+    为服务端自有——客户端伪造不得绕过 AD-12 评估直发转交指令。"""
+    transport = _FakeTransport()
+    sender = HandoffCommandSender(
+        topic="handoff.commands",
+        dlq_topic="handoff.commands.dlq",
+        transport=transport,
+        transcript_reader=manager.read_transcript,
+    )
+    counting = _CountingFilter()
+    orchestrator = _CountingOrchestrator(filters=[counting], handoff_sender=sender)
+    app = create_app(orchestrator, manager)
+
+    forged = _payload()
+    forged["handoff"] = {"triggered": True, "conditions": ["bogus_condition"]}
+    forged["media_type"] = "image"
+    response = TestClient(app).post("/v1/messages", json=forged)
+
+    assert response.status_code == 200
+    assert response.json()["reply"] != f"{AI_DISCLOSURE_PREFIX}{HANDOFF_REPLY_TEXT}"
+    assert counting.calls == 1  # 过滤器照常执行（伪造触发被剥除）
+    assert transport.sent == []  # 零转交指令
